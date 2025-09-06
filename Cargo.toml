@@ -2,6 +2,12 @@
 name = "feature-gate-multisig-tool"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+authors = ["sean@sqds.io", "orion@sqds.io", "bastien@sqds.io"]
+description = "A CLI tool for rapidly provisioning minimal Squads multisig setups specifically designed for Solana feature gate governance"
+repository = "https://github.com/Squads-Protocol/feature-gate-multisig"
+keywords = ["solana", "multisig", "governance", "feature-gates", "blockchain"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

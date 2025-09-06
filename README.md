@@ -19,7 +19,7 @@ This tool is designed to streamline the creation of governance multisigs for Sol
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/Squads-Protocol/feature-gate-multisig.git
 cd feature-gate-multisig
 
 # Build the project
@@ -346,7 +346,15 @@ Contributions are welcome! Please ensure:
 
 ## 📄 License
 
-[Add your license information here]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+The MIT License provides:
+- ✅ **Commercial use** - Use this tool in commercial projects
+- ✅ **Modification** - Modify and adapt the code for your needs  
+- ✅ **Distribution** - Share and distribute the tool
+- ✅ **Private use** - Use privately without restrictions
+- ℹ️ **Attribution** - Include the original license notice
+- ⚠️ **No warranty** - Software provided "as is" without warranty
 
 ## 🆘 Support
 
