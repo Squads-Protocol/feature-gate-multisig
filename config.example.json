@@ -1,6 +1,14 @@
 {
-  "signers": [
+  "threshold": 2,
+  "members": [
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+    "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+    "4Qkev8aNZcqFNSRhQzwyLMFSsi94jHqE8WNVTJzTP6kQ"
   ],
-  "network": "",
-  "threshold": 1
+  "networks": [
+    "https://api.devnet.solana.com",
+    "https://api.testnet.solana.com",
+    "https://api.mainnet-beta.solana.com"
+  ],
+  "network": "https://api.devnet.solana.com"
 }

@@ -54,6 +54,27 @@ pub struct Permissions {
     pub mask: u8,
 }
 
+pub const SEED_EPHEMERAL_SIGNER: &[u8] = b"ephemeral_signer";
+
+pub const SQUADS_MULTISIG_PROGRAM: Pubkey = Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
+
+#[derive(BorshDeserialize)]
+pub struct ProgramConfig {
+    pub authority: Pubkey,
+    pub multisig_creation_fee: u64,
+    pub treasury: Pubkey,
+    pub _reserved: [u8; 64],
+}
+#[derive(BorshSerialize)]
+pub struct MultisigCreateArgsV2 {
+    pub config_authority: Option<Pubkey>,
+    pub threshold: u16,
+    pub members: Vec<Member>,
+    pub time_lock: u32,
+    pub rent_collector: Option<Pubkey>,
+    pub memo: Option<String>,
+}
+
 #[derive(BorshSerialize, BorshDeserialize)]
 pub struct VaultTransaction {
     pub multisig: Pubkey,
@@ -151,4 +172,41 @@ pub fn get_proposal_pda(
         ],
         program_id.unwrap_or(&SQUADS_MULTISIG_PROGRAM_ID),
     )
+}
+
+use solana_sdk::instruction::AccountMeta;
+
+pub struct MultisigCreateV2Accounts {
+    pub create_key: Pubkey,
+    pub creator: Pubkey,
+    pub multisig: Pubkey,
+    pub system_program: Pubkey,
+    pub program_config: Pubkey,
+    pub treasury: Pubkey,
+}
+
+impl MultisigCreateV2Accounts {
+    pub fn to_account_metas(&self, _is_signer: Option<bool>) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new_readonly(self.create_key, true),
+            AccountMeta::new(self.creator, true),
+            AccountMeta::new(self.multisig, false),
+            AccountMeta::new_readonly(self.system_program, false),
+            AccountMeta::new_readonly(self.program_config, false),
+            AccountMeta::new(self.treasury, false),
+        ]
+    }
+}
+
+pub struct MultisigCreateV2Data {
+    pub args: MultisigCreateArgsV2,
+}
+
+impl MultisigCreateV2Data {
+    pub fn data(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(CREATE_MULTISIG_V2_DISCRIMINATOR);
+        data.extend_from_slice(&borsh::to_vec(&self.args).unwrap());
+        data
+    }
 }
