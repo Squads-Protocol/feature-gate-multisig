@@ -1,5 +1,5 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 
 pub const CREATE_MULTISIG_V2_DISCRIMINATOR: &[u8] = &[50, 221, 199, 93, 40, 245, 139, 233];
 
@@ -174,7 +174,7 @@ pub fn get_proposal_pda(
     )
 }
 
-use solana_sdk::instruction::AccountMeta;
+use solana_instruction::AccountMeta;
 
 pub struct MultisigCreateV2Accounts {
     pub create_key: Pubkey,
@@ -185,15 +185,56 @@ pub struct MultisigCreateV2Accounts {
     pub treasury: Pubkey,
 }
 
+pub struct MultisigCreateTransaction {
+    pub multisig: Pubkey,
+    pub transaction: Pubkey,
+    pub creator: Pubkey,
+    pub rent_payer: Pubkey,
+    pub system_program: Pubkey,
+}
+
+impl MultisigCreateTransaction {
+    pub fn to_account_metas(&self, _is_signer: Option<bool>) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new(self.multisig, false),
+            AccountMeta::new(self.transaction, false),
+            AccountMeta::new_readonly(self.creator, true),
+            AccountMeta::new(self.rent_payer, true),
+            AccountMeta::new_readonly(self.system_program, false),
+        ]
+    }
+}
+
+pub struct MultisigCreateTransactionData {
+    pub args: MultisigCreateTransactionArgs
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct MultisigCreateTransactionArgs {
+    pub vault_index: u8,
+    pub num_ephemeral_signers: u8,
+    pub transaction_message: VaultTransactionMessage
+}
+
+impl MultisigCreateTransactionData {
+    pub fn data(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(CREATE_TRANSACTION_DISCRIMINATOR);
+        data.extend_from_slice(&borsh::to_vec(&self.args).unwrap());
+        data
+    }
+}
+
+
 impl MultisigCreateV2Accounts {
     pub fn to_account_metas(&self, _is_signer: Option<bool>) -> Vec<AccountMeta> {
         vec![
-            AccountMeta::new_readonly(self.create_key, true),
-            AccountMeta::new(self.creator, true),
-            AccountMeta::new(self.multisig, false),
-            AccountMeta::new_readonly(self.system_program, false),
             AccountMeta::new_readonly(self.program_config, false),
             AccountMeta::new(self.treasury, false),
+            AccountMeta::new(self.multisig, false),
+            AccountMeta::new_readonly(self.create_key, true),
+            AccountMeta::new(self.creator, true),
+            AccountMeta::new_readonly(self.system_program, false),
         ]
     }
 }
@@ -209,4 +250,43 @@ impl MultisigCreateV2Data {
         data.extend_from_slice(&borsh::to_vec(&self.args).unwrap());
         data
     }
+}
+
+pub struct MultisigCreateProposalAccounts {
+    pub multisig: Pubkey,
+    pub proposal: Pubkey,
+    pub creator: Pubkey,
+    pub rent_payer: Pubkey,
+    pub system_program: Pubkey,
+}
+
+impl MultisigCreateProposalAccounts {
+    pub fn to_account_metas(&self, _is_signer: Option<bool>) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new(self.multisig, false),
+            AccountMeta::new(self.proposal, false),
+            AccountMeta::new_readonly(self.creator, true),
+            AccountMeta::new(self.rent_payer, true),
+            AccountMeta::new_readonly(self.system_program, false),
+        ]
+    }
+}
+
+pub struct MultisigCreateProposalData {
+    pub args: MultisigCreateProposalArgs
+}
+
+impl MultisigCreateProposalData {
+    pub fn data(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(CREATE_PROPOSAL_DISCRIMINATOR);
+        data.extend_from_slice(&borsh::to_vec(&self.args).unwrap());
+        data
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct MultisigCreateProposalArgs {
+    pub transaction_index: u64,
+    pub is_draft: bool,
 }
