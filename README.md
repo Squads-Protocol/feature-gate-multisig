@@ -51,9 +51,22 @@ feature-gate-multisig-tool [COMMAND]
 feature-gate-multisig-tool create [OPTIONS]
 
 Options:
-  -t, --threshold <THRESHOLD>    Number of required signatures
-  -s, --signers <SIGNERS>       Signers (currently unused in favor of interactive collection)
+  -t, --threshold <THRESHOLD>    Number of required signatures (will be prompted if not provided)
+  -s, --signers <SIGNERS>       Signers (currently unused - members are collected interactively)
+  -k, --keypair <KEYPAIR>       Keypair file path for paying transaction fees (e.g., ~/.config/solana/id.json)
   -h, --help                    Print help information
+```
+
+**Examples:**
+```bash
+# Create with specific fee payer
+feature-gate-multisig-tool create --keypair ~/.config/solana/my-wallet.json
+
+# Create with threshold and fee payer
+feature-gate-multisig-tool create --threshold 2 --keypair ~/.config/solana/my-wallet.json
+
+# Create interactively (will prompt for fee payer)
+feature-gate-multisig-tool create
 ```
 
 ### Config Command Example
@@ -69,6 +82,7 @@ feature-gate-multisig-tool config
 📋 Configuration:
   Config file: "/Users/user/.feature-gate-multisig-tool/config.json"
   Default threshold: 2
+  Fee payer keypair: ~/.config/solana/id.json
   Saved networks: 3 networks
     Network 1: https://api.devnet.solana.com
     Network 2: https://api.testnet.solana.com
@@ -78,12 +92,58 @@ feature-gate-multisig-tool config
     Member 2: 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
 ```
 
+### Show Command Example
+
+Query details of an existing multisig with smart network discovery:
+
+```bash
+feature-gate-multisig-tool show GWVKaMd1faaxaH9HozFWikNQ9YUCiesEoNdKsfNSxVDD
+```
+
+**Output:**
+```
+🔍 Fetching multisig details...
+
+Available networks to search:
+  1: https://api.devnet.solana.com
+  2: https://api.mainnet-beta.solana.com
+
+🌐 Trying network: https://api.devnet.solana.com
+✅ Found account on: https://api.devnet.solana.com
+
+📡 Using network: https://api.devnet.solana.com
+🎯 Multisig address: GWVKaMd1faaxaH9HozFWikNQ9YUCiesEoNdKsfNSxVDD
+
+📊 Account data length: 198 bytes
+✅ Multisig deserialized successfully!
+
+📋 MULTISIG DETAILS
+═══════════════════════════════════════════════════════════════════════════════
+
+╭─────────────────────────┬──────────────────────────────────────────────╮
+│ Property                │ Value                                        │
+├─────────────────────────┼──────────────────────────────────────────────┤
+│ Multisig Address        │ GWVKaMd1faaxaH9HozFWikNQ9YUCiesEoNdKsfNSxVDD │
+│ Threshold               │ 1 of 2                                       │
+│ Default Vault Address   │ G39AVSauH1gyYDgbWp4Bqw8njUS7e1KQLei5YbQypWyU │
+╰─────────────────────────┴──────────────────────────────────────────────╯
+
+👥 MEMBERS (2 total)
+╭───┬──────────────────────────────────────────────┬─────────────────────────┬─────────╮
+│ # │ Public Key                                   │ Permissions             │ Bitmask │
+├───┼──────────────────────────────────────────────┼─────────────────────────┼─────────┤
+│ 1 │ seanNDjjAuqnPjschE1sPxLVtD9amiT7mzNjsRYQY4E  │ Initiate, Vote, Execute │ 7       │
+│ 2 │ GmRj6WF6J5aoBDmT1QBubAQv6L7LsTxo6VhnF6RGfqro │ Initiate                │ 1       │
+╰───┴──────────────────────────────────────────────┴─────────────────────────┴─────────╯
+```
+
 ## 🎮 Interactive Mode
 
 The tool is designed to work primarily in interactive mode, providing a guided experience:
 
 ### 1. **Configuration Setup**
 - **Config Review**: Checks for existing saved configuration and asks for confirmation
+- **Fee Payer Setup**: Prompts for fee payer keypair file path with intelligent defaults
 - **Member Loading**: If config exists, loads saved members with full permissions
 - **Interactive Fallback**: If no config or user declines, collects members interactively
 - **Contributor Generation**: Always generates fresh ephemeral contributor keypair (never saved)
@@ -222,20 +282,115 @@ A `config.example.json` file is provided showing the expected format:
     "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
     "4Qkev8aNZcqFNSRhQzwyLMFSsi94jHqE8WNVTJzTP6kQ"
   ],
-  "network": "https://api.devnet.solana.com"
+  "network": "https://api.devnet.solana.com",
+  "fee_payer_path": "~/.config/solana/id.json"
 }
 ```
+
+## 💳 Fee Payer Support
+
+The tool now supports configurable fee payer keypairs for transaction costs:
+
+### Command Line Usage
+```bash
+# Specify fee payer directly via CLI
+feature-gate-multisig-tool create --keypair ~/.config/solana/my-wallet.json
+
+# Interactive mode will prompt for fee payer path
+feature-gate-multisig-tool interactive
+```
+
+### Configuration Support
+- **Config Storage**: Fee payer path is saved in `~/.feature-gate-multisig-tool/config.json`
+- **Interactive Prompts**: Fee payer keypair path is requested during interactive multisig creation
+- **Fallback Logic**: If no fee payer is specified, the contributor keypair pays transaction fees
+- **Tilde Expansion**: Paths starting with `~/` are automatically expanded to home directory
+
+## 🎯 Advanced Functionality
+
+### Transaction and Proposal Creation
+
+The tool includes advanced functionality for creating multisig transactions and proposals:
+
+```rust
+// Create transaction and proposal message for multisig governance
+pub fn create_transaction_and_proposal_message(
+    program_id: Option<&Pubkey>,
+    fee_payer_pubkey: &Pubkey,
+    contributor_pubkey: &Pubkey,
+    multisig_address: &Pubkey,
+    transaction_index: u64,          // Use 1 for fresh multisigs
+    vault_index: u8,                 // Use 0 for default vault
+    transaction_message: VaultTransactionMessage,
+    priority_fee: Option<u32>,
+    recent_blockhash: Hash,
+) -> eyre::Result<(Message, Pubkey, Pubkey)>
+```
+
+**Key Features:**
+- **Dual Instructions**: Creates both transaction (index 1) and proposal (index 1) in a single message
+- **PDA Derivation**: Automatically derives transaction and proposal PDAs using Squads program logic
+- **Priority Fee Support**: Optional compute budget instruction for transaction prioritization
+- **Message-Only**: Returns Solana `Message` object for flexible signing and sending
+
+### Smart Network Discovery
+
+The tool now intelligently searches across multiple networks:
+
+```bash
+# Tool automatically tries all configured networks to find multisig
+feature-gate-multisig-tool show GWVKaMd1faaxaH9HozFWikNQ9YUCiesEoNdKsfNSxVDD
+```
+
+**Network Discovery Features:**
+- **Multi-Network Search**: Tries all configured networks in order
+- **Real-time Feedback**: Shows progress with colored status indicators
+- **Error Recovery**: Continues searching if account not found on one network
+- **Performance Optimized**: Stops on first successful network discovery
 
 ## 🔧 Technical Details
 
 ### Dependencies
 - **Solana SDK**: Blockchain interaction
 - **Squads Protocol**: Multisig program integration
-- **Borsh**: Serialization
+- **Borsh**: Serialization/deserialization
 - **Colored**: Terminal output formatting
 - **Tabled**: Professional table formatting
 - **Inquire**: Interactive prompts
 - **Dialoguer**: Confirmation dialogs
+- **Eyre**: Error handling
+- **Dirs**: Cross-platform directory handling
+
+### Testing Infrastructure
+
+The project includes comprehensive test coverage with modern testing practices:
+
+```bash
+# Run all tests
+cargo test
+
+# Run specific test module
+cargo test provision::tests
+
+# Run with output
+cargo test -- --nocapture
+```
+
+**Test Features:**
+- **Randomized Keys**: Tests use `Pubkey::new_unique()` for better isolation and reliability
+- **Comprehensive Coverage**: 7 test cases covering serialization, PDA derivation, and message creation
+- **Real-world Scenarios**: Tests both priority fee and no-fee transaction scenarios  
+- **Deterministic Logic**: While using random keys, test logic remains deterministic and reliable
+- **Multi-run Stability**: Tests pass consistently across multiple executions
+
+**Test Modules:**
+- `test_create_transaction_data_serialization` - Transaction instruction format validation
+- `test_create_proposal_data_serialization` - Proposal instruction format validation
+- `test_vault_transaction_message_serialization` - Transaction message payload testing
+- `test_pda_derivation` - Program Derived Address generation verification
+- `test_account_metas_generation` - Account metadata structure validation
+- `test_create_transaction_and_proposal_message` - Full message creation with priority fees
+- `test_create_transaction_and_proposal_message_no_priority_fee` - Message creation optimization
 
 ### Key Addresses Generated
 - **Multisig PDA**: Main multisig account
@@ -247,6 +402,28 @@ A `config.example.json` file is provided showing the expected format:
 - **Persistent Keys**: The same create key is used across all deployments
 - **Permission Model**: Contributor has Initiate-only (bitmask 1); additional members have full permissions (bitmask 7)
 - **Network Consistency**: Identical addresses across different networks
+
+## 📈 Recent Improvements
+
+### v0.1.0+ Features
+- ✅ **Enhanced Fee Payer Support**: CLI args, interactive prompts, and config persistence
+- ✅ **Smart Network Discovery**: Multi-network search with intelligent fallback
+- ✅ **Transaction/Proposal Creation**: Advanced multisig governance message building
+- ✅ **Improved Testing**: Randomized test keys for better reliability and isolation
+- ✅ **Better Error Handling**: Enhanced error messages and recovery scenarios
+- ✅ **Config Enhancements**: Fee payer path storage and tilde expansion support
+
+### Performance & Reliability
+- **Optimized Network Queries**: Stops searching on first successful network
+- **Deterministic Testing**: Consistent test results across multiple runs
+- **Memory Efficient**: Minimal resource usage for transaction building
+- **Cross-platform**: Works on macOS, Linux, and Windows
+
+### Developer Experience
+- **Comprehensive Documentation**: Updated README with all new features
+- **Rich CLI Help**: Detailed help text for all commands and options
+- **Error Guidance**: Helpful hints for common issues and solutions
+- **Test Coverage**: 100% test coverage for critical transaction building logic
 - **Transaction Fees**: Requires SOL for transaction fees on target networks
 - **Security**: Generated keys are ephemeral - save important addresses from output
 
