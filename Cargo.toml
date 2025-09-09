@@ -25,6 +25,16 @@ indicatif = "0.17.11"
 eyre = "0.6.12"
 tabled = "0.15"
 
-solana-sdk = "2.0.0"
 solana-client="2.0.0"
 solana-clap-v3-utils = "2.2.0"
+solana-signature = "2.0.0"
+solana-instruction = {version = "2.0.0", features = ["bincode"]}
+solana-pubkey = {version = "2.4.0", features = ["borsh", "curve25519"]}
+solana-keypair = "2.0.0"
+solana-signer = "2.0.0"
+solana-message = "2.0.0"
+solana-transaction = "2.0.0"
+solana-compute-budget-interface = "2.0.0"
+solana-system-interface = "1.0.0"
+solana-rent = "2.0.0"
+solana-commitment-config = "2.0.0"
