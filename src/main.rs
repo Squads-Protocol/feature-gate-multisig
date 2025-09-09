@@ -2,8 +2,9 @@ mod feature_gate_program;
 mod provision;
 mod squads;
 
-use crate::provision::create_multisig;
-use crate::squads::{get_vault_pda, Member, Multisig, Permissions};
+use crate::provision::{create_multisig, create_transaction_and_proposal_message};
+use crate::squads::{get_vault_pda, Member, Multisig, Permissions, VaultTransactionMessage, MultisigCompiledInstruction};
+use crate::feature_gate_program::create_feature_activation;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
@@ -14,6 +15,9 @@ use solana_client::rpc_client::RpcClient;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::{EncodableKey, Signer};
+use solana_hash::Hash;
+use solana_transaction::versioned::VersionedTransaction;
+use solana_message::{VersionedMessage};
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -350,6 +354,61 @@ async fn interactive_mode() -> Result<()> {
     Ok(())
 }
 
+fn create_feature_activation_transaction_message() -> VaultTransactionMessage {
+    // Create feature activation instructions for a test feature
+    let feature_id = Pubkey::new_unique();
+    let funding_address = Pubkey::new_unique();
+    let instructions = create_feature_activation(&feature_id, &funding_address);
+    
+    // Build account keys list for the message
+    let mut account_keys = vec![
+        funding_address,                                      // 0: Funding address (signer, writable)
+        feature_id,                                          // 1: Feature account (writable)
+        solana_system_interface::program::ID,                // 2: System program
+        crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID, // 3: Feature gate program
+    ];
+    
+    // Compile instructions into MultisigCompiledInstructions
+    let mut compiled_instructions = Vec::new();
+    
+    for instruction in instructions {
+        // Find program_id index in account_keys
+        let program_id_index = account_keys.iter()
+            .position(|key| *key == instruction.program_id)
+            .unwrap_or_else(|| {
+                account_keys.push(instruction.program_id);
+                account_keys.len() - 1
+            }) as u8;
+            
+        // Map account pubkeys to indices
+        let account_indexes: Vec<u8> = instruction.accounts.iter()
+            .map(|account_meta| {
+                account_keys.iter()
+                    .position(|key| *key == account_meta.pubkey)
+                    .unwrap_or_else(|| {
+                        account_keys.push(account_meta.pubkey);
+                        account_keys.len() - 1
+                    }) as u8
+            })
+            .collect();
+            
+        compiled_instructions.push(MultisigCompiledInstruction {
+            program_id_index,
+            account_indexes,
+            data: instruction.data,
+        });
+    }
+    
+    VaultTransactionMessage {
+        num_signers: 1,              // funding_address is the signer
+        num_writable_signers: 1,     // funding_address is writable signer
+        num_writable_non_signers: 1, // feature_id is writable non-signer
+        account_keys,
+        instructions: compiled_instructions,
+        address_table_lookups: vec![],
+    }
+}
+
 async fn create_feature_multisig(
     config: &mut Config,
     threshold: u16,
@@ -630,6 +689,110 @@ async fn create_feature_multisig(
                         "✅".bright_green(),
                         rpc_url.bright_white()
                     );
+
+                    // Create transaction and proposal after successful multisig deployment
+                    println!(
+                        "\n{} Creating transaction and proposal for multisig governance...",
+                        "📋".bright_blue()
+                    );
+
+                    // Create the transaction message for feature activation
+                    let transaction_message = create_feature_activation_transaction_message();
+                    
+                    // Get recent blockhash
+                    let rpc_client = RpcClient::new(rpc_url.clone());
+                    let recent_blockhash = match rpc_client.get_latest_blockhash() {
+                        Ok(blockhash) => blockhash,
+                        Err(e) => {
+                            println!(
+                                "{} Failed to get recent blockhash: {}",
+                                "❌".bright_red(),
+                                e.to_string().red()
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Use fee payer if available, otherwise use contributor
+                    let fee_payer_pubkey = fee_payer_keypair
+                        .as_ref()
+                        .map(|kp| kp.pubkey())
+                        .unwrap_or_else(|| contributor_initiator_keypair.pubkey());
+
+                    // Create the transaction and proposal message
+                    match create_transaction_and_proposal_message(
+                        None, // Use default program ID
+                        &fee_payer_pubkey,
+                        &contributor_pubkey,
+                        &multisig_address,
+                        1, // Transaction index 1 (fresh multisig)
+                        0, // Vault index 0 (default vault for feature gates)
+                        transaction_message,
+                        Some(5000), // Priority fee
+                        recent_blockhash,
+                    ) {
+                        Ok((message, transaction_pda, proposal_pda)) => {
+                            println!(
+                                "  {}: {}",
+                                "Transaction PDA".cyan(),
+                                transaction_pda.to_string().bright_green()
+                            );
+                            println!(
+                                "  {}: {}",
+                                "Proposal PDA".cyan(),
+                                proposal_pda.to_string().bright_green()
+                            );
+
+                            // Create and sign the transaction
+                            let signers: &[&dyn Signer] = if fee_payer_pubkey == contributor_pubkey {
+                                &[&contributor_initiator_keypair]
+                            } else {
+                                &[
+                                    fee_payer_keypair.as_ref().unwrap() as &dyn Signer,
+                                    &contributor_initiator_keypair as &dyn Signer
+                                ]
+                            };
+
+                            match VersionedTransaction::try_new(VersionedMessage::V0(message), signers) {
+                                Ok(transaction) => {
+                                    match rpc_client.send_and_confirm_transaction(&transaction) {
+                                        Ok(signature) => {
+                                            println!(
+                                                "{} Transaction and proposal created successfully!",
+                                                "✅".bright_green()
+                                            );
+                                            println!(
+                                                "  {}: {}",
+                                                "Transaction Signature".cyan(),
+                                                signature.to_string().bright_white()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            println!(
+                                                "{} Failed to send transaction and proposal: {}",
+                                                "❌".bright_red(),
+                                                e.to_string().red()
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "{} Failed to create signed transaction: {}",
+                                        "❌".bright_red(),
+                                        e.to_string().red()
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!(
+                                "{} Failed to create transaction and proposal message: {}",
+                                "❌".bright_red(),
+                                e.to_string().red()
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     println!(
@@ -762,6 +925,110 @@ async fn create_feature_multisig(
                         "✅".bright_green(),
                         rpc_url.bright_white()
                     );
+
+                    // Create transaction and proposal after successful multisig deployment
+                    println!(
+                        "\n{} Creating transaction and proposal for multisig governance...",
+                        "📋".bright_blue()
+                    );
+
+                    // Create the transaction message for feature activation
+                    let transaction_message = create_feature_activation_transaction_message();
+                    
+                    // Get recent blockhash
+                    let rpc_client = RpcClient::new(rpc_url.clone());
+                    let recent_blockhash = match rpc_client.get_latest_blockhash() {
+                        Ok(blockhash) => blockhash,
+                        Err(e) => {
+                            println!(
+                                "{} Failed to get recent blockhash: {}",
+                                "❌".bright_red(),
+                                e.to_string().red()
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Use fee payer if available, otherwise use contributor
+                    let fee_payer_pubkey = fee_payer_keypair
+                        .as_ref()
+                        .map(|kp| kp.pubkey())
+                        .unwrap_or_else(|| contributor_initiator_keypair.pubkey());
+
+                    // Create the transaction and proposal message
+                    match create_transaction_and_proposal_message(
+                        None, // Use default program ID
+                        &fee_payer_pubkey,
+                        &contributor_pubkey,
+                        &multisig_address,
+                        1, // Transaction index 1 (fresh multisig)
+                        0, // Vault index 0 (default vault for feature gates)
+                        transaction_message,
+                        Some(5000), // Priority fee
+                        recent_blockhash,
+                    ) {
+                        Ok((message, transaction_pda, proposal_pda)) => {
+                            println!(
+                                "  {}: {}",
+                                "Transaction PDA".cyan(),
+                                transaction_pda.to_string().bright_green()
+                            );
+                            println!(
+                                "  {}: {}",
+                                "Proposal PDA".cyan(),
+                                proposal_pda.to_string().bright_green()
+                            );
+
+                            // Create and sign the transaction
+                            let signers: &[&dyn Signer] = if fee_payer_pubkey == contributor_pubkey {
+                                &[&contributor_initiator_keypair]
+                            } else {
+                                &[
+                                    fee_payer_keypair.as_ref().unwrap() as &dyn Signer,
+                                    &contributor_initiator_keypair as &dyn Signer
+                                ]
+                            };
+
+                            match VersionedTransaction::try_new(VersionedMessage::V0(message), signers) {
+                                Ok(transaction) => {
+                                    match rpc_client.send_and_confirm_transaction(&transaction) {
+                                        Ok(signature) => {
+                                            println!(
+                                                "{} Transaction and proposal created successfully!",
+                                                "✅".bright_green()
+                                            );
+                                            println!(
+                                                "  {}: {}",
+                                                "Transaction Signature".cyan(),
+                                                signature.to_string().bright_white()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            println!(
+                                                "{} Failed to send transaction and proposal: {}",
+                                                "❌".bright_red(),
+                                                e.to_string().red()
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "{} Failed to create signed transaction: {}",
+                                        "❌".bright_red(),
+                                        e.to_string().red()
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!(
+                                "{} Failed to create transaction and proposal message: {}",
+                                "❌".bright_red(),
+                                e.to_string().red()
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     println!(
