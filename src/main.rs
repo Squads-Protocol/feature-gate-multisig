@@ -1,29 +1,31 @@
+mod feature_gate_program;
 mod provision;
 mod squads;
-mod feature_gate_program;
 
 use crate::provision::create_multisig;
-use crate::squads::{Member, Permissions, Multisig, get_vault_pda};
+use crate::squads::{get_vault_pda, Member, Multisig, Permissions};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
-use inquire::{Select, Text, Confirm};
+use inquire::{Confirm, Select, Text};
 use serde::{Deserialize, Serialize};
 
 use solana_client::rpc_client::RpcClient;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
-use solana_signer::{Signer, EncodableKey};
+use solana_signer::{EncodableKey, Signer};
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
-use tabled::{Table, Tabled, settings::Style};
+use tabled::{settings::Style, Table, Tabled};
 
 #[derive(Parser)]
 #[command(name = "feature-gate-multisig-tool")]
-#[command(about = "A command-line tool for rapidly provisioning minimal Squads multisig setups specifically designed for Solana feature gate governance")]
-#[command(long_about = "This tool enables parties to create multisig wallets where the default vault address can be mapped to feature gate account addresses, allowing collective voting on whether new Solana features should be implemented.
+#[command(
+    about = "A command-line tool for rapidly provisioning minimal Squads multisig setups specifically designed for Solana feature gate governance"
+)]
+#[command(
+    long_about = "This tool enables parties to create multisig wallets where the default vault address can be mapped to feature gate account addresses, allowing collective voting on whether new Solana features should be implemented.
 
 Features:
 • 🚀 Rapid provisioning of Squads multisig wallets
@@ -32,7 +34,8 @@ Features:
 • 📋 Persistent configuration with saved networks and members
 • 🎨 Rich CLI experience with colored output and tables
 
-For more information, run: feature-gate-multisig-tool help <COMMAND>")]
+For more information, run: feature-gate-multisig-tool help <COMMAND>"
+)]
 #[command(version = "0.1.0")]
 struct Cli {
     #[command(subcommand)]
@@ -42,37 +45,57 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "Create a new multisig wallet with interactive setup")]
-    #[command(long_about = "Creates a new multisig wallet for feature gate governance. The tool will guide you through:
+    #[command(
+        long_about = "Creates a new multisig wallet for feature gate governance. The tool will guide you through:
 • Configuration review (if saved config exists)
 • Member collection (interactive or from saved config)
 • Network deployment selection (automatic or manual)
 • Multi-network deployment with consistent addresses
 • Comprehensive deployment summary
 
-The contributor key receives Initiate-only permissions, while additional members receive full permissions (Initiate, Vote, Execute).")]
+The contributor key receives Initiate-only permissions, while additional members receive full permissions (Initiate, Vote, Execute)."
+    )]
     Create {
-        #[arg(short, long, help = "Number of required signatures (will be prompted if not provided)")]
+        #[arg(
+            short,
+            long,
+            help = "Number of required signatures (will be prompted if not provided)"
+        )]
         threshold: Option<u32>,
-        #[arg(short, long, help = "Signers (currently unused - members are collected interactively)")]
+        #[arg(
+            short,
+            long,
+            help = "Signers (currently unused - members are collected interactively)"
+        )]
         signers: Option<Vec<String>>,
-        #[arg(short = 'k', long, help = "Keypair file path for paying transaction fees")]
+        #[arg(
+            short = 'k',
+            long,
+            help = "Keypair file path for paying transaction fees (e.g., ~/.config/solana/id.json)"
+        )]
         keypair: Option<String>,
     },
     #[command(about = "Show feature multisig details for a given address")]
-    #[command(long_about = "Display detailed information about an existing multisig wallet including member permissions, threshold settings, and network deployment status.")]
+    #[command(
+        long_about = "Display detailed information about an existing multisig wallet including member permissions, threshold settings, and network deployment status."
+    )]
     Show {
         #[arg(help = "The multisig address to inspect")]
         address: Option<String>,
     },
     #[command(about = "Start interactive mode (default when no command is specified)")]
-    #[command(long_about = "Launches the interactive mode which provides a guided experience for creating multisig wallets. This is the default mode when no command is specified.")]
+    #[command(
+        long_about = "Launches the interactive mode which provides a guided experience for creating multisig wallets. This is the default mode when no command is specified."
+    )]
     Interactive,
     #[command(about = "Show current configuration including networks and saved members")]
-    #[command(long_about = "Displays the current configuration stored in ~/.feature-gate-multisig-tool/config.json including:
+    #[command(
+        long_about = "Displays the current configuration stored in ~/.feature-gate-multisig-tool/config.json including:
 • Saved networks array for automatic deployment
 • Saved member public keys
 • Default threshold setting
-• Configuration file location")]
+• Configuration file location"
+    )]
     Config,
 }
 
@@ -159,21 +182,42 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("{} {}", "❌ Error:".bright_red().bold(), e.to_string().bright_red());
+        eprintln!(
+            "{} {}",
+            "❌ Error:".bright_red().bold(),
+            e.to_string().bright_red()
+        );
 
         // Provide helpful error messages for common issues
         let error_msg = e.to_string();
         if error_msg.contains("config") {
-            eprintln!("{} Try running: {}", "💡 Hint:".bright_blue(), "feature-gate-multisig-tool config".bright_cyan());
+            eprintln!(
+                "{} Try running: {}",
+                "💡 Hint:".bright_blue(),
+                "feature-gate-multisig-tool config".bright_cyan()
+            );
         } else if error_msg.contains("address") || error_msg.contains("pubkey") {
-            eprintln!("{} Public keys should be valid base58-encoded addresses", "💡 Hint:".bright_blue());
+            eprintln!(
+                "{} Public keys should be valid base58-encoded addresses",
+                "💡 Hint:".bright_blue()
+            );
         } else if error_msg.contains("network") || error_msg.contains("URL") {
-            eprintln!("{} Network URLs should start with https:// (e.g., https://api.devnet.solana.com)", "💡 Hint:".bright_blue());
+            eprintln!(
+                "{} Network URLs should start with https:// (e.g., https://api.devnet.solana.com)",
+                "💡 Hint:".bright_blue()
+            );
         } else if error_msg.contains("threshold") {
-            eprintln!("{} Threshold must be a positive number not exceeding member count", "💡 Hint:".bright_blue());
+            eprintln!(
+                "{} Threshold must be a positive number not exceeding member count",
+                "💡 Hint:".bright_blue()
+            );
         }
 
-        eprintln!("\n{} Run {} for usage information", "💡".bright_blue(), "--help".bright_cyan());
+        eprintln!(
+            "\n{} Run {} for usage information",
+            "💡".bright_blue(),
+            "--help".bright_cyan()
+        );
         std::process::exit(1);
     }
 }
@@ -182,10 +226,18 @@ async fn handle_command(command: Commands) -> Result<()> {
     let mut config = load_config()?;
 
     match command {
-        Commands::Create { threshold, signers: _, keypair } => {
+        Commands::Create {
+            threshold,
+            signers: _,
+            keypair,
+        } => {
             let threshold = if let Some(t) = threshold {
                 if t == 0 {
-                    println!("{} Threshold cannot be 0, using default: {}", "⚠️".bright_yellow(), config.threshold);
+                    println!(
+                        "{} Threshold cannot be 0, using default: {}",
+                        "⚠️".bright_yellow(),
+                        config.threshold
+                    );
                     config.threshold
                 } else {
                     t as u16
@@ -218,7 +270,11 @@ async fn handle_command(command: Commands) -> Result<()> {
                 match Pubkey::from_str(&addr) {
                     Ok(_) => addr,
                     Err(_) => {
-                        println!("{} Invalid address format: {}", "❌".bright_red(), addr.bright_red());
+                        println!(
+                            "{} Invalid address format: {}",
+                            "❌".bright_red(),
+                            addr.bright_red()
+                        );
                         return Err(anyhow::anyhow!("Invalid multisig address format"));
                     }
                 }
@@ -255,7 +311,27 @@ async fn interactive_mode() -> Result<()> {
                 .parse()
                 .unwrap_or(config.threshold);
 
-                create_feature_multisig(&mut config, threshold, vec![], None).await?;
+                // Prompt for fee payer keypair path
+                let default_feepayer = config
+                    .fee_payer_path
+                    .as_deref()
+                    .unwrap_or("~/.config/solana/id.json");
+
+                let feepayer_path = Text::new("Enter fee payer keypair file path:")
+                    .with_default(default_feepayer)
+                    .prompt()?;
+
+                // Expand tilde to home directory
+                let expanded_path = if feepayer_path.starts_with("~/") {
+                    let home = dirs::home_dir()
+                        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+                    home.join(&feepayer_path[2..]).to_string_lossy().to_string()
+                } else {
+                    feepayer_path
+                };
+
+                create_feature_multisig(&mut config, threshold, vec![], Some(expanded_path))
+                    .await?;
             }
             "Show feature gate multisig details" => {
                 let address = Text::new("Enter the main multisig address:").prompt()?;
@@ -280,7 +356,12 @@ async fn create_feature_multisig(
     _sub_multisigs: Vec<String>,
     keypair_path: Option<String>,
 ) -> Result<()> {
-    println!("{}", "🚀 Creating feature gate multisig configuration".bright_cyan().bold());
+    println!(
+        "{}",
+        "🚀 Creating feature gate multisig configuration"
+            .bright_cyan()
+            .bold()
+    );
 
     // Check for existing configuration and ask user
     let use_saved_config = review_config(config)?;
@@ -300,8 +381,11 @@ async fn create_feature_multisig(
                     });
                 }
                 Err(_) => {
-                    println!("  {} Invalid saved member key: {}, skipping...",
-                             "⚠️".bright_yellow(), member_str);
+                    println!(
+                        "  {} Invalid saved member key: {}, skipping...",
+                        "⚠️".bright_yellow(),
+                        member_str
+                    );
                 }
             }
         }
@@ -315,9 +399,7 @@ async fn create_feature_multisig(
 
         // Collect additional member keys
         loop {
-            let add_member = Confirm::new("Add a member?")
-                .with_default(true)
-                .prompt()?;
+            let add_member = Confirm::new("Add a member?").with_default(true).prompt()?;
 
             if !add_member {
                 break;
@@ -329,13 +411,19 @@ async fn create_feature_multisig(
                         key: member_key,
                         permissions: Permissions { mask: 7 },
                     });
-                    println!("  {} Added member: {} ({})",
-                             "✓".bright_green(),
-                             member_key.to_string().bright_white(),
-                             "Initiate, Vote, Execute".bright_cyan());
+                    println!(
+                        "  {} Added member: {} ({})",
+                        "✓".bright_green(),
+                        member_key.to_string().bright_white(),
+                        "Initiate, Vote, Execute".bright_cyan()
+                    );
                 }
                 Err(e) => {
-                    println!("  {} Failed to add member: {}", "❌".bright_red(), e.to_string().bright_red());
+                    println!(
+                        "  {} Failed to add member: {}",
+                        "❌".bright_red(),
+                        e.to_string().bright_red()
+                    );
                     continue;
                 }
             }
@@ -346,13 +434,24 @@ async fn create_feature_multisig(
 
     // Load fee payer keypair from CLI arg or config
     let fee_payer_keypair = if let Some(path) = keypair_path {
-        println!("{} Loading fee payer keypair from CLI: {}", "💰".bright_blue(), path.bright_white());
-        Some(Keypair::read_from_file(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to load keypair from {}: {}", path, e))?)
+        println!(
+            "{} Loading fee payer keypair from CLI: {}",
+            "💰".bright_blue(),
+            path.bright_white()
+        );
+        Some(
+            Keypair::read_from_file(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to load keypair from {}: {}", path, e))?,
+        )
     } else if let Some(path) = &config.fee_payer_path {
-        println!("{} Loading fee payer keypair from config: {}", "💰".bright_blue(), path.bright_white());
-        Some(Keypair::read_from_file(path)
-            .map_err(|e| anyhow::anyhow!("Failed to load keypair from config path {}: {}", path, e))?)
+        println!(
+            "{} Loading fee payer keypair from config: {}",
+            "💰".bright_blue(),
+            path.bright_white()
+        );
+        Some(Keypair::read_from_file(path).map_err(|e| {
+            anyhow::anyhow!("Failed to load keypair from config path {}: {}", path, e)
+        })?)
     } else {
         println!("{} No fee payer keypair provided", "⚠️".bright_yellow());
         None
@@ -366,40 +465,69 @@ async fn create_feature_multisig(
     let create_key = Keypair::new();
 
     // Add contributor as a member with permission 1 (bitmask for Initiate only)
-    members.insert(0, Member {
-        key: contributor_pubkey,
-        permissions: Permissions { mask: 1 },
-    });
+    members.insert(
+        0,
+        Member {
+            key: contributor_pubkey,
+            permissions: Permissions { mask: 1 },
+        },
+    );
 
     println!("\n{}", "📋 Final Configuration:".bright_yellow().bold());
-    println!("  {}: {}", "Contributor public key".cyan(), contributor_pubkey.to_string().bright_white());
-    println!("  {}: {}", "Create key".cyan(), create_key.pubkey().to_string().bright_white());
+    println!(
+        "  {}: {}",
+        "Contributor public key".cyan(),
+        contributor_pubkey.to_string().bright_white()
+    );
+    println!(
+        "  {}: {}",
+        "Create key".cyan(),
+        create_key.pubkey().to_string().bright_white()
+    );
     if let Some(fee_payer) = &fee_payer_keypair {
-        println!("  {}: {}", "Fee payer".cyan(), fee_payer.pubkey().to_string().bright_green());
+        println!(
+            "  {}: {}",
+            "Fee payer".cyan(),
+            fee_payer.pubkey().to_string().bright_green()
+        );
     } else {
-        println!("  {}: {} (same as contributor)", "Fee payer".cyan(), contributor_pubkey.to_string().bright_yellow());
+        println!(
+            "  {}: {} (same as contributor)",
+            "Fee payer".cyan(),
+            contributor_pubkey.to_string().bright_yellow()
+        );
     }
-    println!("  {}: {}", "Threshold".cyan(), final_threshold.to_string().bright_green());
+    println!(
+        "  {}: {}",
+        "Threshold".cyan(),
+        final_threshold.to_string().bright_green()
+    );
 
     println!("\n{}", "👥 All Members:".bright_yellow().bold());
-    println!("  {} Contributor: {} ({})",
-             "✓".bright_green(),
-             contributor_pubkey.to_string().bright_white(),
-             "Initiate".bright_cyan());
+    println!(
+        "  {} Contributor: {} ({})",
+        "✓".bright_green(),
+        contributor_pubkey.to_string().bright_white(),
+        "Initiate".bright_cyan()
+    );
 
     // Display all other members
     for (i, member) in members.iter().skip(1).enumerate() {
         let perms = decode_permissions(member.permissions.mask);
-        println!("  {} Member {}: {} ({})",
-                 "✓".bright_green(),
-                 i + 1,
-                 member.key.to_string().bright_white(),
-                 perms.join(", ").bright_cyan());
+        println!(
+            "  {} Member {}: {} ({})",
+            "✓".bright_green(),
+            i + 1,
+            member.key.to_string().bright_white(),
+            perms.join(", ").bright_cyan()
+        );
     }
 
-    println!("\n{} {}",
-             "📊 Total members:".bright_yellow().bold(),
-             members.len().to_string().bright_green());
+    println!(
+        "\n{} {}",
+        "📊 Total members:".bright_yellow().bold(),
+        members.len().to_string().bright_green()
+    );
     println!();
 
     // Store deployment results
@@ -413,21 +541,44 @@ async fn create_feature_multisig(
         println!("\n{} Deploying to all saved networks", "🚀".bright_cyan());
 
         for (i, rpc_url) in saved_networks.iter().enumerate() {
-            println!("\n{} Deployment {} of {} to: {}",
-                     "📡".bright_blue(),
-                     (i + 1).to_string().bright_green(),
-                     saved_networks.len().to_string().bright_green(),
-                     rpc_url.bright_white());
-            println!("{}", "📦 All public keys for this deployment:".bright_yellow().bold());
+            println!(
+                "\n{} Deployment {} of {} to: {}",
+                "📡".bright_blue(),
+                (i + 1).to_string().bright_green(),
+                saved_networks.len().to_string().bright_green(),
+                rpc_url.bright_white()
+            );
+            println!(
+                "{}",
+                "📦 All public keys for this deployment:"
+                    .bright_yellow()
+                    .bold()
+            );
 
             // Derive addresses that will be created
             let multisig_address = crate::squads::get_multisig_pda(&create_key.pubkey(), None).0;
             let vault_address = get_vault_pda(&multisig_address, 0, None).0;
 
-            println!("  {}: {}", "Create key".cyan(), create_key.pubkey().to_string().bright_white());
-            println!("  {}: {}", "Contributor".cyan(), contributor_pubkey.to_string().bright_white());
-            println!("  {}: {}", "Multisig PDA".cyan(), multisig_address.to_string().bright_green());
-            println!("  {}: {}", "Vault PDA (index 0)".cyan(), vault_address.to_string().bright_green());
+            println!(
+                "  {}: {}",
+                "Create key".cyan(),
+                create_key.pubkey().to_string().bright_white()
+            );
+            println!(
+                "  {}: {}",
+                "Contributor".cyan(),
+                contributor_pubkey.to_string().bright_white()
+            );
+            println!(
+                "  {}: {}",
+                "Multisig PDA".cyan(),
+                multisig_address.to_string().bright_green()
+            );
+            println!(
+                "  {}: {}",
+                "Vault PDA (index 0)".cyan(),
+                vault_address.to_string().bright_green()
+            );
             for (i, member) in members.iter().enumerate() {
                 let perms = decode_permissions(member.permissions.mask);
                 let label = if member.key == contributor_pubkey {
@@ -435,16 +586,19 @@ async fn create_feature_multisig(
                 } else {
                     format!("Member {}", i)
                 };
-                println!("  {}: {} ({})",
-                         label.cyan(),
-                         member.key.to_string().bright_white(),
-                         perms.join(", ").bright_cyan());
+                println!(
+                    "  {}: {} ({})",
+                    label.cyan(),
+                    member.key.to_string().bright_white(),
+                    perms.join(", ").bright_cyan()
+                );
             }
             println!();
 
             // Create multisig using provision code
             // Use fee payer if provided, otherwise use contributor keypair
-            let signer_for_creation = fee_payer_keypair.as_ref()
+            let signer_for_creation = fee_payer_keypair
+                .as_ref()
                 .map(|kp| kp as &dyn Signer)
                 .unwrap_or(&contributor_initiator_keypair as &dyn Signer);
 
@@ -456,9 +610,11 @@ async fn create_feature_multisig(
                 None, // No config authority
                 members.clone(),
                 final_threshold,
-                None, // No rent collector
+                None,       // No rent collector
                 Some(5000), // Priority fee
-            ).await {
+            )
+            .await
+            {
                 Ok((multisig_address, signature)) => {
                     let vault_address = get_vault_pda(&multisig_address, 0, None).0;
 
@@ -469,15 +625,19 @@ async fn create_feature_multisig(
                         transaction_signature: signature,
                     });
 
-                    println!("{} Deployment successful on {}",
-                             "✅".bright_green(),
-                             rpc_url.bright_white());
+                    println!(
+                        "{} Deployment successful on {}",
+                        "✅".bright_green(),
+                        rpc_url.bright_white()
+                    );
                 }
                 Err(e) => {
-                    println!("{} Failed to deploy on {}: {}",
-                             "❌".bright_red(),
-                             rpc_url.bright_white(),
-                             e.to_string().red());
+                    println!(
+                        "{} Failed to deploy on {}: {}",
+                        "❌".bright_red(),
+                        rpc_url.bright_white(),
+                        e.to_string().red()
+                    );
                 }
             }
 
@@ -507,9 +667,7 @@ async fn create_feature_multisig(
                     Ok(url) => break url,
                     Err(e) => {
                         println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
-                        let retry = Confirm::new("Try again?")
-                            .with_default(true)
-                            .prompt()?;
+                        let retry = Confirm::new("Try again?").with_default(true).prompt()?;
                         if !retry {
                             return Err(anyhow::anyhow!("User cancelled network entry"));
                         }
@@ -517,74 +675,109 @@ async fn create_feature_multisig(
                 }
             };
 
-        println!("\n{} {}", "🌐 Deploying to:".bright_blue().bold(), rpc_url.bright_white());
-        println!("{}", "📦 All public keys for this deployment:".bright_yellow().bold());
+            println!(
+                "\n{} {}",
+                "🌐 Deploying to:".bright_blue().bold(),
+                rpc_url.bright_white()
+            );
+            println!(
+                "{}",
+                "📦 All public keys for this deployment:"
+                    .bright_yellow()
+                    .bold()
+            );
 
-        // Derive addresses that will be created
-        let multisig_address = crate::squads::get_multisig_pda(&create_key.pubkey(), None).0;
-        let vault_address = get_vault_pda(&multisig_address, 0, None).0;
+            // Derive addresses that will be created
+            let multisig_address = crate::squads::get_multisig_pda(&create_key.pubkey(), None).0;
+            let vault_address = get_vault_pda(&multisig_address, 0, None).0;
 
-        println!("  {}: {}", "Create key".cyan(), create_key.pubkey().to_string().bright_white());
-        println!("  {}: {}", "Contributor".cyan(), contributor_pubkey.to_string().bright_white());
-        println!("  {}: {}", "Multisig PDA".cyan(), multisig_address.to_string().bright_green());
-        println!("  {}: {}", "Vault PDA (index 0)".cyan(), vault_address.to_string().bright_green());
-        for (i, member) in members.iter().enumerate() {
-            let perms = decode_permissions(member.permissions.mask);
-            let label = if member.key == contributor_pubkey {
-                "Contributor".to_string()
-            } else {
-                format!("Member {}", i)
-            };
-            println!("  {}: {} ({})",
-                     label.cyan(),
-                     member.key.to_string().bright_white(),
-                     perms.join(", ").bright_cyan());
-        }
-        println!();
-
-        // Create multisig using provision code
-        // Use fee payer if provided, otherwise use contributor keypair
-        let signer_for_creation = fee_payer_keypair.as_ref()
-            .map(|kp| kp as &dyn Signer)
-            .unwrap_or(&contributor_initiator_keypair as &dyn Signer);
-
-        match create_multisig(
-            rpc_url.clone(),
-            None, // Use default program ID
-            signer_for_creation,
-            &create_key,
-            None, // No config authority
-            members.clone(),
-            final_threshold,
-            None, // No rent collector
-            Some(5000), // Priority fee
-        ).await {
-            Ok((multisig_address, signature)) => {
-                let vault_address = get_vault_pda(&multisig_address, 0, None).0;
-
-                deployments.push(DeploymentResult {
-                    rpc_url: rpc_url.clone(),
-                    multisig_address,
-                    vault_address,
-                    transaction_signature: signature,
-                });
-
-                println!("{} Deployment successful on {}",
-                         "✅".bright_green(),
-                         rpc_url.bright_white());
+            println!(
+                "  {}: {}",
+                "Create key".cyan(),
+                create_key.pubkey().to_string().bright_white()
+            );
+            println!(
+                "  {}: {}",
+                "Contributor".cyan(),
+                contributor_pubkey.to_string().bright_white()
+            );
+            println!(
+                "  {}: {}",
+                "Multisig PDA".cyan(),
+                multisig_address.to_string().bright_green()
+            );
+            println!(
+                "  {}: {}",
+                "Vault PDA (index 0)".cyan(),
+                vault_address.to_string().bright_green()
+            );
+            for (i, member) in members.iter().enumerate() {
+                let perms = decode_permissions(member.permissions.mask);
+                let label = if member.key == contributor_pubkey {
+                    "Contributor".to_string()
+                } else {
+                    format!("Member {}", i)
+                };
+                println!(
+                    "  {}: {} ({})",
+                    label.cyan(),
+                    member.key.to_string().bright_white(),
+                    perms.join(", ").bright_cyan()
+                );
             }
-            Err(e) => {
-                println!("{} Failed to deploy on {}: {}",
-                         "❌".bright_red(),
-                         rpc_url.bright_white(),
-                         e.to_string().red());
+            println!();
+
+            // Create multisig using provision code
+            // Use fee payer if provided, otherwise use contributor keypair
+            let signer_for_creation = fee_payer_keypair
+                .as_ref()
+                .map(|kp| kp as &dyn Signer)
+                .unwrap_or(&contributor_initiator_keypair as &dyn Signer);
+
+            match create_multisig(
+                rpc_url.clone(),
+                None, // Use default program ID
+                signer_for_creation,
+                &create_key,
+                None, // No config authority
+                members.clone(),
+                final_threshold,
+                None,       // No rent collector
+                Some(5000), // Priority fee
+            )
+            .await
+            {
+                Ok((multisig_address, signature)) => {
+                    let vault_address = get_vault_pda(&multisig_address, 0, None).0;
+
+                    deployments.push(DeploymentResult {
+                        rpc_url: rpc_url.clone(),
+                        multisig_address,
+                        vault_address,
+                        transaction_signature: signature,
+                    });
+
+                    println!(
+                        "{} Deployment successful on {}",
+                        "✅".bright_green(),
+                        rpc_url.bright_white()
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "{} Failed to deploy on {}: {}",
+                        "❌".bright_red(),
+                        rpc_url.bright_white(),
+                        e.to_string().red()
+                    );
+                }
             }
-        }
 
             // Ask if they want to deploy to another network
-            let deploy_another = Confirm::new("Deploy to another network with the same configuration?")
-                .with_default(false)
-                .prompt()?;
+            let deploy_another =
+                Confirm::new("Deploy to another network with the same configuration?")
+                    .with_default(false)
+                    .prompt()?;
 
             if !deploy_another {
                 break;
@@ -595,7 +788,12 @@ async fn create_feature_multisig(
     }
 
     // Print summary table
-    print_deployment_summary(&deployments, &members, final_threshold, &create_key.pubkey());
+    print_deployment_summary(
+        &deployments,
+        &members,
+        final_threshold,
+        &create_key.pubkey(),
+    );
 
     // Save updated configuration (excluding contributor key)
     if !deployments.is_empty() {
@@ -608,7 +806,10 @@ async fn create_feature_multisig(
             .collect();
 
         save_config(config)?;
-        println!("\n{} Configuration saved for future use", "💾".bright_green());
+        println!(
+            "\n{} Configuration saved for future use",
+            "💾".bright_green()
+        );
     }
 
     Ok(())
@@ -619,55 +820,81 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
     let multisig_pubkey = Pubkey::from_str(address)
         .map_err(|_| anyhow::anyhow!("Invalid multisig address format"))?;
 
-    println!("{}", "🔍 Fetching multisig details...".bright_yellow().bold());
+    println!(
+        "{}",
+        "🔍 Fetching multisig details...".bright_yellow().bold()
+    );
     println!();
 
-    // Determine which network to use
-    let rpc_url = if !config.networks.is_empty() {
-        // If we have multiple networks, ask which one to query
-        if config.networks.len() > 1 {
-            println!("Available networks:");
-            for (i, network) in config.networks.iter().enumerate() {
-                println!("  {}: {}", i + 1, network);
-            }
+    // Try all configured networks until we find the account
+    let mut account_data = None;
+    let mut successful_rpc_url = None;
+    let mut last_error = None;
 
-            // For testing, let's try mainnet first if available, otherwise use the first network
-            if config.networks.iter().any(|n| n.contains("mainnet")) {
-                let mainnet_url = config.networks.iter().find(|n| n.contains("mainnet")).unwrap();
-                println!("🌐 Trying mainnet-beta first: {}", mainnet_url);
-                mainnet_url.clone()
-            } else {
-                config.networks[0].clone()
-            }
-        } else {
-            config.networks[0].clone()
-        }
+    let networks_to_try = if !config.networks.is_empty() {
+        config.networks.clone()
     } else if !config.network.is_empty() {
-        config.network.clone()
+        vec![config.network.clone()]
     } else {
-        "https://api.devnet.solana.com".to_string()
+        vec!["https://api.devnet.solana.com".to_string()]
     };
 
-    println!("📡 Querying network: {}", rpc_url.bright_white());
-    println!("🎯 Multisig address: {}", multisig_pubkey.to_string().bright_white());
+    println!("Available networks to search:");
+    for (i, network) in networks_to_try.iter().enumerate() {
+        println!("  {}: {}", i + 1, network);
+    }
     println!();
 
-    // Create RPC client and fetch account data directly
-    let rpc_client = RpcClient::new(&rpc_url);
+    for rpc_url in &networks_to_try {
+        println!("🌐 Trying network: {}", rpc_url.bright_white());
 
-    // Use get_account_data to get just the data
-    let account_data = rpc_client.get_account_data(&multisig_pubkey)
-        .map_err(|e| {
-            let error_str = e.to_string();
-            if error_str.contains("AccountNotFound") || error_str.contains("could not find account") {
-                anyhow::anyhow!("Account not found: {}. This address may not exist on the selected network or may not be a multisig account.", multisig_pubkey)
-            } else {
-                anyhow::anyhow!("Failed to fetch multisig account data: {}", e)
+        let rpc_client = RpcClient::new(rpc_url);
+        match rpc_client.get_account_data(&multisig_pubkey) {
+            Ok(data) => {
+                println!("✅ Found account on: {}", rpc_url.bright_green());
+                account_data = Some(data);
+                successful_rpc_url = Some(rpc_url.clone());
+                break;
             }
-        })?;
+            Err(e) => {
+                let error_str = e.to_string();
+                if error_str.contains("AccountNotFound")
+                    || error_str.contains("could not find account")
+                {
+                    println!("❌ Account not found on: {}", rpc_url.bright_red());
+                    last_error = Some(format!("Account not found: {}. This address may not exist on any of the configured networks or may not be a multisig account.", multisig_pubkey));
+                } else {
+                    println!("❌ Error querying {}: {}", rpc_url.bright_red(), e);
+                    last_error = Some(format!("Failed to query networks: {}", e));
+                }
+            }
+        }
+    }
+
+    let (rpc_url, account_data) = match (successful_rpc_url, account_data) {
+        (Some(url), Some(data)) => (url, data),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "{}",
+                last_error.unwrap_or_else(
+                    || "Failed to find account on any configured network".to_string()
+                )
+            ));
+        }
+    };
+
+    println!();
+    println!("📡 Using network: {}", rpc_url.bright_white());
+    println!(
+        "🎯 Multisig address: {}",
+        multisig_pubkey.to_string().bright_white()
+    );
+    println!();
 
     if account_data.len() < 8 {
-        return Err(anyhow::anyhow!("Account data too small to be a valid multisig"));
+        return Err(anyhow::anyhow!(
+            "Account data too small to be a valid multisig"
+        ));
     }
 
     println!("📊 Account data length: {} bytes", account_data.len());
@@ -739,7 +966,8 @@ fn display_multisig_details(multisig: &Multisig, address: &Pubkey) -> Result<()>
         },
         MultisigInfo {
             property: "Rent Collector".to_string(),
-            value: multisig.rent_collector
+            value: multisig
+                .rent_collector
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "None".to_string()),
         },
@@ -767,18 +995,31 @@ fn display_multisig_details(multisig: &Multisig, address: &Pubkey) -> Result<()>
         bitmask: u8,
     }
 
-    println!("{} ({} total)", "👥 MEMBERS".bright_blue().bold(), multisig.members.len());
+    println!(
+        "{} ({} total)",
+        "👥 MEMBERS".bright_blue().bold(),
+        multisig.members.len()
+    );
     println!();
 
-    let member_data: Vec<MemberInfo> = multisig.members.iter().enumerate().map(|(i, member)| {
-        let perms = decode_permissions(member.permissions.mask);
-        MemberInfo {
-            index: i + 1,
-            pubkey: member.key.to_string(),
-            permissions: if perms.is_empty() { "None".to_string() } else { perms.join(", ") },
-            bitmask: member.permissions.mask,
-        }
-    }).collect();
+    let member_data: Vec<MemberInfo> = multisig
+        .members
+        .iter()
+        .enumerate()
+        .map(|(i, member)| {
+            let perms = decode_permissions(member.permissions.mask);
+            MemberInfo {
+                index: i + 1,
+                pubkey: member.key.to_string(),
+                permissions: if perms.is_empty() {
+                    "None".to_string()
+                } else {
+                    perms.join(", ")
+                },
+                bitmask: member.permissions.mask,
+            }
+        })
+        .collect();
 
     let mut members_table = Table::new(member_data);
     members_table.with(Style::rounded());
@@ -822,38 +1063,77 @@ fn display_multisig_details(multisig: &Multisig, address: &Pubkey) -> Result<()>
     println!("{}", vault_table);
     println!();
 
-    println!("{}", "✅ Multisig details retrieved successfully!".bright_green());
+    println!(
+        "{}",
+        "✅ Multisig details retrieved successfully!".bright_green()
+    );
 
     Ok(())
 }
 
 async fn show_config(config: &Config) -> Result<()> {
     println!("{}", "📋 Configuration:".bright_yellow().bold());
-    println!("  {}: {:?}", "Config file".cyan(), get_config_path()?.to_string_lossy().bright_white());
-    println!("  {}: {}", "Default threshold".cyan(), config.threshold.to_string().bright_green());
+    println!(
+        "  {}: {:?}",
+        "Config file".cyan(),
+        get_config_path()?.to_string_lossy().bright_white()
+    );
+    println!(
+        "  {}: {}",
+        "Default threshold".cyan(),
+        config.threshold.to_string().bright_green()
+    );
 
     // Display fee payer path
     if let Some(fee_payer_path) = &config.fee_payer_path {
-        println!("  {}: {}", "Fee payer keypair".cyan(), fee_payer_path.bright_green());
+        println!(
+            "  {}: {}",
+            "Fee payer keypair".cyan(),
+            fee_payer_path.bright_green()
+        );
     } else {
-        println!("  {}: {}", "Fee payer keypair".cyan(), "Not configured".bright_yellow());
+        println!(
+            "  {}: {}",
+            "Fee payer keypair".cyan(),
+            "Not configured".bright_yellow()
+        );
     }
 
     // Display networks array if available, otherwise show legacy single network
     if !config.networks.is_empty() {
-        println!("  {}: {} networks", "Saved networks".cyan(), config.networks.len().to_string().bright_green());
+        println!(
+            "  {}: {} networks",
+            "Saved networks".cyan(),
+            config.networks.len().to_string().bright_green()
+        );
         for (i, network) in config.networks.iter().enumerate() {
-            println!("    {}: {}", format!("Network {}", i + 1).cyan(), network.bright_white());
+            println!(
+                "    {}: {}",
+                format!("Network {}", i + 1).cyan(),
+                network.bright_white()
+            );
         }
     } else if !config.network.is_empty() {
-        println!("  {}: {}", "Default network".cyan(), config.network.bright_white());
+        println!(
+            "  {}: {}",
+            "Default network".cyan(),
+            config.network.bright_white()
+        );
     }
 
-    println!("  {}: {} members", "Saved members".cyan(), config.members.len().to_string().bright_green());
+    println!(
+        "  {}: {} members",
+        "Saved members".cyan(),
+        config.members.len().to_string().bright_green()
+    );
 
     if !config.members.is_empty() {
         for (i, member) in config.members.iter().enumerate() {
-            println!("    {}: {}", format!("Member {}", i + 1).cyan(), member.bright_white());
+            println!(
+                "    {}: {}",
+                format!("Member {}", i + 1).cyan(),
+                member.bright_white()
+            );
         }
     }
 
@@ -862,9 +1142,15 @@ async fn show_config(config: &Config) -> Result<()> {
 
 fn decode_permissions(mask: u8) -> Vec<String> {
     let mut permissions = Vec::new();
-    if mask & 1 != 0 { permissions.push("Initiate".to_string()); }
-    if mask & 2 != 0 { permissions.push("Vote".to_string()); }
-    if mask & 4 != 0 { permissions.push("Execute".to_string()); }
+    if mask & 1 != 0 {
+        permissions.push("Initiate".to_string());
+    }
+    if mask & 2 != 0 {
+        permissions.push("Vote".to_string());
+    }
+    if mask & 4 != 0 {
+        permissions.push("Execute".to_string());
+    }
     permissions
 }
 
@@ -886,10 +1172,17 @@ fn validate_rpc_url(url: &str) -> Result<String> {
     }
 
     // Check for common Solana RPC patterns
-    if url.contains("solana.com") || url.contains("localhost") || url.contains("127.0.0.1") || url.contains("rpc") {
+    if url.contains("solana.com")
+        || url.contains("localhost")
+        || url.contains("127.0.0.1")
+        || url.contains("rpc")
+    {
         println!("  {} Valid RPC URL format detected", "✓".bright_green());
     } else {
-        println!("  {} Warning: URL doesn't match common Solana RPC patterns", "⚠️".bright_yellow());
+        println!(
+            "  {} Warning: URL doesn't match common Solana RPC patterns",
+            "⚠️".bright_yellow()
+        );
         let confirm = Confirm::new("Continue with this URL?")
             .with_default(false)
             .prompt()?;
@@ -906,16 +1199,24 @@ fn validate_pubkey_with_retry(prompt: &str) -> Result<Pubkey> {
         let input = Text::new(prompt).prompt()?;
         match Pubkey::from_str(&input.trim()) {
             Ok(pubkey) => {
-                println!("  {} Valid public key: {}", "✓".bright_green(), pubkey.to_string().bright_white());
+                println!(
+                    "  {} Valid public key: {}",
+                    "✓".bright_green(),
+                    pubkey.to_string().bright_white()
+                );
                 return Ok(pubkey);
             }
             Err(_) => {
-                println!("  {} Invalid public key format. Please try again.", "❌".bright_red());
-                println!("  {} Public keys should be valid base58-encoded addresses", "💡".bright_blue());
+                println!(
+                    "  {} Invalid public key format. Please try again.",
+                    "❌".bright_red()
+                );
+                println!(
+                    "  {} Public keys should be valid base58-encoded addresses",
+                    "💡".bright_blue()
+                );
 
-                let retry = Confirm::new("Try again?")
-                    .with_default(true)
-                    .prompt()?;
+                let retry = Confirm::new("Try again?").with_default(true).prompt()?;
                 if !retry {
                     return Err(anyhow::anyhow!("User cancelled public key entry"));
                 }
@@ -930,19 +1231,22 @@ fn validate_threshold(input: &str, max_members: usize, default: u16) -> Result<u
     }
 
     match input.trim().parse::<u16>() {
-        Ok(threshold) if threshold == 0 => {
-            Err(anyhow::anyhow!("Threshold must be at least 1"))
-        }
-        Ok(threshold) if threshold > max_members as u16 => {
-            Err(anyhow::anyhow!("Threshold cannot exceed number of members ({})", max_members))
-        }
+        Ok(threshold) if threshold == 0 => Err(anyhow::anyhow!("Threshold must be at least 1")),
+        Ok(threshold) if threshold > max_members as u16 => Err(anyhow::anyhow!(
+            "Threshold cannot exceed number of members ({})",
+            max_members
+        )),
         Ok(threshold) => {
-            println!("  {} Valid threshold: {}", "✓".bright_green(), threshold.to_string().bright_white());
+            println!(
+                "  {} Valid threshold: {}",
+                "✓".bright_green(),
+                threshold.to_string().bright_white()
+            );
             Ok(threshold)
         }
-        Err(_) => {
-            Err(anyhow::anyhow!("Invalid number format. Please enter a positive integer."))
-        }
+        Err(_) => Err(anyhow::anyhow!(
+            "Invalid number format. Please enter a positive integer."
+        )),
     }
 }
 
@@ -961,7 +1265,10 @@ fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(bool,
         return Ok((false, Vec::new()));
     }
 
-    println!("\n{}", "🌐 Network Deployment Options:".bright_blue().bold());
+    println!(
+        "\n{}",
+        "🌐 Network Deployment Options:".bright_blue().bold()
+    );
     println!("  Option 1: Deploy to all saved networks automatically");
     for (i, network) in available_networks.iter().enumerate() {
         let network_name = if network.contains("devnet") {
@@ -973,7 +1280,12 @@ fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(bool,
         } else {
             "Custom"
         };
-        println!("    {}: {} ({})", format!("Network {}", i + 1).cyan(), network_name.bright_white(), network.bright_white());
+        println!(
+            "    {}: {} ({})",
+            format!("Network {}", i + 1).cyan(),
+            network_name.bright_white(),
+            network.bright_white()
+        );
     }
     println!("  Option 2: Manual network entry (prompt for each deployment)");
 
@@ -989,14 +1301,29 @@ fn review_config(config: &Config) -> Result<bool> {
         return Ok(false);
     }
 
-    println!("\n{}", "📋 Found existing configuration:".bright_yellow().bold());
-    println!("  {}: {}", "Threshold".cyan(), config.threshold.to_string().bright_green());
+    println!(
+        "\n{}",
+        "📋 Found existing configuration:".bright_yellow().bold()
+    );
+    println!(
+        "  {}: {}",
+        "Threshold".cyan(),
+        config.threshold.to_string().bright_green()
+    );
 
     // Show fee payer path
     if let Some(fee_payer_path) = &config.fee_payer_path {
-        println!("  {}: {}", "Fee payer keypair".cyan(), fee_payer_path.bright_green());
+        println!(
+            "  {}: {}",
+            "Fee payer keypair".cyan(),
+            fee_payer_path.bright_green()
+        );
     } else {
-        println!("  {}: {}", "Fee payer keypair".cyan(), "Not configured".bright_yellow());
+        println!(
+            "  {}: {}",
+            "Fee payer keypair".cyan(),
+            "Not configured".bright_yellow()
+        );
     }
 
     // Show networks
@@ -1006,15 +1333,31 @@ fn review_config(config: &Config) -> Result<bool> {
         &vec![config.network.clone()]
     };
 
-    println!("  {}: {} networks", "Saved networks".cyan(), networks_to_show.len().to_string().bright_green());
+    println!(
+        "  {}: {} networks",
+        "Saved networks".cyan(),
+        networks_to_show.len().to_string().bright_green()
+    );
     for (i, network) in networks_to_show.iter().enumerate() {
-        println!("    {}: {}", format!("Network {}", i + 1).cyan(), network.bright_white());
+        println!(
+            "    {}: {}",
+            format!("Network {}", i + 1).cyan(),
+            network.bright_white()
+        );
     }
 
     if !config.members.is_empty() {
-        println!("  {}: {} members", "Saved members".cyan(), config.members.len().to_string().bright_green());
+        println!(
+            "  {}: {} members",
+            "Saved members".cyan(),
+            config.members.len().to_string().bright_green()
+        );
         for (i, member) in config.members.iter().enumerate() {
-            println!("    {}: {}", format!("Member {}", i + 1).cyan(), member.bright_white());
+            println!(
+                "    {}: {}",
+                format!("Member {}", i + 1).cyan(),
+                member.bright_white()
+            );
         }
     }
 
@@ -1054,9 +1397,17 @@ struct DeploymentRow {
     vault_address: String,
 }
 
-fn print_deployment_summary(deployments: &[DeploymentResult], members: &[Member], threshold: u16, create_key: &Pubkey) {
+fn print_deployment_summary(
+    deployments: &[DeploymentResult],
+    members: &[Member],
+    threshold: u16,
+    create_key: &Pubkey,
+) {
     if deployments.is_empty() {
-        println!("\n{} No successful deployments to summarize.", "❌".bright_red());
+        println!(
+            "\n{} No successful deployments to summarize.",
+            "❌".bright_red()
+        );
         return;
     }
 
@@ -1065,9 +1416,21 @@ fn print_deployment_summary(deployments: &[DeploymentResult], members: &[Member]
 
     // Configuration section
     println!("\n{}", "📋 Configuration:".bright_yellow().bold());
-    println!("  {}: {}", "Create Key".cyan(), create_key.to_string().bright_white());
-    println!("  {}: {}", "Threshold".cyan(), threshold.to_string().bright_green());
-    println!("  {}: {}", "Total Members".cyan(), members.len().to_string().bright_green());
+    println!(
+        "  {}: {}",
+        "Create Key".cyan(),
+        create_key.to_string().bright_white()
+    );
+    println!(
+        "  {}: {}",
+        "Threshold".cyan(),
+        threshold.to_string().bright_green()
+    );
+    println!(
+        "  {}: {}",
+        "Total Members".cyan(),
+        members.len().to_string().bright_green()
+    );
 
     // Members table
     println!("\n{}", "👥 Members & Permissions:".bright_yellow().bold());
@@ -1076,7 +1439,11 @@ fn print_deployment_summary(deployments: &[DeploymentResult], members: &[Member]
         .enumerate()
         .map(|(i, member)| {
             let perms = decode_permissions(member.permissions.mask);
-            let role_indicator = if member.permissions.mask == 1 { " (Contributor)" } else { "" };
+            let role_indicator = if member.permissions.mask == 1 {
+                " (Contributor)"
+            } else {
+                ""
+            };
             MemberRow {
                 index: i + 1,
                 public_key: format!("{}{}", member.key.to_string(), role_indicator),
@@ -1085,9 +1452,7 @@ fn print_deployment_summary(deployments: &[DeploymentResult], members: &[Member]
         })
         .collect();
 
-    let members_table = Table::new(member_rows)
-        .with(Style::rounded())
-        .to_string();
+    let members_table = Table::new(member_rows).with(Style::rounded()).to_string();
     println!("{}", members_table);
 
     // Deployments table
@@ -1123,14 +1488,18 @@ fn print_deployment_summary(deployments: &[DeploymentResult], members: &[Member]
             deployment.rpc_url.clone()
         };
 
-        println!("  {}: {} → {}",
-                format!("{}.", i + 1).bright_cyan(),
-                rpc_display.bright_white(),
-                deployment.transaction_signature.bright_green());
+        println!(
+            "  {}: {} → {}",
+            format!("{}.", i + 1).bright_cyan(),
+            rpc_display.bright_white(),
+            deployment.transaction_signature.bright_green()
+        );
     }
 
-    println!("\n{} Successfully deployed to {} network(s)!",
-             "✅".bright_green().bold(),
-             deployments.len().to_string().bright_green().bold());
+    println!(
+        "\n{} Successfully deployed to {} network(s)!",
+        "✅".bright_green().bold(),
+        deployments.len().to_string().bright_green().bold()
+    );
     println!("{}", "═".repeat(80).bright_blue());
 }
