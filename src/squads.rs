@@ -1,5 +1,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_pubkey::Pubkey;
+use std::io::{Read, Write};
+use std::marker::PhantomData;
 
 pub const CREATE_MULTISIG_V2_DISCRIMINATOR: &[u8] = &[50, 221, 199, 93, 40, 245, 139, 233];
 
@@ -56,7 +58,8 @@ pub struct Permissions {
 
 pub const SEED_EPHEMERAL_SIGNER: &[u8] = b"ephemeral_signer";
 
-pub const SQUADS_MULTISIG_PROGRAM: Pubkey = Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
+pub const SQUADS_MULTISIG_PROGRAM: Pubkey =
+    Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
 
 #[derive(BorshDeserialize)]
 pub struct ProgramConfig {
@@ -205,18 +208,18 @@ impl MultisigCreateTransaction {
     }
 }
 
-pub struct MultisigCreateTransactionData {
-    pub args: MultisigCreateTransactionArgs
+pub struct VaultTransactionCreateArgsData {
+    pub args: VaultTransactionCreateArgs,
 }
 
 #[derive(BorshSerialize, BorshDeserialize)]
-pub struct MultisigCreateTransactionArgs {
+pub struct VaultTransactionCreateArgs {
     pub vault_index: u8,
     pub num_ephemeral_signers: u8,
-    pub transaction_message: VaultTransactionMessage
+    pub transaction_message: TransactionMessage,
 }
 
-impl MultisigCreateTransactionData {
+impl VaultTransactionCreateArgsData {
     pub fn data(&self) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(CREATE_TRANSACTION_DISCRIMINATOR);
@@ -224,7 +227,6 @@ impl MultisigCreateTransactionData {
         data
     }
 }
-
 
 impl MultisigCreateV2Accounts {
     pub fn to_account_metas(&self, _is_signer: Option<bool>) -> Vec<AccountMeta> {
@@ -273,7 +275,7 @@ impl MultisigCreateProposalAccounts {
 }
 
 pub struct MultisigCreateProposalData {
-    pub args: MultisigCreateProposalArgs
+    pub args: MultisigCreateProposalArgs,
 }
 
 impl MultisigCreateProposalData {
@@ -289,4 +291,159 @@ impl MultisigCreateProposalData {
 pub struct MultisigCreateProposalArgs {
     pub transaction_index: u64,
     pub is_draft: bool,
+}
+
+// transaction wire structs
+#[derive(BorshSerialize, BorshDeserialize, Clone)]
+pub struct TransactionMessage {
+    /// The number of signer pubkeys in the account_keys vec.
+    pub num_signers: u8,
+    /// The number of writable signer pubkeys in the account_keys vec.
+    pub num_writable_signers: u8,
+    /// The number of writable non-signer pubkeys in the account_keys vec.
+    pub num_writable_non_signers: u8,
+    /// The list of unique account public keys (including program IDs) that will be used in the provided instructions.
+    pub account_keys: SmallVec<u8, Pubkey>,
+    /// The list of instructions to execute.
+    pub instructions: SmallVec<u8, CompiledInstruction>,
+    /// List of address table lookups used to load additional accounts
+    /// for this transaction.
+    pub address_table_lookups: SmallVec<u8, MessageAddressTableLookup>,
+}
+
+// Concise serialization schema for instructions that make up transaction.
+#[derive(BorshSerialize, BorshDeserialize, Clone)]
+pub struct CompiledInstruction {
+    pub program_id_index: u8,
+    /// Indices into the tx's `account_keys` list indicating which accounts to pass to the instruction.
+    pub account_indexes: SmallVec<u8, u8>,
+    /// Instruction data.
+    pub data: SmallVec<u16, u8>,
+}
+
+/// Address table lookups describe an on-chain address lookup table to use
+/// for loading more readonly and writable accounts in a single tx.
+#[derive(BorshSerialize, BorshDeserialize, Clone)]
+pub struct MessageAddressTableLookup {
+    /// Address lookup table account key
+    pub account_key: Pubkey,
+    /// List of indexes used to load writable account addresses
+    pub writable_indexes: SmallVec<u8, u8>,
+    /// List of indexes used to load readonly account addresses
+    pub readonly_indexes: SmallVec<u8, u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SmallVec<L, T>(Vec<T>, PhantomData<L>);
+
+impl<L, T> SmallVec<L, T> {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.0.iter()
+    }
+}
+
+impl<L, T: PartialEq> SmallVec<L, T> {
+    pub fn contains(&self, x: &T) -> bool {
+        self.0.contains(x)
+    }
+}
+
+impl<L, T> std::ops::Index<usize> for SmallVec<L, T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
+impl<L, T> From<SmallVec<L, T>> for Vec<T> {
+    fn from(val: SmallVec<L, T>) -> Self {
+        val.0
+    }
+}
+
+impl<L, T> From<Vec<T>> for SmallVec<L, T> {
+    fn from(val: Vec<T>) -> Self {
+        Self(val, PhantomData)
+    }
+}
+
+impl<T: BorshSerialize> BorshSerialize for SmallVec<u8, T> {
+    fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        let len = u8::try_from(self.len()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        // Write the length of the vector as u8.
+        writer.write_all(&len.to_le_bytes())?;
+
+        // Write the vector elements.
+        serialize_slice(&self.0, writer)
+    }
+}
+
+impl<T: BorshSerialize> BorshSerialize for SmallVec<u16, T> {
+    fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        let len = u16::try_from(self.len()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        // Write the length of the vector as u16.
+        writer.write_all(&len.to_le_bytes())?;
+
+        // Write the vector elements.
+        serialize_slice(&self.0, writer)
+    }
+}
+
+impl<L, T> BorshDeserialize for SmallVec<L, T>
+where
+    L: BorshDeserialize + Into<u32>,
+    T: BorshDeserialize,
+{
+    /// This implementation almost exactly matches standard implementation of
+    /// `Vec<T>::deserialize` except that it uses `L` instead of `u32` for the length,
+    /// and doesn't include `unsafe` code.
+    fn deserialize_reader<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let len: u32 = L::deserialize_reader(reader)?.into();
+
+        let vec = if len == 0 {
+            Vec::new()
+        } else if let Some(vec_bytes) = T::vec_from_reader(len, reader)? {
+            vec_bytes
+        } else {
+            let mut result = Vec::with_capacity(hint::cautious::<T>(len));
+            for _ in 0..len {
+                result.push(T::deserialize_reader(reader)?);
+            }
+            result
+        };
+
+        Ok(SmallVec(vec, PhantomData))
+    }
+}
+
+// This is copy-pasted from borsh::de::hint;
+mod hint {
+    #[inline]
+    pub fn cautious<T>(hint: u32) -> usize {
+        let el_size = core::mem::size_of::<T>() as u32;
+        core::cmp::max(core::cmp::min(hint, 4096 / el_size), 1) as usize
+    }
+}
+
+/// Helper method that is used to serialize a slice of data (without the length marker).
+/// Copied from borsh::ser::serialize_slice.
+#[inline]
+fn serialize_slice<T: BorshSerialize, W: Write>(data: &[T], writer: &mut W) -> std::io::Result<()> {
+    if let Some(u8_slice) = T::u8_slice(data) {
+        writer.write_all(u8_slice)?;
+    } else {
+        for item in data {
+            item.serialize(writer)?;
+        }
+    }
+    Ok(())
 }

@@ -1,6 +1,6 @@
 use crate::feature_gate_program::create_feature_activation;
 use crate::provision::create_transaction_and_proposal_message;
-use crate::squads::{Member, MultisigCompiledInstruction, Permissions, VaultTransactionMessage};
+use crate::squads::{CompiledInstruction, Member, Permissions, TransactionMessage};
 use anyhow::Result;
 use colored::*;
 use dirs;
@@ -404,7 +404,9 @@ pub fn display_deployment_info(
 }
 
 // Transaction creation functions
-pub fn create_feature_activation_transaction_message() -> VaultTransactionMessage {
+pub fn create_feature_activation_transaction_message() -> TransactionMessage {
+    use crate::squads::SmallVec;
+    
     // Create feature activation instructions for a test feature
     let feature_id = Pubkey::new_unique();
     let funding_address = Pubkey::new_unique();
@@ -418,7 +420,7 @@ pub fn create_feature_activation_transaction_message() -> VaultTransactionMessag
         crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID, // 3: Feature gate program
     ];
     
-    // Compile instructions into MultisigCompiledInstructions
+    // Compile instructions into CompiledInstructions with SmallVec
     let mut compiled_instructions = Vec::new();
     
     for instruction in instructions {
@@ -442,24 +444,26 @@ pub fn create_feature_activation_transaction_message() -> VaultTransactionMessag
             })
             .collect();
             
-        compiled_instructions.push(MultisigCompiledInstruction {
+        compiled_instructions.push(CompiledInstruction {
             program_id_index,
-            account_indexes,
-            data: instruction.data,
+            account_indexes: SmallVec::from(account_indexes),
+            data: SmallVec::from(instruction.data),
         });
     }
     
-    VaultTransactionMessage {
+    TransactionMessage {
         num_signers: 1,              // funding_address is the signer
         num_writable_signers: 1,     // funding_address is writable signer
         num_writable_non_signers: 1, // feature_id is writable non-signer
-        account_keys,
-        instructions: compiled_instructions,
-        address_table_lookups: vec![],
+        account_keys: SmallVec::from(account_keys),
+        instructions: SmallVec::from(compiled_instructions),
+        address_table_lookups: SmallVec::from(vec![]),
     }
 }
 
-pub fn create_feature_revocation_transaction_message() -> VaultTransactionMessage {
+pub fn create_feature_revocation_transaction_message() -> TransactionMessage {
+    use crate::squads::SmallVec;
+    
     // Create feature revocation instruction for a test feature
     let feature_id = Pubkey::new_unique();
     let instruction = crate::feature_gate_program::revoke_pending_activation(&feature_id);
@@ -492,19 +496,19 @@ pub fn create_feature_revocation_transaction_message() -> VaultTransactionMessag
         })
         .collect();
         
-    let compiled_instructions = vec![MultisigCompiledInstruction {
+    let compiled_instructions = vec![CompiledInstruction {
         program_id_index,
-        account_indexes,
-        data: instruction.data,
+        account_indexes: SmallVec::from(account_indexes),
+        data: SmallVec::from(instruction.data),
     }];
     
-    VaultTransactionMessage {
+    TransactionMessage {
         num_signers: 1,              // feature_id is the signer
         num_writable_signers: 1,     // feature_id is writable signer
         num_writable_non_signers: 1, // incinerator is writable non-signer
-        account_keys,
-        instructions: compiled_instructions,
-        address_table_lookups: vec![],
+        account_keys: SmallVec::from(account_keys),
+        instructions: SmallVec::from(compiled_instructions),
+        address_table_lookups: SmallVec::from(vec![]),
     }
 }
 

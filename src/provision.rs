@@ -1,10 +1,10 @@
-use crate::feature_gate_program::{activate_feature_funded, revoke_pending_activation};
+use crate::feature_gate_program::activate_feature_funded;
 use crate::squads::{
     get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
-    Member, MultisigCompiledInstruction, MultisigCreateArgsV2, MultisigCreateProposalAccounts,
-    MultisigCreateProposalArgs, MultisigCreateProposalData, MultisigCreateTransaction,
-    MultisigCreateTransactionArgs, MultisigCreateTransactionData, MultisigCreateV2Accounts,
-    MultisigCreateV2Data, Permissions, ProgramConfig, VaultTransactionMessage,
+    Member, MultisigCreateArgsV2, MultisigCreateProposalAccounts, MultisigCreateProposalArgs,
+    MultisigCreateProposalData, MultisigCreateTransaction, MultisigCreateV2Accounts,
+    MultisigCreateV2Data, Permissions, ProgramConfig, TransactionMessage,
+    VaultTransactionCreateArgs, VaultTransactionCreateArgsData,
 };
 use colored::Colorize;
 use dialoguer::Confirm;
@@ -315,9 +315,6 @@ pub async fn create_feature_gate_proposal(
         // Create feature activation instructions
         let activation_ixs = activate_feature_funded(&feature_gate_id);
 
-        // Create feature revocation instruction
-        let revocation_ix = revoke_pending_activation(&feature_gate_id);
-
         // Build proper VersionedTransaction for activation to get correct message structure
         let activation_temp_message = Message::try_compile(
             &vault_pda.0, // Use vault as the fee payer for the inner transaction
@@ -334,83 +331,9 @@ pub async fn create_feature_gate_proposal(
         )
         .expect("Failed to create temporary activation transaction");
 
-        // Build proper VersionedTransaction for revocation to get correct message structure
-        let revocation_temp_message = Message::try_compile(
-            &vault_pda.0, // Use vault as the fee payer for the inner transaction
-            &[revocation_ix.clone()],
-            &[],
-            blockhash,
-        )
-        .unwrap();
-
-        let revocation_temp_transaction = VersionedTransaction::try_new(
-            VersionedMessage::V0(revocation_temp_message.clone()),
-            empty_signers,
-        )
-        .expect("Failed to create temporary revocation transaction");
-
-        // Extract message information from the VersionedTransactions
-        let activation_message = match &activation_temp_transaction.message {
-            VersionedMessage::V0(msg) => {
-                let header = &msg.header;
-                VaultTransactionMessage {
-                    num_signers: header.num_required_signatures,
-                    num_writable_signers: header.num_readonly_signed_accounts,
-                    num_writable_non_signers: header.num_readonly_unsigned_accounts,
-                    account_keys: msg.account_keys.clone(),
-                    instructions: msg
-                        .instructions
-                        .iter()
-                        .map(|ix| MultisigCompiledInstruction {
-                            program_id_index: ix.program_id_index,
-                            account_indexes: ix.accounts.clone(),
-                            data: ix.data.clone(),
-                        })
-                        .collect(),
-                    address_table_lookups: msg
-                        .address_table_lookups
-                        .iter()
-                        .map(|lookup| crate::squads::MultisigMessageAddressTableLookup {
-                            account_key: lookup.account_key,
-                            writable_indexes: lookup.writable_indexes.clone(),
-                            readonly_indexes: lookup.readonly_indexes.clone(),
-                        })
-                        .collect(),
-                }
-            }
-            VersionedMessage::Legacy(_) => panic!("Expected V0 message"),
-        };
-
-        let revocation_message = match &revocation_temp_transaction.message {
-            VersionedMessage::V0(msg) => {
-                let header = &msg.header;
-                VaultTransactionMessage {
-                    num_signers: header.num_required_signatures,
-                    num_writable_signers: header.num_readonly_signed_accounts,
-                    num_writable_non_signers: header.num_readonly_unsigned_accounts,
-                    account_keys: msg.account_keys.clone(),
-                    instructions: msg
-                        .instructions
-                        .iter()
-                        .map(|ix| MultisigCompiledInstruction {
-                            program_id_index: ix.program_id_index,
-                            account_indexes: ix.accounts.clone(),
-                            data: ix.data.clone(),
-                        })
-                        .collect(),
-                    address_table_lookups: msg
-                        .address_table_lookups
-                        .iter()
-                        .map(|lookup| crate::squads::MultisigMessageAddressTableLookup {
-                            account_key: lookup.account_key,
-                            writable_indexes: lookup.writable_indexes.clone(),
-                            readonly_indexes: lookup.readonly_indexes.clone(),
-                        })
-                        .collect(),
-                }
-            }
-            VersionedMessage::Legacy(_) => panic!("Expected V0 message"),
-        };
+        // Create transaction messages using utility functions
+        let activation_message = crate::utils::create_feature_activation_transaction_message();
+        let revocation_message = crate::utils::create_feature_revocation_transaction_message();
 
         // Transaction 1: Create activation transaction
         let create_activation_tx_message = Message::try_compile(
@@ -429,8 +352,8 @@ pub async fn create_feature_gate_proposal(
                         system_program: solana_system_interface::program::ID,
                     }
                     .to_account_metas(None),
-                    data: MultisigCreateTransactionData {
-                        args: MultisigCreateTransactionArgs {
+                    data: VaultTransactionCreateArgsData {
+                        args: VaultTransactionCreateArgs {
                             vault_index: 0,
                             num_ephemeral_signers: 0,
                             transaction_message: activation_message,
@@ -512,8 +435,8 @@ pub async fn create_feature_gate_proposal(
                         system_program: solana_system_interface::program::ID,
                     }
                     .to_account_metas(None),
-                    data: MultisigCreateTransactionData {
-                        args: MultisigCreateTransactionArgs {
+                    data: VaultTransactionCreateArgsData {
+                        args: VaultTransactionCreateArgs {
                             vault_index: 0,
                             num_ephemeral_signers: 0,
                             transaction_message: revocation_message,
@@ -620,7 +543,7 @@ pub fn create_transaction_and_proposal_message(
     multisig_address: &Pubkey,
     transaction_index: u64,
     vault_index: u8,
-    transaction_message: VaultTransactionMessage,
+    transaction_message: TransactionMessage,
     priority_fee: Option<u32>,
     compute_unit_limit: Option<u32>,
     recent_blockhash: Hash,
@@ -642,8 +565,8 @@ pub fn create_transaction_and_proposal_message(
         system_program: solana_system_interface::program::ID,
     };
 
-    let create_transaction_data = MultisigCreateTransactionData {
-        args: MultisigCreateTransactionArgs {
+    let create_transaction_data = VaultTransactionCreateArgsData {
+        args: VaultTransactionCreateArgs {
             vault_index,
             num_ephemeral_signers: 0, // No ephemeral signers for basic transactions
             transaction_message,
@@ -731,9 +654,10 @@ pub fn parse_members(member_strings: Vec<String>) -> Result<Vec<Member>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::squads::{CompiledInstruction, SmallVec, TransactionMessage};
     use borsh::BorshDeserialize;
 
-    fn create_test_transaction_message() -> VaultTransactionMessage {
+    fn create_test_transaction_message() -> TransactionMessage {
         use crate::feature_gate_program::create_feature_activation;
 
         // Create feature activation instructions for a test feature
@@ -777,20 +701,20 @@ mod tests {
                 })
                 .collect();
 
-            compiled_instructions.push(MultisigCompiledInstruction {
+            compiled_instructions.push(CompiledInstruction {
                 program_id_index,
-                account_indexes,
-                data: instruction.data,
+                account_indexes: SmallVec::from(account_indexes),
+                data: SmallVec::from(instruction.data),
             });
         }
 
-        VaultTransactionMessage {
+        TransactionMessage {
             num_signers: 1,              // funding_address is the signer
             num_writable_signers: 1,     // funding_address is writable signer
             num_writable_non_signers: 1, // feature_id is writable non-signer
-            account_keys,
-            instructions: compiled_instructions,
-            address_table_lookups: vec![],
+            account_keys: SmallVec::from(account_keys),
+            instructions: SmallVec::from(compiled_instructions),
+            address_table_lookups: SmallVec::from(vec![]),
         }
     }
 
@@ -798,8 +722,8 @@ mod tests {
     fn test_create_transaction_data_serialization() {
         let transaction_message = create_test_transaction_message();
 
-        let create_transaction_data = MultisigCreateTransactionData {
-            args: MultisigCreateTransactionArgs {
+        let create_transaction_data = VaultTransactionCreateArgsData {
+            args: VaultTransactionCreateArgs {
                 vault_index: 0,
                 num_ephemeral_signers: 0,
                 transaction_message: transaction_message.clone(),
@@ -817,7 +741,7 @@ mod tests {
 
         // Test deserialization of the args portion
         let args_data = &serialized_data[8..];
-        let deserialized_args = MultisigCreateTransactionArgs::try_from_slice(args_data).unwrap();
+        let deserialized_args = VaultTransactionCreateArgs::try_from_slice(args_data).unwrap();
 
         assert_eq!(deserialized_args.vault_index, 0);
         assert_eq!(deserialized_args.num_ephemeral_signers, 0);
@@ -863,7 +787,7 @@ mod tests {
 
         // Test serialization and deserialization
         let serialized = borsh::to_vec(&transaction_message).unwrap();
-        let deserialized = VaultTransactionMessage::try_from_slice(&serialized).unwrap();
+        let deserialized = TransactionMessage::try_from_slice(&serialized).unwrap();
 
         assert_eq!(deserialized.num_signers, transaction_message.num_signers);
         assert_eq!(
@@ -986,6 +910,7 @@ mod tests {
             vault_index,
             transaction_message,
             priority_fee,
+            Some(200000u32), // compute_unit_limit
             recent_blockhash,
         );
 
@@ -1000,8 +925,8 @@ mod tests {
         assert_eq!(proposal_pda, expected_proposal_pda);
 
         // Verify message has the right number of instructions
-        // Should have 3: priority fee + create transaction + create proposal
-        assert_eq!(message.instructions.len(), 3);
+        // Should have 4: priority fee + compute unit limit + create transaction + create proposal
+        assert_eq!(message.instructions.len(), 4);
 
         // Verify the fee payer is set correctly
         assert_eq!(message.account_keys[0], fee_payer_pubkey);
@@ -1031,6 +956,7 @@ mod tests {
             vault_index,
             transaction_message,
             None, // No priority fee
+            None, // No compute unit limit
             recent_blockhash,
         );
 
