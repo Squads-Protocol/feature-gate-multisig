@@ -215,8 +215,9 @@ pub struct VaultTransactionCreateArgsData {
 #[derive(BorshSerialize, BorshDeserialize)]
 pub struct VaultTransactionCreateArgs {
     pub vault_index: u8,
-    pub num_ephemeral_signers: u8,
-    pub transaction_message: TransactionMessage,
+    pub ephemeral_signers: u8,
+    pub transaction_message: Vec<u8>,
+    pub memo: Option<String>,
 }
 
 impl VaultTransactionCreateArgsData {

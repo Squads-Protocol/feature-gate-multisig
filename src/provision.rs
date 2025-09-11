@@ -11,6 +11,7 @@ use eyre::eyre;
 use indicatif::ProgressBar;
 use solana_client::client_error::ClientErrorKind;
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_client::rpc_request::{RpcError, RpcResponseErrorData};
 use solana_client::rpc_response::RpcSimulateTransactionResult;
 use solana_commitment_config::CommitmentConfig;
@@ -31,7 +32,13 @@ pub fn send_and_confirm_transaction(
     rpc_client: &RpcClient,
 ) -> eyre::Result<String> {
     // Try to send and confirm the transaction
-    match rpc_client.send_and_confirm_transaction(transaction) {
+    match rpc_client.send_transaction_with_config(
+        transaction,
+        RpcSendTransactionConfig {
+            skip_preflight: true,
+            ..RpcSendTransactionConfig::default()
+        },
+    ) {
         Ok(signature) => {
             println!(
                 "Transaction confirmed: {}\n\n",
@@ -308,7 +315,7 @@ pub async fn create_feature_gate_proposal(
         let revocation_message = crate::utils::create_feature_revocation_transaction_message();
 
         // Transaction 1: Create activation transaction and proposal in one step
-        let (activation_combined_message, activation_transaction_pda, activation_proposal_pda) = 
+        let (activation_combined_message, activation_transaction_pda, activation_proposal_pda) =
             create_transaction_and_proposal_message(
                 Some(&program_id),
                 &transaction_creator,
@@ -332,7 +339,7 @@ pub async fn create_feature_gate_proposal(
             send_and_confirm_transaction(&activation_combined_transaction, &rpc_client)?;
 
         // Transaction 2: Create revocation transaction and proposal in one step
-        let (revocation_combined_message, revocation_transaction_pda, revocation_proposal_pda) = 
+        let (revocation_combined_message, revocation_transaction_pda, revocation_proposal_pda) =
             create_transaction_and_proposal_message(
                 Some(&program_id),
                 &transaction_creator,
@@ -425,11 +432,15 @@ pub fn create_transaction_and_proposal_message(
         system_program: solana_system_interface::program::ID,
     };
 
+    // Serialize the TransactionMessage to bytes as expected by the on-chain program
+    let transaction_message_bytes = borsh::to_vec(&transaction_message)?;
+    
     let create_transaction_data = VaultTransactionCreateArgsData {
         args: VaultTransactionCreateArgs {
             vault_index,
-            num_ephemeral_signers: 0, // No ephemeral signers for basic transactions
-            transaction_message,
+            ephemeral_signers: 0, // No ephemeral signers for basic transactions
+            transaction_message: transaction_message_bytes,
+            memo: None,
         },
     };
 
@@ -582,11 +593,13 @@ mod tests {
     fn test_create_transaction_data_serialization() {
         let transaction_message = create_test_transaction_message();
 
+        let transaction_message_bytes = borsh::to_vec(&transaction_message).unwrap();
         let create_transaction_data = VaultTransactionCreateArgsData {
             args: VaultTransactionCreateArgs {
                 vault_index: 0,
-                num_ephemeral_signers: 0,
-                transaction_message: transaction_message.clone(),
+                ephemeral_signers: 0,
+                transaction_message: transaction_message_bytes,
+                memo: None,
             },
         };
 
@@ -604,13 +617,17 @@ mod tests {
         let deserialized_args = VaultTransactionCreateArgs::try_from_slice(args_data).unwrap();
 
         assert_eq!(deserialized_args.vault_index, 0);
-        assert_eq!(deserialized_args.num_ephemeral_signers, 0);
+        assert_eq!(deserialized_args.ephemeral_signers, 0);
+        assert_eq!(deserialized_args.memo, None);
+        
+        // Deserialize the transaction message bytes and verify
+        let deserialized_transaction_message = TransactionMessage::try_from_slice(&deserialized_args.transaction_message).unwrap();
         assert_eq!(
-            deserialized_args.transaction_message.num_signers,
+            deserialized_transaction_message.num_signers,
             transaction_message.num_signers
         );
         assert_eq!(
-            deserialized_args.transaction_message.account_keys.len(),
+            deserialized_transaction_message.account_keys.len(),
             transaction_message.account_keys.len()
         );
     }
@@ -825,6 +842,86 @@ mod tests {
 
         // Should have 2 instructions: create transaction + create proposal (no priority fee)
         assert_eq!(message.instructions.len(), 2);
+    }
+
+    #[test]
+    fn test_debug_serialization() {
+        let transaction_message = create_test_transaction_message();
+        
+        println!("Transaction message created with:");
+        println!("  num_signers: {}", transaction_message.num_signers);
+        println!("  num_writable_signers: {}", transaction_message.num_writable_signers);
+        println!("  num_writable_non_signers: {}", transaction_message.num_writable_non_signers);
+        println!("  account_keys.len(): {}", transaction_message.account_keys.len());
+        println!("  instructions.len(): {}", transaction_message.instructions.len());
+        
+        // Try to serialize just the transaction message
+        let serialized = borsh::to_vec(&transaction_message).unwrap();
+        println!("  serialized transaction_message length: {}", serialized.len());
+        
+        // Show detailed hex breakdown
+        println!("  Detailed serialization breakdown:");
+        println!("    num_signers (u8): {:02x}", serialized[0]);
+        println!("    num_writable_signers (u8): {:02x}", serialized[1]);  
+        println!("    num_writable_non_signers (u8): {:02x}", serialized[2]);
+        
+        // Check account_keys serialization - should be length as u8 then pubkeys
+        println!("    account_keys length byte: {:02x}", serialized[3]);
+        
+        // If it shows more than 1 byte for length, there's the issue
+        println!("    bytes 4-7: {:02x} {:02x} {:02x} {:02x}", 
+            serialized[4], serialized[5], serialized[6], serialized[7]);
+        
+        // Create VaultTransactionCreateArgs and see its serialization
+        let transaction_message_bytes = borsh::to_vec(&transaction_message).unwrap();
+        let vault_args = VaultTransactionCreateArgs {
+            vault_index: 0,
+            ephemeral_signers: 0,
+            transaction_message: transaction_message_bytes.clone(),
+            memo: None,
+        };
+        
+        let vault_args_serialized = borsh::to_vec(&vault_args).unwrap();
+        println!("  vault_args serialized length: {}", vault_args_serialized.len());
+        println!("  vault_args hex breakdown:");
+        println!("    vault_index: {:02x}", vault_args_serialized[0]);
+        println!("    ephemeral_signers: {:02x}", vault_args_serialized[1]);
+        
+        // Next should be the Vec<u8> length (u32) then the transaction_message bytes
+        let tm_vec_len = u32::from_le_bytes([
+            vault_args_serialized[2], vault_args_serialized[3], 
+            vault_args_serialized[4], vault_args_serialized[5]
+        ]);
+        println!("    transaction_message Vec<u8> length: {} bytes", tm_vec_len);
+        
+        // The actual transaction message bytes start at offset 6, then after memo option
+        let tm_offset = 6;
+        
+        // memo is Option<String> which serializes as 1 byte (0 for None, 1 for Some) + content
+        let memo_len_byte = vault_args_serialized[tm_offset + tm_vec_len as usize];
+        println!("    memo option byte: {:02x} (0=None, 1=Some)", memo_len_byte);
+        
+        // Transaction message data starts after the memo
+        let actual_tm_offset = tm_offset;
+        if vault_args_serialized.len() > actual_tm_offset + 5 {
+            println!("    tm bytes start at offset {}", actual_tm_offset);
+            println!("    tm.num_signers: {:02x}", vault_args_serialized[actual_tm_offset]);
+            println!("    tm.num_writable_signers: {:02x}", vault_args_serialized[actual_tm_offset + 1]);
+            println!("    tm.num_writable_non_signers: {:02x}", vault_args_serialized[actual_tm_offset + 2]);
+            println!("    tm.account_keys length: {:02x}", vault_args_serialized[actual_tm_offset + 3]);
+        }
+        
+        // Create the full data structure
+        let create_transaction_data = VaultTransactionCreateArgsData {
+            args: vault_args,
+        };
+        
+        let full_data = create_transaction_data.data();
+        println!("  full data length: {}", full_data.len());
+        
+        // Convert to hex string like the blockchain data
+        let hex_string = full_data.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        println!("  full hex: {}", hex_string);
     }
 
     #[test]

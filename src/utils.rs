@@ -6,8 +6,9 @@ use dirs;
 use inquire::{Confirm, Text};
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_keypair::Keypair;
-use solana_message::{VersionedMessage};
+use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_signer::{EncodableKey, Signer};
 use solana_transaction::versioned::VersionedTransaction;
@@ -157,7 +158,10 @@ pub fn collect_members_interactively() -> Result<Vec<Member>> {
     Ok(interactive_members)
 }
 
-pub fn review_and_collect_configuration(config: &Config, threshold: u16) -> Result<(u16, Vec<Member>)> {
+pub fn review_and_collect_configuration(
+    config: &Config,
+    threshold: u16,
+) -> Result<(u16, Vec<Member>)> {
     let use_saved_config = review_config(config)?;
 
     if use_saved_config {
@@ -174,15 +178,18 @@ pub fn review_and_collect_configuration(config: &Config, threshold: u16) -> Resu
 // Keypair management functions
 pub fn expand_tilde_path(path: &str) -> Result<String> {
     if path.starts_with("~/") {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
         Ok(home.join(&path[2..]).to_string_lossy().to_string())
     } else {
         Ok(path.to_string())
     }
 }
 
-pub fn load_fee_payer_keypair(config: &Config, keypair_path: Option<String>) -> Result<Option<Keypair>> {
+pub fn load_fee_payer_keypair(
+    config: &Config,
+    keypair_path: Option<String>,
+) -> Result<Option<Keypair>> {
     if let Some(path) = keypair_path {
         println!(
             "{} Loading fee payer keypair from CLI: {}",
@@ -356,7 +363,7 @@ pub fn display_deployment_info(
             rpc_url.bright_white()
         );
     }
-    
+
     println!(
         "{}",
         "📦 All public keys for this deployment:"
@@ -384,7 +391,7 @@ pub fn display_deployment_info(
         "Vault PDA (index 0)".cyan(),
         vault_address.to_string().bright_green()
     );
-    
+
     for (i, member) in members.iter().enumerate() {
         let perms = decode_permissions(member.permissions.mask);
         let label = if member.key == *contributor_pubkey {
@@ -405,36 +412,40 @@ pub fn display_deployment_info(
 // Transaction creation functions
 pub fn create_feature_activation_transaction_message() -> TransactionMessage {
     use crate::squads::SmallVec;
-    
+
     // Create feature activation instructions for a test feature
     let feature_id = Pubkey::new_unique();
     let funding_address = Pubkey::new_unique();
     let instructions = create_feature_activation(&feature_id, &funding_address);
-    
+
     // Build account keys list for the message
     let mut account_keys = vec![
-        funding_address,                                      // 0: Funding address (signer, writable)
-        feature_id,                                          // 1: Feature account (writable)
-        solana_system_interface::program::ID,                // 2: System program
+        funding_address,                      // 0: Funding address (signer, writable)
+        feature_id,                           // 1: Feature account (writable)
+        solana_system_interface::program::ID, // 2: System program
         crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID, // 3: Feature gate program
     ];
-    
+
     // Compile instructions into CompiledInstructions with SmallVec
     let mut compiled_instructions = Vec::new();
-    
+
     for instruction in instructions {
         // Find program_id index in account_keys
-        let program_id_index = account_keys.iter()
+        let program_id_index = account_keys
+            .iter()
             .position(|key| *key == instruction.program_id)
             .unwrap_or_else(|| {
                 account_keys.push(instruction.program_id);
                 account_keys.len() - 1
             }) as u8;
-            
+
         // Map account pubkeys to indices
-        let account_indexes: Vec<u8> = instruction.accounts.iter()
+        let account_indexes: Vec<u8> = instruction
+            .accounts
+            .iter()
             .map(|account_meta| {
-                account_keys.iter()
+                account_keys
+                    .iter()
                     .position(|key| *key == account_meta.pubkey)
                     .unwrap_or_else(|| {
                         account_keys.push(account_meta.pubkey);
@@ -442,14 +453,14 @@ pub fn create_feature_activation_transaction_message() -> TransactionMessage {
                     }) as u8
             })
             .collect();
-            
+
         compiled_instructions.push(CompiledInstruction {
             program_id_index,
             account_indexes: SmallVec::from(account_indexes),
             data: SmallVec::from(instruction.data),
         });
     }
-    
+
     TransactionMessage {
         num_signers: 1,              // funding_address is the signer
         num_writable_signers: 1,     // funding_address is writable signer
@@ -462,31 +473,35 @@ pub fn create_feature_activation_transaction_message() -> TransactionMessage {
 
 pub fn create_feature_revocation_transaction_message() -> TransactionMessage {
     use crate::squads::SmallVec;
-    
+
     // Create feature revocation instruction for a test feature
     let feature_id = Pubkey::new_unique();
     let instruction = crate::feature_gate_program::revoke_pending_activation(&feature_id);
-    
+
     // Build account keys list for the message
     let mut account_keys = vec![
-        feature_id,                                          // 0: Feature account (signer, writable)
-        crate::feature_gate_program::INCINERATOR_ID,         // 1: Incinerator (writable)
-        solana_system_interface::program::ID,                // 2: System program
+        feature_id,                                  // 0: Feature account (signer, writable)
+        crate::feature_gate_program::INCINERATOR_ID, // 1: Incinerator (writable)
+        solana_system_interface::program::ID,        // 2: System program
         crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID, // 3: Feature gate program
     ];
-    
+
     // Find program_id index in account_keys
-    let program_id_index = account_keys.iter()
+    let program_id_index = account_keys
+        .iter()
         .position(|key| *key == instruction.program_id)
         .unwrap_or_else(|| {
             account_keys.push(instruction.program_id);
             account_keys.len() - 1
         }) as u8;
-        
+
     // Map account pubkeys to indices
-    let account_indexes: Vec<u8> = instruction.accounts.iter()
+    let account_indexes: Vec<u8> = instruction
+        .accounts
+        .iter()
         .map(|account_meta| {
-            account_keys.iter()
+            account_keys
+                .iter()
                 .position(|key| *key == account_meta.pubkey)
                 .unwrap_or_else(|| {
                     account_keys.push(account_meta.pubkey);
@@ -494,13 +509,13 @@ pub fn create_feature_revocation_transaction_message() -> TransactionMessage {
                 }) as u8
         })
         .collect();
-        
+
     let compiled_instructions = vec![CompiledInstruction {
         program_id_index,
         account_indexes: SmallVec::from(account_indexes),
         data: SmallVec::from(instruction.data),
     }];
-    
+
     TransactionMessage {
         num_signers: 1,              // feature_id is the signer
         num_writable_signers: 1,     // feature_id is writable signer
@@ -528,11 +543,17 @@ pub async fn create_and_send_transaction_proposal(
     let transaction_message = match transaction_type {
         "activation" => create_feature_activation_transaction_message(),
         "revocation" => create_feature_revocation_transaction_message(),
-        _ => return Err(anyhow::anyhow!("Invalid transaction type: {}", transaction_type)),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Invalid transaction type: {}",
+                transaction_type
+            ))
+        }
     };
-    
+
     let rpc_client = RpcClient::new(rpc_url);
-    let recent_blockhash = rpc_client.get_latest_blockhash()
+    let recent_blockhash = rpc_client
+        .get_latest_blockhash()
         .map_err(|e| anyhow::anyhow!("Failed to get recent blockhash: {}", e))?;
 
     let fee_payer_pubkey = fee_payer_keypair
@@ -541,18 +562,20 @@ pub async fn create_and_send_transaction_proposal(
         .unwrap_or_else(|| contributor_keypair.pubkey());
 
     // Use the integrated create_transaction_and_proposal_message function from provision.rs
-    let (message, transaction_pda, proposal_pda) = crate::provision::create_transaction_and_proposal_message(
-        None, // Use default program ID
-        &fee_payer_pubkey,
-        &contributor_keypair.pubkey(),
-        multisig_address,
-        transaction_index,
-        0, // Vault index 0 (default vault for feature gates)
-        transaction_message,
-        Some(5000), // Priority fee
-        Some(300_000), // Compute unit limit
-        recent_blockhash,
-    ).map_err(|e| anyhow::anyhow!("Failed to create transaction and proposal message: {}", e))?;
+    let (message, transaction_pda, proposal_pda) =
+        crate::provision::create_transaction_and_proposal_message(
+            None, // Use default program ID
+            &fee_payer_pubkey,
+            &contributor_keypair.pubkey(),
+            multisig_address,
+            transaction_index,
+            0, // Vault index 0 (default vault for feature gates)
+            transaction_message,
+            Some(5000),    // Priority fee
+            Some(300_000), // Compute unit limit
+            recent_blockhash,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create transaction and proposal message: {}", e))?;
 
     println!(
         "  {}: {}",
@@ -575,7 +598,7 @@ pub async fn create_and_send_transaction_proposal(
     } else {
         &[
             fee_payer_keypair.as_ref().unwrap() as &dyn Signer,
-            contributor_keypair as &dyn Signer
+            contributor_keypair as &dyn Signer,
         ]
     };
 
@@ -589,10 +612,20 @@ pub async fn create_and_send_transaction_proposal(
         "Transaction Signature (before send)".cyan(),
         expected_signature.to_string().bright_white()
     );
-    
-    println!("{} Sending combined transaction to RPC...", "📤".bright_blue());
 
-    let signature = rpc_client.send_and_confirm_transaction(&transaction)
+    println!(
+        "{} Sending combined transaction to RPC...",
+        "📤".bright_blue()
+    );
+
+    let signature = rpc_client
+        .send_transaction_with_config(
+            &transaction,
+            RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..RpcSendTransactionConfig::default()
+            },
+        )
         .map_err(|e| anyhow::anyhow!("Failed to send transaction and proposal: {}", e))?;
 
     println!(
