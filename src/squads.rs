@@ -334,6 +334,45 @@ pub struct MessageAddressTableLookup {
     pub readonly_indexes: SmallVec<u8, u8>,
 }
 
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct Proposal {
+    /// The multisig this belongs to.
+    pub multisig: Pubkey,
+    /// Index of the multisig transaction this proposal is associated with.
+    pub transaction_index: u64,
+    /// The status of the transaction.
+    pub status: ProposalStatus,
+    /// PDA bump.
+    pub bump: u8,
+    /// Keys that have approved/signed.
+    pub approved: Vec<Pubkey>,
+    /// Keys that have rejected.
+    pub rejected: Vec<Pubkey>,
+    /// Keys that have cancelled (Approved only).
+    pub cancelled: Vec<Pubkey>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub enum ProposalStatus {
+    /// Proposal is in the draft mode and can be voted on.
+    Draft { timestamp: i64 },
+    /// Proposal is live and ready for voting.
+    Active { timestamp: i64 },
+    /// Proposal has been rejected.
+    Rejected { timestamp: i64 },
+    /// Proposal has been approved and is pending execution.
+    Approved { timestamp: i64 },
+    /// Proposal is being executed. This is a transient state that always transitions to `Executed` in the span of a single transaction.
+    #[deprecated(
+        note = "This status used to be used to prevent reentrancy attacks. It is no longer needed."
+    )]
+    Executing,
+    /// Proposal has been executed.
+    Executed { timestamp: i64 },
+    /// Proposal has been cancelled.
+    Cancelled { timestamp: i64 },
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SmallVec<L, T>(Vec<T>, PhantomData<L>);
 
