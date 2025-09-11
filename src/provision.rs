@@ -1,4 +1,3 @@
-use crate::feature_gate_program::activate_feature_funded;
 use crate::squads::{
     get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
     Member, MultisigCreateArgsV2, MultisigCreateProposalAccounts, MultisigCreateProposalArgs,
@@ -298,231 +297,92 @@ pub async fn create_feature_gate_proposal(
 
         let base_tx_index = multisig.transaction_index;
 
-        // Create activation transaction (tx index 1)
+        // Create activation transaction and proposal (tx index 1)
         let activation_tx_index = base_tx_index + 1;
-        let activation_transaction_pda =
-            get_transaction_pda(&multisig_pubkey, activation_tx_index, Some(&program_id));
-        let activation_proposal_pda =
-            get_proposal_pda(&multisig_pubkey, activation_tx_index, Some(&program_id));
 
-        // Create revocation transaction (tx index 2)
+        // Create revocation transaction and proposal (tx index 2)
         let revocation_tx_index = base_tx_index + 2;
-        let revocation_transaction_pda =
-            get_transaction_pda(&multisig_pubkey, revocation_tx_index, Some(&program_id));
-        let revocation_proposal_pda =
-            get_proposal_pda(&multisig_pubkey, revocation_tx_index, Some(&program_id));
-
-        // Create feature activation instructions
-        let activation_ixs = activate_feature_funded(&feature_gate_id);
-
-        // Build proper VersionedTransaction for activation to get correct message structure
-        let activation_temp_message = Message::try_compile(
-            &vault_pda.0, // Use vault as the fee payer for the inner transaction
-            &activation_ixs,
-            &[],
-            blockhash,
-        )
-        .unwrap();
-
-        let empty_signers: &[&dyn Signer] = &[];
-        let activation_temp_transaction = VersionedTransaction::try_new(
-            VersionedMessage::V0(activation_temp_message.clone()),
-            empty_signers,
-        )
-        .expect("Failed to create temporary activation transaction");
 
         // Create transaction messages using utility functions
         let activation_message = crate::utils::create_feature_activation_transaction_message();
         let revocation_message = crate::utils::create_feature_revocation_transaction_message();
 
-        // Transaction 1: Create activation transaction
-        let create_activation_tx_message = Message::try_compile(
-            &transaction_creator,
-            &[
-                ComputeBudgetInstruction::set_compute_unit_price(
-                    priority_fee_lamports.unwrap_or(5000),
-                ),
-                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
-                Instruction {
-                    accounts: MultisigCreateTransaction {
-                        multisig: multisig_pubkey,
-                        transaction: activation_transaction_pda.0,
-                        creator: transaction_creator,
-                        rent_payer: transaction_creator,
-                        system_program: solana_system_interface::program::ID,
-                    }
-                    .to_account_metas(None),
-                    data: VaultTransactionCreateArgsData {
-                        args: VaultTransactionCreateArgs {
-                            vault_index: 0,
-                            num_ephemeral_signers: 0,
-                            transaction_message: activation_message,
-                        },
-                    }
-                    .data(),
-                    program_id,
-                },
-            ],
-            &[],
-            blockhash,
-        )
-        .unwrap();
+        // Transaction 1: Create activation transaction and proposal in one step
+        let (activation_combined_message, activation_transaction_pda, activation_proposal_pda) = 
+            create_transaction_and_proposal_message(
+                Some(&program_id),
+                &transaction_creator,
+                &transaction_creator,
+                &multisig_pubkey,
+                activation_tx_index,
+                0, // vault_index
+                activation_message,
+                priority_fee_lamports.map(|fee| fee as u32),
+                Some(300_000), // compute_unit_limit
+                blockhash,
+            )?;
 
-        let activation_tx_transaction = VersionedTransaction::try_new(
-            VersionedMessage::V0(create_activation_tx_message),
+        let activation_combined_transaction = VersionedTransaction::try_new(
+            VersionedMessage::V0(activation_combined_message),
             &[contributor_keypair],
         )
-        .expect("Failed to create activation transaction");
+        .expect("Failed to create activation combined transaction");
 
-        let activation_tx_signature =
-            send_and_confirm_transaction(&activation_tx_transaction, &rpc_client)?;
+        let activation_combined_signature =
+            send_and_confirm_transaction(&activation_combined_transaction, &rpc_client)?;
 
-        // Transaction 2: Create activation proposal
-        let create_activation_proposal_message = Message::try_compile(
-            &transaction_creator,
-            &[
-                ComputeBudgetInstruction::set_compute_unit_price(
-                    priority_fee_lamports.unwrap_or(5000),
-                ),
-                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
-                Instruction {
-                    accounts: MultisigCreateProposalAccounts {
-                        multisig: multisig_pubkey,
-                        proposal: activation_proposal_pda.0,
-                        creator: transaction_creator,
-                        rent_payer: transaction_creator,
-                        system_program: solana_system_interface::program::ID,
-                    }
-                    .to_account_metas(None),
-                    data: MultisigCreateProposalData {
-                        args: MultisigCreateProposalArgs {
-                            transaction_index: activation_tx_index,
-                            is_draft: false,
-                        },
-                    }
-                    .data(),
-                    program_id,
-                },
-            ],
-            &[],
-            blockhash,
-        )
-        .unwrap();
+        // Transaction 2: Create revocation transaction and proposal in one step
+        let (revocation_combined_message, revocation_transaction_pda, revocation_proposal_pda) = 
+            create_transaction_and_proposal_message(
+                Some(&program_id),
+                &transaction_creator,
+                &transaction_creator,
+                &multisig_pubkey,
+                revocation_tx_index,
+                0, // vault_index
+                revocation_message,
+                priority_fee_lamports.map(|fee| fee as u32),
+                Some(300_000), // compute_unit_limit
+                blockhash,
+            )?;
 
-        let activation_proposal_transaction = VersionedTransaction::try_new(
-            VersionedMessage::V0(create_activation_proposal_message),
+        let revocation_combined_transaction = VersionedTransaction::try_new(
+            VersionedMessage::V0(revocation_combined_message),
             &[contributor_keypair],
         )
-        .expect("Failed to create activation proposal transaction");
+        .expect("Failed to create revocation combined transaction");
 
-        let activation_proposal_signature =
-            send_and_confirm_transaction(&activation_proposal_transaction, &rpc_client)?;
-
-        // Transaction 3: Create revocation transaction
-        let create_revocation_tx_message = Message::try_compile(
-            &transaction_creator,
-            &[
-                ComputeBudgetInstruction::set_compute_unit_price(
-                    priority_fee_lamports.unwrap_or(5000),
-                ),
-                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
-                Instruction {
-                    accounts: MultisigCreateTransaction {
-                        multisig: multisig_pubkey,
-                        transaction: revocation_transaction_pda.0,
-                        creator: transaction_creator,
-                        rent_payer: transaction_creator,
-                        system_program: solana_system_interface::program::ID,
-                    }
-                    .to_account_metas(None),
-                    data: VaultTransactionCreateArgsData {
-                        args: VaultTransactionCreateArgs {
-                            vault_index: 0,
-                            num_ephemeral_signers: 0,
-                            transaction_message: revocation_message,
-                        },
-                    }
-                    .data(),
-                    program_id,
-                },
-            ],
-            &[],
-            blockhash,
-        )
-        .unwrap();
-
-        let revocation_tx_transaction = VersionedTransaction::try_new(
-            VersionedMessage::V0(create_revocation_tx_message),
-            &[contributor_keypair],
-        )
-        .expect("Failed to create revocation transaction");
-
-        let revocation_tx_signature =
-            send_and_confirm_transaction(&revocation_tx_transaction, &rpc_client)?;
-
-        // Transaction 4: Create revocation proposal
-        let create_revocation_proposal_message = Message::try_compile(
-            &transaction_creator,
-            &[
-                ComputeBudgetInstruction::set_compute_unit_price(
-                    priority_fee_lamports.unwrap_or(5000),
-                ),
-                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
-                Instruction {
-                    accounts: MultisigCreateProposalAccounts {
-                        multisig: multisig_pubkey,
-                        proposal: revocation_proposal_pda.0,
-                        creator: transaction_creator,
-                        rent_payer: transaction_creator,
-                        system_program: solana_system_interface::program::ID,
-                    }
-                    .to_account_metas(None),
-                    data: MultisigCreateProposalData {
-                        args: MultisigCreateProposalArgs {
-                            transaction_index: revocation_tx_index,
-                            is_draft: false,
-                        },
-                    }
-                    .data(),
-                    program_id,
-                },
-            ],
-            &[],
-            blockhash,
-        )
-        .unwrap();
-
-        let revocation_proposal_transaction = VersionedTransaction::try_new(
-            VersionedMessage::V0(create_revocation_proposal_message),
-            &[contributor_keypair],
-        )
-        .expect("Failed to create revocation proposal transaction");
-
-        let revocation_proposal_signature =
-            send_and_confirm_transaction(&revocation_proposal_transaction, &rpc_client)?;
+        let revocation_combined_signature =
+            send_and_confirm_transaction(&revocation_combined_transaction, &rpc_client)?;
 
         progress.finish_with_message("Network completed!");
 
         println!("✅ Network {} completed:", rpc_url.bright_cyan());
         println!(
-            "  Activation Transaction ({}): {}",
+            "  Activation Transaction & Proposal ({}): {}",
             activation_tx_index,
-            activation_tx_signature.bright_cyan()
+            activation_combined_signature.bright_cyan()
         );
         println!(
-            "  Activation Proposal ({}): {}",
-            activation_tx_index,
-            activation_proposal_signature.bright_cyan()
+            "    Transaction PDA: {}",
+            activation_transaction_pda.to_string().bright_white()
         );
         println!(
-            "  Revocation Transaction ({}): {}",
+            "    Proposal PDA: {}",
+            activation_proposal_pda.to_string().bright_white()
+        );
+        println!(
+            "  Revocation Transaction & Proposal ({}): {}",
             revocation_tx_index,
-            revocation_tx_signature.bright_cyan()
+            revocation_combined_signature.bright_cyan()
         );
         println!(
-            "  Revocation Proposal ({}): {}",
-            revocation_tx_index,
-            revocation_proposal_signature.bright_cyan()
+            "    Transaction PDA: {}",
+            revocation_transaction_pda.to_string().bright_white()
+        );
+        println!(
+            "    Proposal PDA: {}",
+            revocation_proposal_pda.to_string().bright_white()
         );
         println!();
     }

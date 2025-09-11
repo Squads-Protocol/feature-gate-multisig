@@ -1,5 +1,4 @@
 use crate::feature_gate_program::create_feature_activation;
-use crate::provision::create_transaction_and_proposal_message;
 use crate::squads::{CompiledInstruction, Member, Permissions, TransactionMessage};
 use anyhow::Result;
 use colored::*;
@@ -541,7 +540,8 @@ pub async fn create_and_send_transaction_proposal(
         .map(|kp| kp.pubkey())
         .unwrap_or_else(|| contributor_keypair.pubkey());
 
-    let (message, transaction_pda, proposal_pda) = create_transaction_and_proposal_message(
+    // Use the integrated create_transaction_and_proposal_message function from provision.rs
+    let (message, transaction_pda, proposal_pda) = crate::provision::create_transaction_and_proposal_message(
         None, // Use default program ID
         &fee_payer_pubkey,
         &contributor_keypair.pubkey(),
@@ -566,7 +566,7 @@ pub async fn create_and_send_transaction_proposal(
     );
     println!(
         "  {}: {} instructions",
-        "Transaction Instructions".cyan(),
+        "Combined Transaction & Proposal".cyan(),
         "4".bright_white() // set_compute_unit_price, set_compute_unit_limit, create_transaction, create_proposal
     );
 
@@ -590,13 +590,13 @@ pub async fn create_and_send_transaction_proposal(
         expected_signature.to_string().bright_white()
     );
     
-    println!("{} Sending transaction to RPC...", "📤".bright_blue());
+    println!("{} Sending combined transaction to RPC...", "📤".bright_blue());
 
     let signature = rpc_client.send_and_confirm_transaction(&transaction)
         .map_err(|e| anyhow::anyhow!("Failed to send transaction and proposal: {}", e))?;
 
     println!(
-        "{} Transaction and proposal created successfully!",
+        "{} Transaction and proposal created successfully in one step!",
         "✅".bright_green()
     );
     println!(
