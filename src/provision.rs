@@ -1,10 +1,10 @@
-use crate::feature_gate_program::{activate_feature_funded, revoke_pending_activation};
+use crate::feature_gate_program::activate_feature_funded;
 use crate::squads::{
     get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
-    Member, MultisigCompiledInstruction, MultisigCreateArgsV2, MultisigCreateProposalAccounts,
-    MultisigCreateProposalArgs, MultisigCreateProposalData, MultisigCreateTransaction,
-    MultisigCreateTransactionArgs, MultisigCreateTransactionData, MultisigCreateV2Accounts,
-    MultisigCreateV2Data, Permissions, ProgramConfig, VaultTransactionMessage,
+    Member, MultisigCreateArgsV2, MultisigCreateProposalAccounts, MultisigCreateProposalArgs,
+    MultisigCreateProposalData, MultisigCreateTransaction, MultisigCreateV2Accounts,
+    MultisigCreateV2Data, Permissions, ProgramConfig, TransactionMessage,
+    VaultTransactionCreateArgs, VaultTransactionCreateArgsData,
 };
 use colored::Colorize;
 use dialoguer::Confirm;
@@ -14,14 +14,14 @@ use solana_client::client_error::ClientErrorKind;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_request::{RpcError, RpcResponseErrorData};
 use solana_client::rpc_response::RpcSimulateTransactionResult;
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_hash::Hash;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::v0::Message;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
-use solana_hash::Hash;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 use std::str::FromStr;
@@ -315,9 +315,6 @@ pub async fn create_feature_gate_proposal(
         // Create feature activation instructions
         let activation_ixs = activate_feature_funded(&feature_gate_id);
 
-        // Create feature revocation instruction
-        let revocation_ix = revoke_pending_activation(&feature_gate_id);
-
         // Build proper VersionedTransaction for activation to get correct message structure
         let activation_temp_message = Message::try_compile(
             &vault_pda.0, // Use vault as the fee payer for the inner transaction
@@ -334,83 +331,9 @@ pub async fn create_feature_gate_proposal(
         )
         .expect("Failed to create temporary activation transaction");
 
-        // Build proper VersionedTransaction for revocation to get correct message structure
-        let revocation_temp_message = Message::try_compile(
-            &vault_pda.0, // Use vault as the fee payer for the inner transaction
-            &[revocation_ix.clone()],
-            &[],
-            blockhash,
-        )
-        .unwrap();
-
-        let revocation_temp_transaction = VersionedTransaction::try_new(
-            VersionedMessage::V0(revocation_temp_message.clone()),
-            empty_signers,
-        )
-        .expect("Failed to create temporary revocation transaction");
-
-        // Extract message information from the VersionedTransactions
-        let activation_message = match &activation_temp_transaction.message {
-            VersionedMessage::V0(msg) => {
-                let header = &msg.header;
-                VaultTransactionMessage {
-                    num_signers: header.num_required_signatures,
-                    num_writable_signers: header.num_readonly_signed_accounts,
-                    num_writable_non_signers: header.num_readonly_unsigned_accounts,
-                    account_keys: msg.account_keys.clone(),
-                    instructions: msg
-                        .instructions
-                        .iter()
-                        .map(|ix| MultisigCompiledInstruction {
-                            program_id_index: ix.program_id_index,
-                            account_indexes: ix.accounts.clone(),
-                            data: ix.data.clone(),
-                        })
-                        .collect(),
-                    address_table_lookups: msg
-                        .address_table_lookups
-                        .iter()
-                        .map(|lookup| crate::squads::MultisigMessageAddressTableLookup {
-                            account_key: lookup.account_key,
-                            writable_indexes: lookup.writable_indexes.clone(),
-                            readonly_indexes: lookup.readonly_indexes.clone(),
-                        })
-                        .collect(),
-                }
-            }
-            VersionedMessage::Legacy(_) => panic!("Expected V0 message"),
-        };
-
-        let revocation_message = match &revocation_temp_transaction.message {
-            VersionedMessage::V0(msg) => {
-                let header = &msg.header;
-                VaultTransactionMessage {
-                    num_signers: header.num_required_signatures,
-                    num_writable_signers: header.num_readonly_signed_accounts,
-                    num_writable_non_signers: header.num_readonly_unsigned_accounts,
-                    account_keys: msg.account_keys.clone(),
-                    instructions: msg
-                        .instructions
-                        .iter()
-                        .map(|ix| MultisigCompiledInstruction {
-                            program_id_index: ix.program_id_index,
-                            account_indexes: ix.accounts.clone(),
-                            data: ix.data.clone(),
-                        })
-                        .collect(),
-                    address_table_lookups: msg
-                        .address_table_lookups
-                        .iter()
-                        .map(|lookup| crate::squads::MultisigMessageAddressTableLookup {
-                            account_key: lookup.account_key,
-                            writable_indexes: lookup.writable_indexes.clone(),
-                            readonly_indexes: lookup.readonly_indexes.clone(),
-                        })
-                        .collect(),
-                }
-            }
-            VersionedMessage::Legacy(_) => panic!("Expected V0 message"),
-        };
+        // Create transaction messages using utility functions
+        let activation_message = crate::utils::create_feature_activation_transaction_message();
+        let revocation_message = crate::utils::create_feature_revocation_transaction_message();
 
         // Transaction 1: Create activation transaction
         let create_activation_tx_message = Message::try_compile(
@@ -429,8 +352,8 @@ pub async fn create_feature_gate_proposal(
                         system_program: solana_system_interface::program::ID,
                     }
                     .to_account_metas(None),
-                    data: MultisigCreateTransactionData {
-                        args: MultisigCreateTransactionArgs {
+                    data: VaultTransactionCreateArgsData {
+                        args: VaultTransactionCreateArgs {
                             vault_index: 0,
                             num_ephemeral_signers: 0,
                             transaction_message: activation_message,
@@ -512,8 +435,8 @@ pub async fn create_feature_gate_proposal(
                         system_program: solana_system_interface::program::ID,
                     }
                     .to_account_metas(None),
-                    data: MultisigCreateTransactionData {
-                        args: MultisigCreateTransactionArgs {
+                    data: VaultTransactionCreateArgsData {
+                        args: VaultTransactionCreateArgs {
                             vault_index: 0,
                             num_ephemeral_signers: 0,
                             transaction_message: revocation_message,
@@ -620,15 +543,18 @@ pub fn create_transaction_and_proposal_message(
     multisig_address: &Pubkey,
     transaction_index: u64,
     vault_index: u8,
-    transaction_message: VaultTransactionMessage,
+    transaction_message: TransactionMessage,
     priority_fee: Option<u32>,
+    compute_unit_limit: Option<u32>,
     recent_blockhash: Hash,
 ) -> eyre::Result<(Message, Pubkey, Pubkey)> {
     let program_id = program_id.unwrap_or(&crate::squads::SQUADS_MULTISIG_PROGRAM_ID);
 
     // Derive transaction and proposal PDAs
-    let (transaction_pda, _transaction_bump) = get_transaction_pda(multisig_address, transaction_index, Some(program_id));
-    let (proposal_pda, _proposal_bump) = get_proposal_pda(multisig_address, transaction_index, Some(program_id));
+    let (transaction_pda, _transaction_bump) =
+        get_transaction_pda(multisig_address, transaction_index, Some(program_id));
+    let (proposal_pda, _proposal_bump) =
+        get_proposal_pda(multisig_address, transaction_index, Some(program_id));
 
     // Create transaction instruction
     let create_transaction_accounts = MultisigCreateTransaction {
@@ -639,12 +565,12 @@ pub fn create_transaction_and_proposal_message(
         system_program: solana_system_interface::program::ID,
     };
 
-    let create_transaction_data = MultisigCreateTransactionData {
-        args: MultisigCreateTransactionArgs {
+    let create_transaction_data = VaultTransactionCreateArgsData {
+        args: VaultTransactionCreateArgs {
             vault_index,
             num_ephemeral_signers: 0, // No ephemeral signers for basic transactions
             transaction_message,
-        }
+        },
     };
 
     let create_transaction_instruction = Instruction::new_with_bytes(
@@ -666,7 +592,7 @@ pub fn create_transaction_and_proposal_message(
         args: MultisigCreateProposalArgs {
             transaction_index,
             is_draft: false, // Not a draft, ready for voting
-        }
+        },
     };
 
     let create_proposal_instruction = Instruction::new_with_bytes(
@@ -678,11 +604,16 @@ pub fn create_transaction_and_proposal_message(
     // Build instructions list
     let mut instructions = Vec::new();
 
-    // Add priority fee if specified
+    // Add compute unit price if specified
     if let Some(microlamports) = priority_fee {
         instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
             microlamports as u64,
         ));
+    }
+
+    // Add compute unit limit if specified
+    if let Some(units) = compute_unit_limit {
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(units));
     }
 
     // Add both create transaction and create proposal instructions
@@ -690,12 +621,7 @@ pub fn create_transaction_and_proposal_message(
     instructions.push(create_proposal_instruction);
 
     // Create message with fee payer as the payer
-    let message = Message::try_compile(
-        fee_payer_pubkey,
-        &instructions,
-        &[],
-        recent_blockhash,
-    )?;
+    let message = Message::try_compile(fee_payer_pubkey, &instructions, &[], recent_blockhash)?;
 
     Ok((message, transaction_pda, proposal_pda))
 }
@@ -728,40 +654,45 @@ pub fn parse_members(member_strings: Vec<String>) -> Result<Vec<Member>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::squads::{CompiledInstruction, SmallVec, TransactionMessage};
     use borsh::BorshDeserialize;
 
-    fn create_test_transaction_message() -> VaultTransactionMessage {
+    fn create_test_transaction_message() -> TransactionMessage {
         use crate::feature_gate_program::create_feature_activation;
-        
+
         // Create feature activation instructions for a test feature
         let feature_id = Pubkey::new_unique();
         let funding_address = Pubkey::new_unique();
         let instructions = create_feature_activation(&feature_id, &funding_address);
-        
+
         // Build account keys list for the message
         let mut account_keys = vec![
-            funding_address,                                      // 0: Funding address (signer, writable)
-            feature_id,                                          // 1: Feature account (writable)
-            solana_system_interface::program::ID,                // 2: System program
+            funding_address,                      // 0: Funding address (signer, writable)
+            feature_id,                           // 1: Feature account (writable)
+            solana_system_interface::program::ID, // 2: System program
             crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID, // 3: Feature gate program
         ];
-        
+
         // Compile instructions into MultisigCompiledInstructions
         let mut compiled_instructions = Vec::new();
-        
+
         for instruction in instructions {
             // Find program_id index in account_keys
-            let program_id_index = account_keys.iter()
+            let program_id_index = account_keys
+                .iter()
                 .position(|key| *key == instruction.program_id)
                 .unwrap_or_else(|| {
                     account_keys.push(instruction.program_id);
                     account_keys.len() - 1
                 }) as u8;
-                
+
             // Map account pubkeys to indices
-            let account_indexes: Vec<u8> = instruction.accounts.iter()
+            let account_indexes: Vec<u8> = instruction
+                .accounts
+                .iter()
                 .map(|account_meta| {
-                    account_keys.iter()
+                    account_keys
+                        .iter()
                         .position(|key| *key == account_meta.pubkey)
                         .unwrap_or_else(|| {
                             account_keys.push(account_meta.pubkey);
@@ -769,50 +700,59 @@ mod tests {
                         }) as u8
                 })
                 .collect();
-                
-            compiled_instructions.push(MultisigCompiledInstruction {
+
+            compiled_instructions.push(CompiledInstruction {
                 program_id_index,
-                account_indexes,
-                data: instruction.data,
+                account_indexes: SmallVec::from(account_indexes),
+                data: SmallVec::from(instruction.data),
             });
         }
-        
-        VaultTransactionMessage {
+
+        TransactionMessage {
             num_signers: 1,              // funding_address is the signer
             num_writable_signers: 1,     // funding_address is writable signer
             num_writable_non_signers: 1, // feature_id is writable non-signer
-            account_keys,
-            instructions: compiled_instructions,
-            address_table_lookups: vec![],
+            account_keys: SmallVec::from(account_keys),
+            instructions: SmallVec::from(compiled_instructions),
+            address_table_lookups: SmallVec::from(vec![]),
         }
     }
 
     #[test]
     fn test_create_transaction_data_serialization() {
         let transaction_message = create_test_transaction_message();
-        
-        let create_transaction_data = MultisigCreateTransactionData {
-            args: MultisigCreateTransactionArgs {
+
+        let create_transaction_data = VaultTransactionCreateArgsData {
+            args: VaultTransactionCreateArgs {
                 vault_index: 0,
                 num_ephemeral_signers: 0,
                 transaction_message: transaction_message.clone(),
-            }
+            },
         };
 
         // Serialize the data
         let serialized_data = create_transaction_data.data();
-        
+
         // Check that it starts with the correct discriminator
-        assert_eq!(&serialized_data[0..8], crate::squads::CREATE_TRANSACTION_DISCRIMINATOR);
-        
+        assert_eq!(
+            &serialized_data[0..8],
+            crate::squads::CREATE_TRANSACTION_DISCRIMINATOR
+        );
+
         // Test deserialization of the args portion
         let args_data = &serialized_data[8..];
-        let deserialized_args = MultisigCreateTransactionArgs::try_from_slice(args_data).unwrap();
-        
+        let deserialized_args = VaultTransactionCreateArgs::try_from_slice(args_data).unwrap();
+
         assert_eq!(deserialized_args.vault_index, 0);
         assert_eq!(deserialized_args.num_ephemeral_signers, 0);
-        assert_eq!(deserialized_args.transaction_message.num_signers, transaction_message.num_signers);
-        assert_eq!(deserialized_args.transaction_message.account_keys.len(), transaction_message.account_keys.len());
+        assert_eq!(
+            deserialized_args.transaction_message.num_signers,
+            transaction_message.num_signers
+        );
+        assert_eq!(
+            deserialized_args.transaction_message.account_keys.len(),
+            transaction_message.account_keys.len()
+        );
     }
 
     #[test]
@@ -821,19 +761,22 @@ mod tests {
             args: MultisigCreateProposalArgs {
                 transaction_index: 1,
                 is_draft: false,
-            }
+            },
         };
 
         // Serialize the data
         let serialized_data = create_proposal_data.data();
-        
+
         // Check that it starts with the correct discriminator
-        assert_eq!(&serialized_data[0..8], crate::squads::CREATE_PROPOSAL_DISCRIMINATOR);
-        
+        assert_eq!(
+            &serialized_data[0..8],
+            crate::squads::CREATE_PROPOSAL_DISCRIMINATOR
+        );
+
         // Test deserialization of the args portion
         let args_data = &serialized_data[8..];
         let deserialized_args = MultisigCreateProposalArgs::try_from_slice(args_data).unwrap();
-        
+
         assert_eq!(deserialized_args.transaction_index, 1);
         assert_eq!(deserialized_args.is_draft, false);
     }
@@ -841,37 +784,57 @@ mod tests {
     #[test]
     fn test_vault_transaction_message_serialization() {
         let transaction_message = create_test_transaction_message();
-        
+
         // Test serialization and deserialization
         let serialized = borsh::to_vec(&transaction_message).unwrap();
-        let deserialized = VaultTransactionMessage::try_from_slice(&serialized).unwrap();
-        
+        let deserialized = TransactionMessage::try_from_slice(&serialized).unwrap();
+
         assert_eq!(deserialized.num_signers, transaction_message.num_signers);
-        assert_eq!(deserialized.num_writable_signers, transaction_message.num_writable_signers);
-        assert_eq!(deserialized.num_writable_non_signers, transaction_message.num_writable_non_signers);
+        assert_eq!(
+            deserialized.num_writable_signers,
+            transaction_message.num_writable_signers
+        );
+        assert_eq!(
+            deserialized.num_writable_non_signers,
+            transaction_message.num_writable_non_signers
+        );
         assert_eq!(deserialized.account_keys, transaction_message.account_keys);
-        assert_eq!(deserialized.instructions.len(), transaction_message.instructions.len());
-        assert_eq!(deserialized.instructions[0].program_id_index, transaction_message.instructions[0].program_id_index);
-        assert_eq!(deserialized.instructions[0].account_indexes, transaction_message.instructions[0].account_indexes);
-        assert_eq!(deserialized.instructions[0].data, transaction_message.instructions[0].data);
+        assert_eq!(
+            deserialized.instructions.len(),
+            transaction_message.instructions.len()
+        );
+        assert_eq!(
+            deserialized.instructions[0].program_id_index,
+            transaction_message.instructions[0].program_id_index
+        );
+        assert_eq!(
+            deserialized.instructions[0].account_indexes,
+            transaction_message.instructions[0].account_indexes
+        );
+        assert_eq!(
+            deserialized.instructions[0].data,
+            transaction_message.instructions[0].data
+        );
     }
 
     #[test]
     fn test_pda_derivation() {
         let multisig_address = Pubkey::new_unique(); // Generate random key
         let transaction_index = 1u64;
-        
+
         // Test transaction PDA derivation
-        let (transaction_pda, transaction_bump) = get_transaction_pda(&multisig_address, transaction_index, None);
+        let (transaction_pda, transaction_bump) =
+            get_transaction_pda(&multisig_address, transaction_index, None);
         assert!(transaction_bump <= 255); // Valid bump seed
-        
+
         // Test proposal PDA derivation
-        let (proposal_pda, proposal_bump) = get_proposal_pda(&multisig_address, transaction_index, None);
+        let (proposal_pda, proposal_bump) =
+            get_proposal_pda(&multisig_address, transaction_index, None);
         assert!(proposal_bump <= 255); // Valid bump seed
-        
+
         // PDAs should be different
         assert_ne!(transaction_pda, proposal_pda);
-        
+
         // Same inputs should produce same PDAs
         let (transaction_pda2, _) = get_transaction_pda(&multisig_address, transaction_index, None);
         let (proposal_pda2, _) = get_proposal_pda(&multisig_address, transaction_index, None);
@@ -886,7 +849,7 @@ mod tests {
         let proposal = Pubkey::new_unique();
         let creator = Pubkey::new_unique();
         let rent_payer = Pubkey::new_unique();
-        
+
         // Test MultisigCreateTransaction account metas
         let create_transaction_accounts = MultisigCreateTransaction {
             multisig,
@@ -895,7 +858,7 @@ mod tests {
             rent_payer,
             system_program: solana_system_interface::program::ID,
         };
-        
+
         let tx_metas = create_transaction_accounts.to_account_metas(None);
         assert_eq!(tx_metas.len(), 5);
         assert_eq!(tx_metas[0].pubkey, multisig);
@@ -903,7 +866,7 @@ mod tests {
         assert_eq!(tx_metas[2].pubkey, creator);
         assert_eq!(tx_metas[3].pubkey, rent_payer);
         assert_eq!(tx_metas[4].pubkey, solana_system_interface::program::ID);
-        
+
         // Test MultisigCreateProposal account metas
         let create_proposal_accounts = MultisigCreateProposalAccounts {
             multisig,
@@ -912,14 +875,17 @@ mod tests {
             rent_payer,
             system_program: solana_system_interface::program::ID,
         };
-        
+
         let proposal_metas = create_proposal_accounts.to_account_metas(None);
         assert_eq!(proposal_metas.len(), 5);
         assert_eq!(proposal_metas[0].pubkey, multisig);
         assert_eq!(proposal_metas[1].pubkey, proposal);
         assert_eq!(proposal_metas[2].pubkey, creator);
         assert_eq!(proposal_metas[3].pubkey, rent_payer);
-        assert_eq!(proposal_metas[4].pubkey, solana_system_interface::program::ID);
+        assert_eq!(
+            proposal_metas[4].pubkey,
+            solana_system_interface::program::ID
+        );
     }
 
     #[test]
@@ -928,7 +894,7 @@ mod tests {
         let fee_payer_pubkey = Pubkey::new_unique();
         let contributor_pubkey = Pubkey::new_unique();
         let recent_blockhash = Hash::default(); // Use default hash for testing
-        
+
         let transaction_message = create_test_transaction_message();
         let transaction_index = 1u64;
         let vault_index = 0u8;
@@ -944,6 +910,7 @@ mod tests {
             vault_index,
             transaction_message,
             priority_fee,
+            Some(200000u32), // compute_unit_limit
             recent_blockhash,
         );
 
@@ -951,14 +918,15 @@ mod tests {
         let (message, transaction_pda, proposal_pda) = result.unwrap();
 
         // Verify PDAs are derived correctly
-        let expected_transaction_pda = get_transaction_pda(&multisig_address, transaction_index, None).0;
+        let expected_transaction_pda =
+            get_transaction_pda(&multisig_address, transaction_index, None).0;
         let expected_proposal_pda = get_proposal_pda(&multisig_address, transaction_index, None).0;
         assert_eq!(transaction_pda, expected_transaction_pda);
         assert_eq!(proposal_pda, expected_proposal_pda);
 
         // Verify message has the right number of instructions
-        // Should have 3: priority fee + create transaction + create proposal
-        assert_eq!(message.instructions.len(), 3);
+        // Should have 4: priority fee + compute unit limit + create transaction + create proposal
+        assert_eq!(message.instructions.len(), 4);
 
         // Verify the fee payer is set correctly
         assert_eq!(message.account_keys[0], fee_payer_pubkey);
@@ -973,7 +941,7 @@ mod tests {
         let fee_payer_pubkey = Pubkey::new_unique();
         let contributor_pubkey = Pubkey::new_unique();
         let recent_blockhash = Hash::default(); // Use default hash for testing
-        
+
         let transaction_message = create_test_transaction_message();
         let transaction_index = 1u64;
         let vault_index = 0u8;
@@ -988,6 +956,7 @@ mod tests {
             vault_index,
             transaction_message,
             None, // No priority fee
+            None, // No compute unit limit
             recent_blockhash,
         );
 
@@ -1001,39 +970,60 @@ mod tests {
     #[test]
     fn test_feature_activation_instructions_compilation() {
         let transaction_message = create_test_transaction_message();
-        
+
         // Verify we have 3 compiled instructions (transfer, allocate, assign)
         assert_eq!(transaction_message.instructions.len(), 3);
-        
+
         // Verify account structure
         assert!(transaction_message.account_keys.len() >= 4); // At least: funding, feature, system, feature_gate_program
-        
+
         // Verify signer counts
         assert_eq!(transaction_message.num_signers, 1);
         assert_eq!(transaction_message.num_writable_signers, 1);
         assert_eq!(transaction_message.num_writable_non_signers, 1);
-        
+
         // First account should be the funding address (signer)
         // Second account should be the feature account (writable non-signer)
         // System program and Feature Gate program should be in the account list
-        let has_system_program = transaction_message.account_keys.contains(&solana_system_interface::program::ID);
-        let has_feature_gate_program = transaction_message.account_keys.contains(&crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID);
-        
-        assert!(has_system_program, "Transaction should include system program");
-        assert!(has_feature_gate_program, "Transaction should include feature gate program");
-        
+        let has_system_program = transaction_message
+            .account_keys
+            .contains(&solana_system_interface::program::ID);
+        let has_feature_gate_program = transaction_message
+            .account_keys
+            .contains(&crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID);
+
+        assert!(
+            has_system_program,
+            "Transaction should include system program"
+        );
+        assert!(
+            has_feature_gate_program,
+            "Transaction should include feature gate program"
+        );
+
         // Verify all instructions have valid program_id_index and account_indexes
         for (i, instruction) in transaction_message.instructions.iter().enumerate() {
-            assert!((instruction.program_id_index as usize) < transaction_message.account_keys.len(), 
-                    "Instruction {} has invalid program_id_index", i);
-            
+            assert!(
+                (instruction.program_id_index as usize) < transaction_message.account_keys.len(),
+                "Instruction {} has invalid program_id_index",
+                i
+            );
+
             for (j, &account_index) in instruction.account_indexes.iter().enumerate() {
-                assert!((account_index as usize) < transaction_message.account_keys.len(), 
-                        "Instruction {} account {} has invalid index", i, j);
+                assert!(
+                    (account_index as usize) < transaction_message.account_keys.len(),
+                    "Instruction {} account {} has invalid index",
+                    i,
+                    j
+                );
             }
-            
+
             // Each instruction should have some data
-            assert!(!instruction.data.is_empty(), "Instruction {} should have data", i);
+            assert!(
+                !instruction.data.is_empty(),
+                "Instruction {} should have data",
+                i
+            );
         }
     }
 }
