@@ -9,7 +9,7 @@ use tabled::{settings::Style, Table, Tabled};
 
 pub async fn create_command(
     config: &mut Config,
-    threshold: u16,
+    threshold: Option<u16>,
     _sub_multisigs: Vec<String>,
     keypair_path: Option<String>,
 ) -> Result<()> {
@@ -186,7 +186,6 @@ async fn deploy_to_saved_networks(
     members: &[Member],
     threshold: u16,
 ) -> Result<Vec<DeploymentResult>> {
-    println!("\n{} Deploying to all saved networks", "🚀".bright_cyan());
 
     let mut deployments = Vec::new();
 

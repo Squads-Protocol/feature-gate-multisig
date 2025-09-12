@@ -122,6 +122,14 @@ pub fn parse_saved_members(config: &Config) -> Vec<Member> {
     parsed_members
 }
 
+pub fn parse_saved_threshold(config: &Config) -> Option<u16> {
+    if config.threshold > 0 {
+        Some(config.threshold)
+    } else {
+        None
+    }
+}
+
 pub fn collect_members_interactively() -> Result<Vec<Member>> {
     let mut interactive_members = Vec::new();
 
@@ -161,18 +169,43 @@ pub fn collect_members_interactively() -> Result<Vec<Member>> {
 
 pub fn review_and_collect_configuration(
     config: &Config,
-    threshold: u16,
+    threshold: Option<u16>,
 ) -> Result<(u16, Vec<Member>)> {
     let use_saved_config = review_config(config)?;
 
     if use_saved_config {
-        println!("{} Using saved configuration", "✅".bright_green());
         let parsed_members = parse_saved_members(config);
         Ok((config.threshold, parsed_members))
     } else {
-        println!("{} Collecting members interactively", "🔄".bright_cyan());
+        println!(
+            "{} Collecting configuration interactively",
+            "🔄".bright_cyan()
+        );
+
+        // First collect members
         let interactive_members = collect_members_interactively()?;
-        Ok((threshold, interactive_members))
+
+        // Then get threshold based on member count
+        let final_threshold =
+            if let Some(t) = threshold {
+                // Validate CLI threshold against member count
+                let max_members = interactive_members.len() + 1; // +1 for contributor
+                if t as usize > max_members {
+                    println!(
+                    "  {} CLI threshold ({}) exceeds member count ({}), prompting for new value",
+                    "⚠️".bright_yellow(), t, max_members
+                );
+                    prompt_for_threshold_with_max(max_members)?
+                } else {
+                    println!("  {} Using threshold from CLI: {}", "✓".bright_green(), t);
+                    t
+                }
+            } else {
+                let max_members = interactive_members.len() + 1; // +1 for contributor
+                prompt_for_threshold_with_max(max_members)?
+            };
+
+        Ok((final_threshold, interactive_members))
     }
 }
 
@@ -192,11 +225,6 @@ pub fn load_fee_payer_keypair(
     keypair_path: Option<String>,
 ) -> Result<Option<Keypair>> {
     if let Some(path) = keypair_path {
-        println!(
-            "{} Loading fee payer keypair from CLI: {}",
-            "💰".bright_blue(),
-            path.bright_white()
-        );
         let keypair = Keypair::read_from_file(&path)
             .map_err(|e| anyhow::anyhow!("Failed to load keypair from {}: {}", path, e))?;
         Ok(Some(keypair))
@@ -227,6 +255,25 @@ pub fn prompt_for_threshold(config: &Config) -> Result<u16> {
         .unwrap_or_default();
 
         match validate_threshold(&input, 10, config.threshold) {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
+                continue;
+            }
+        }
+    }
+}
+
+pub fn prompt_for_threshold_with_max(max_members: usize) -> Result<u16> {
+    loop {
+        let input = Text::new(&format!(
+            "Enter threshold (required signatures) [max: {}]:",
+            max_members
+        ))
+        .prompt()
+        .unwrap_or_default();
+
+        match validate_threshold(&input, max_members, 1) {
             Ok(t) => return Ok(t),
             Err(e) => {
                 println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
@@ -763,10 +810,14 @@ pub enum TransactionEncoding {
 
 impl Display for TransactionEncoding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", match self {
-            TransactionEncoding::Base58 => "base58",
-            TransactionEncoding::Base64 => "base64",
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                TransactionEncoding::Base58 => "base58",
+                TransactionEncoding::Base64 => "base64",
+            }
+        )
     }
 }
 pub fn choose_transaction_encoding() -> Result<TransactionEncoding> {
@@ -815,11 +866,14 @@ pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(b
         return Ok((false, Vec::new()));
     }
 
+    println!("");
+    println!("{}", "Saved Network Configuration".bold().bright_yellow(),);
+    println!("");
     println!(
-        "\n{}",
-        "🌐 Network Deployment Options:".bright_blue().bold()
+        "  {}: {}",
+        "Networks".cyan(),
+        available_networks.len().to_string().cyan()
     );
-    println!("  Option 1: Deploy to all saved networks automatically");
     for (i, network) in available_networks.iter().enumerate() {
         let network_name = if network.contains("devnet") {
             "Devnet"
@@ -837,8 +891,6 @@ pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(b
             network.bright_white()
         );
     }
-    println!("  Option 2: Manual network entry (prompt for each deployment)");
-
     let use_saved_networks = Confirm::new("Use saved networks for deployment?")
         .with_default(true)
         .prompt()?;
@@ -855,6 +907,22 @@ pub fn review_config(config: &Config) -> Result<bool> {
         "\n{}",
         "📋 Found existing configuration:".bright_yellow().bold()
     );
+    println!("");
+    if !config.members.is_empty() {
+        println!(
+            "  {}: {}",
+            "Saved members".cyan(),
+            config.members.len().to_string().bright_green()
+        );
+        for (i, member) in config.members.iter().enumerate() {
+            println!(
+                "    {}: {}",
+                format!("Member {}", i + 1).cyan(),
+                member.bright_white()
+            );
+        }
+    }
+    println!("");
     println!(
         "  {}: {}",
         "Threshold".cyan(),
@@ -862,6 +930,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
     );
 
     // Show fee payer path
+    println!("");
     if let Some(fee_payer_path) = &config.fee_payer_path {
         println!(
             "  {}: {}",
@@ -883,6 +952,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
         &vec![config.network.clone()]
     };
 
+    println!("");
     println!(
         "  {}: {}",
         "Saved networks".cyan(),
@@ -894,21 +964,6 @@ pub fn review_config(config: &Config) -> Result<bool> {
             format!("Network {}", i + 1).cyan(),
             network.bright_white()
         );
-    }
-
-    if !config.members.is_empty() {
-        println!(
-            "  {}: {}",
-            "Saved members".cyan(),
-            config.members.len().to_string().bright_green()
-        );
-        for (i, member) in config.members.iter().enumerate() {
-            println!(
-                "    {}: {}",
-                format!("Member {}", i + 1).cyan(),
-                member.bright_white()
-            );
-        }
     }
 
     println!();

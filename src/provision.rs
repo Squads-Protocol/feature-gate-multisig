@@ -106,7 +106,7 @@ pub async fn create_multisig(
         transaction_creator.to_string().bright_white()
     );
     println!();
-    println!("{}", "⚙️ General Info".bright_yellow().bold());
+    println!("{}", "⚙️ General Info".bright_white().bold());
     println!();
     println!(
         "{}: {}",
@@ -119,7 +119,7 @@ pub async fn create_multisig(
         vault_address.to_string().bright_white()
     );
     println!();
-    println!("{}", "⚙️ Config Parameters".bright_yellow().bold());
+    println!("{}", "⚙️ Config Parameters".bright_white().bold());
     println!();
     println!(
         "{}: {}",
@@ -130,7 +130,7 @@ pub async fn create_multisig(
         let perms = decode_permissions(member.permissions.mask);
         if perms.len() == 1 && perms[0] == "Initiate" {
             println!(
-                "  {} Setup Keypair: {} ({})",
+                "  {} Temporary Setup Keypair: {} ({})",
                 "✓".bright_green(),
                 member.key.to_string().bright_white(),
                 "Initiate".bright_cyan()
@@ -145,6 +145,7 @@ pub async fn create_multisig(
             );
         }
     }
+    println!("");
     println!(
         "{}: {}",
         "Threshold".cyan(),

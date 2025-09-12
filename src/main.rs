@@ -150,22 +150,19 @@ async fn handle_command(command: Commands) -> Result<()> {
             signers: _,
             keypair,
         } => {
-            let threshold = if let Some(t) = threshold {
+            let threshold_option = threshold.map(|t| {
                 if t == 0 {
                     println!(
-                        "{} Threshold cannot be 0, using default: {}",
-                        "⚠️".bright_yellow(),
-                        config.threshold
+                        "{} Threshold cannot be 0, will prompt later",
+                        "⚠️".bright_yellow()
                     );
-                    config.threshold
+                    None
                 } else {
-                    t as u16
+                    Some(t as u16)
                 }
-            } else {
-                prompt_for_threshold(&config)?
-            };
+            }).flatten();
 
-            create_command(&mut config, threshold, vec![], keypair).await
+            create_command(&mut config, threshold_option, vec![], keypair).await
         }
         Commands::Show { address } => {
             show_command(&config, address).await

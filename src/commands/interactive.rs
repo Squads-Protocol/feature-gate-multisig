@@ -24,9 +24,7 @@ pub async fn interactive_mode() -> Result<()> {
         match choice {
             "Create new feature gate multisig" => {
                 let feepayer_path = prompt_for_fee_payer_path(&config)?;
-                let threshold = prompt_for_threshold(&config)?;
-
-                create_command(&mut config, threshold, vec![], Some(feepayer_path)).await?;
+                create_command(&mut config, None, vec![], Some(feepayer_path)).await?;
             }
             "Show feature gate multisig details" => {
                 let address = Text::new("Enter the main multisig address:").prompt()?;
