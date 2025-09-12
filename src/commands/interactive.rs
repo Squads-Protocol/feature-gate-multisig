@@ -1,6 +1,6 @@
 use crate::commands::{config_command, create_command, show_command};
 use crate::utils::*;
-use anyhow::Result;
+use eyre::Result;
 use inquire::{Select, Text};
 
 pub async fn interactive_mode() -> Result<()> {

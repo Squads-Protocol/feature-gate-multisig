@@ -1,7 +1,7 @@
 use crate::provision::create_multisig;
 use crate::squads::{get_vault_pda, Member, Permissions};
 use crate::utils::*;
-use anyhow::Result;
+use eyre::Result;
 use colored::*;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -140,7 +140,7 @@ async fn deploy_to_single_network(
         threshold,
         None,       // No rent collector
         Some(5000), // Priority fee
-    ).await.map_err(|e| anyhow::anyhow!("Failed to create multisig: {}", e))?;
+    ).await.map_err(|e| eyre::eyre!("Failed to create multisig: {}", e))?;
 
     let vault_address = get_vault_pda(&multisig_address, 0, None).0;
 
