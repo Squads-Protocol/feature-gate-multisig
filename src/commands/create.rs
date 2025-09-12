@@ -26,9 +26,9 @@ pub async fn create_command(
     // Load fee payer keypair from CLI arg or config
     let fee_payer_keypair = load_fee_payer_keypair(config, keypair_path)?;
 
-    // Create contributor keypair (always separate from fee payer)
-    let contributor_keypair = Keypair::new();
-    let contributor_pubkey = contributor_keypair.pubkey();
+    // Create setup keypair (always separate from fee payer)
+    let setup_keypair = Keypair::new();
+    let setup_pubkey = setup_keypair.pubkey();
 
     // Create a persistent create_key for all deployments
     let create_key = Keypair::new();
@@ -37,41 +37,43 @@ pub async fn create_command(
     members.insert(
         0,
         Member {
-            key: contributor_pubkey,
+            key: setup_pubkey,
             permissions: Permissions { mask: 1 },
         },
     );
 
-    // Display final configuration
-    display_final_configuration(
-        &contributor_pubkey,
-        &create_key.pubkey(),
-        &fee_payer_keypair,
-        final_threshold,
-        &members,
-    );
+    // // Display final configuration
+    // display_final_configuration(
+    //     &contributor_pubkey,
+    //     &create_key.pubkey(),
+    //     &fee_payer_keypair,
+    //     final_threshold,
+    //     &members,
+    // );
 
     // Determine network deployment mode and deploy
     let (use_saved_networks, saved_networks) = choose_network_mode(config, true)?;
-    
+
     let deployments = if use_saved_networks && !saved_networks.is_empty() {
         deploy_to_saved_networks(
             &saved_networks,
             &create_key,
-            &contributor_keypair,
+            &setup_keypair,
             &fee_payer_keypair,
             &members,
             final_threshold,
-        ).await?
+        )
+        .await?
     } else {
         deploy_to_manual_networks(
             config,
             &create_key,
-            &contributor_keypair,
+            &setup_keypair,
             &fee_payer_keypair,
             &members,
             final_threshold,
-        ).await?
+        )
+        .await?
     };
 
     // Print summary table
@@ -106,41 +108,38 @@ async fn deploy_to_single_network(
     network_index: usize,
     total_networks: usize,
     create_key: &Keypair,
-    contributor_keypair: &Keypair,
+    setup_keypair: &Keypair,
     fee_payer_keypair: &Option<Keypair>,
     members: &[Member],
     threshold: u16,
 ) -> Result<DeploymentResult> {
-    let multisig_address = crate::squads::get_multisig_pda(&create_key.pubkey(), None).0;
-    let vault_address = get_vault_pda(&multisig_address, 0, None).0;
-
-    display_deployment_info(
-        network_index,
-        total_networks,
-        rpc_url,
-        &create_key.pubkey(),
-        &contributor_keypair.pubkey(),
-        &multisig_address,
-        &vault_address,
-        members,
-    );
+    // display_deployment_info(
+    //     network_index,
+    //     total_networks,
+    //     rpc_url,
+    //     &create_key.pubkey(),
+    //     &contributor_keypair.pubkey(),
+    //     &multisig_address,
+    //     &vault_address,
+    //     members,
+    // );
 
     let signer_for_creation = fee_payer_keypair
         .as_ref()
         .map(|kp| kp as &dyn Signer)
-        .unwrap_or(contributor_keypair as &dyn Signer);
+        .unwrap_or(setup_keypair as &dyn Signer);
 
     let (multisig_address, signature) = create_multisig(
         rpc_url.to_string(),
         None, // Use default program ID
         signer_for_creation,
         create_key,
-        None, // No config authority
         members.to_vec(),
         threshold,
-        None,       // No rent collector
         Some(5000), // Priority fee
-    ).await.map_err(|e| eyre::eyre!("Failed to create multisig: {}", e))?;
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to create multisig: {}", e))?;
 
     let vault_address = get_vault_pda(&multisig_address, 0, None).0;
 
@@ -154,20 +153,22 @@ async fn deploy_to_single_network(
     create_and_send_transaction_proposal(
         rpc_url,
         fee_payer_keypair,
-        contributor_keypair,
+        setup_keypair,
         &multisig_address,
         "activation",
         1, // Transaction index 1 (activation)
-    ).await?;
+    )
+    .await?;
 
     create_and_send_transaction_proposal(
         rpc_url,
         fee_payer_keypair,
-        contributor_keypair,
+        setup_keypair,
         &multisig_address,
         "revocation",
         2, // Transaction index 2 (revocation)
-    ).await?;
+    )
+    .await?;
 
     Ok(DeploymentResult {
         rpc_url: rpc_url.to_string(),
@@ -180,13 +181,13 @@ async fn deploy_to_single_network(
 async fn deploy_to_saved_networks(
     networks: &[String],
     create_key: &Keypair,
-    contributor_keypair: &Keypair,
+    setup_keypair: &Keypair,
     fee_payer_keypair: &Option<Keypair>,
     members: &[Member],
     threshold: u16,
 ) -> Result<Vec<DeploymentResult>> {
     println!("\n{} Deploying to all saved networks", "🚀".bright_cyan());
-    
+
     let mut deployments = Vec::new();
 
     for (i, rpc_url) in networks.iter().enumerate() {
@@ -195,11 +196,13 @@ async fn deploy_to_saved_networks(
             i,
             networks.len(),
             create_key,
-            contributor_keypair,
+            setup_keypair,
             fee_payer_keypair,
             members,
             threshold,
-        ).await {
+        )
+        .await
+        {
             Ok(deployment) => {
                 deployments.push(deployment);
             }
@@ -231,7 +234,7 @@ async fn deploy_to_manual_networks(
     threshold: u16,
 ) -> Result<Vec<DeploymentResult>> {
     println!("\n{} Manual network entry mode", "🔄".bright_cyan());
-    
+
     let mut deployments = Vec::new();
 
     loop {
@@ -246,7 +249,9 @@ async fn deploy_to_manual_networks(
             fee_payer_keypair,
             members,
             threshold,
-        ).await {
+        )
+        .await
+        {
             Ok(deployment) => {
                 deployments.push(deployment);
             }
