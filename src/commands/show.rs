@@ -1,6 +1,8 @@
+use crate::constants::*;
 use crate::squads::{get_vault_pda, get_transaction_pda, get_proposal_pda, Multisig, VaultTransaction, Proposal, ProposalStatus};
+use crate::provision::{get_account_data_with_retry, create_rpc_client};
 use crate::utils::*;
-use anyhow::Result;
+use eyre::Result;
 use colored::*;
 use solana_client::rpc_client::RpcClient;
 use solana_pubkey::Pubkey;
@@ -18,7 +20,7 @@ pub async fn show_command(config: &Config, address: Option<String>) -> Result<()
                     "❌".bright_red(),
                     addr.bright_red()
                 );
-                return Err(anyhow::anyhow!("Invalid multisig address format"));
+                return Err(eyre::eyre!("Invalid multisig address format"));
             }
         }
     } else {
@@ -30,7 +32,7 @@ pub async fn show_command(config: &Config, address: Option<String>) -> Result<()
 async fn show_multisig(config: &Config, address: &str) -> Result<()> {
     // Parse the multisig address
     let multisig_pubkey = Pubkey::from_str(address)
-        .map_err(|_| anyhow::anyhow!("Invalid multisig address format"))?;
+        .map_err(|_| eyre::eyre!("Invalid multisig address format"))?;
 
     println!(
         "{}",
@@ -45,10 +47,8 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
 
     let networks_to_try = if !config.networks.is_empty() {
         config.networks.clone()
-    } else if !config.network.is_empty() {
-        vec![config.network.clone()]
     } else {
-        vec!["https://api.devnet.solana.com".to_string()]
+        vec![DEFAULT_DEVNET_URL.to_string()]
     };
 
     println!("Available networks to search:");
@@ -60,8 +60,8 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
     for rpc_url in &networks_to_try {
         println!("🌐 Trying network: {}", rpc_url.bright_white());
 
-        let rpc_client = RpcClient::new(rpc_url);
-        match rpc_client.get_account_data(&multisig_pubkey) {
+        let rpc_client = create_rpc_client(rpc_url);
+        match get_account_data_with_retry(&rpc_client, &multisig_pubkey) {
             Ok(data) => {
                 println!("✅ Found account on: {}", rpc_url.bright_green());
                 account_data = Some(data);
@@ -86,7 +86,7 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
     let (rpc_url, account_data) = match (successful_rpc_url, account_data) {
         (Some(url), Some(data)) => (url, data),
         _ => {
-            return Err(anyhow::anyhow!(
+            return Err(eyre::eyre!(
                 "{}",
                 last_error.unwrap_or_else(
                     || "Failed to find account on any configured network".to_string()
@@ -104,7 +104,7 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
     println!();
 
     if account_data.len() < 8 {
-        return Err(anyhow::anyhow!(
+        return Err(eyre::eyre!(
             "Account data too small to be a valid multisig"
         ));
     }
@@ -120,9 +120,9 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
             use borsh::BorshDeserialize;
             let mut slice = &account_data[8..];
             Multisig::deserialize(&mut slice)
-                .map_err(|e2| anyhow::anyhow!("Failed to deserialize multisig data even with partial read: {}. This account may not be a valid Squads multisig.", e2))?
+                .map_err(|e2| eyre::eyre!("Failed to deserialize multisig data even with partial read: {}. This account may not be a valid Squads multisig.", e2))?
         },
-        Err(e) => return Err(anyhow::anyhow!("Failed to deserialize multisig data: {}. This account may not be a valid Squads multisig.", e)),
+        Err(e) => return Err(eyre::eyre!("Failed to deserialize multisig data: {}. This account may not be a valid Squads multisig.", e)),
     };
 
     println!("✅ Multisig deserialized successfully!");
@@ -131,7 +131,7 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
     display_multisig_details(&multisig, &multisig_pubkey)?;
 
     // Fetch and display transaction and proposal details for indices 1 and 2
-    let rpc_client = RpcClient::new(&rpc_url);
+    let rpc_client = create_rpc_client(&rpc_url);
     fetch_and_display_transactions_and_proposals(&rpc_client, &multisig_pubkey, &multisig).await?;
 
     Ok(())
@@ -364,14 +364,14 @@ async fn fetch_and_display_transaction(
     println!("📦 Transaction Account Data:");
 
     // Fetch the transaction account
-    let account_data = match rpc_client.get_account_data(transaction_pda) {
+    let account_data = match get_account_data_with_retry(rpc_client, transaction_pda) {
         Ok(data) => data,
         Err(e) => {
             if e.to_string().contains("AccountNotFound") {
                 println!("  ⚠️  Transaction account not found");
                 return Ok(());
             }
-            return Err(anyhow::anyhow!("Failed to fetch transaction account: {}", e));
+            return Err(eyre::eyre!("Failed to fetch transaction account: {}", e));
         }
     };
 
@@ -610,14 +610,14 @@ async fn fetch_and_display_proposal(
     println!("🗳️  Proposal Account Data:");
 
     // Fetch the proposal account
-    let account_data = match rpc_client.get_account_data(proposal_pda) {
+    let account_data = match get_account_data_with_retry(rpc_client, proposal_pda) {
         Ok(data) => data,
         Err(e) => {
             if e.to_string().contains("AccountNotFound") {
                 println!("  ⚠️  Proposal account not found");
                 return Ok(());
             }
-            return Err(anyhow::anyhow!("Failed to fetch proposal account: {}", e));
+            return Err(eyre::eyre!("Failed to fetch proposal account: {}", e));
         }
     };
 

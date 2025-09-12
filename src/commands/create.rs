@@ -1,7 +1,7 @@
 use crate::provision::create_multisig;
 use crate::squads::{get_vault_pda, Member, Permissions};
 use crate::utils::*;
-use anyhow::Result;
+use eyre::Result;
 use colored::*;
 use solana_keypair::Keypair;
 use solana_signer::Signer;

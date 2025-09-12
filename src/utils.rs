@@ -1,12 +1,12 @@
+use crate::constants::*;
 use crate::feature_gate_program::create_feature_activation;
+use crate::provision::create_rpc_client;
 use crate::squads::{CompiledInstruction, Member, Permissions, TransactionMessage};
-use anyhow::Result;
+use eyre::Result;
 use colored::*;
 use dirs;
 use inquire::{Confirm, Select, Text};
 use serde::{Deserialize, Serialize};
-use solana_client::rpc_client::RpcClient;
-use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_keypair::Keypair;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
@@ -24,14 +24,11 @@ pub struct Config {
     pub members: Vec<String>,
     #[serde(default)]
     pub networks: Vec<String>,
-    // Legacy single network field for backward compatibility
-    #[serde(default)]
-    pub network: String,
-    // Keep for backward compatibility but don't use
-    #[serde(default, skip_serializing)]
-    pub signers: Vec<Vec<String>>,
     #[serde(default)]
     pub fee_payer_path: Option<String>,
+    // Legacy field for migration - will be removed after migration
+    #[serde(default, skip_serializing)]
+    network: String,
 }
 
 impl Default for Config {
@@ -39,10 +36,9 @@ impl Default for Config {
         Self {
             threshold: 1,
             members: Vec::new(),
-            networks: vec!["https://api.devnet.solana.com".to_string()],
-            network: "https://api.devnet.solana.com".to_string(),
-            signers: vec![vec![]],
+            networks: vec![DEFAULT_DEVNET_URL.to_string()],
             fee_payer_path: None,
+            network: String::new(),
         }
     }
 }
@@ -58,7 +54,7 @@ pub struct DeploymentResult {
 // Config management functions
 pub fn get_config_path() -> Result<PathBuf> {
     let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+        dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
     Ok(home_dir
         .join(".feature-gate-multisig-tool")
         .join("config.json"))
@@ -74,10 +70,18 @@ pub fn load_config() -> Result<Config> {
     }
 
     let config_str = fs::read_to_string(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to read config file: {}", e))?;
 
-    let config: Config = serde_json::from_str(&config_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
+    let mut config: Config = serde_json::from_str(&config_str)
+        .map_err(|e| eyre::eyre!("Failed to parse config file: {}", e))?;
+
+    // Migrate legacy single network field to networks array
+    if !config.network.is_empty() && config.networks.is_empty() {
+        config.networks = vec![config.network.clone()];
+        config.network = String::new();
+        // Save the migrated config
+        save_config(&config)?;
+    }
 
     Ok(config)
 }
@@ -87,14 +91,14 @@ pub fn save_config(config: &Config) -> Result<()> {
 
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
+            .map_err(|e| eyre::eyre!("Failed to create config directory: {}", e))?;
     }
 
     let config_str = serde_json::to_string_pretty(config)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize config: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to serialize config: {}", e))?;
 
     fs::write(&config_path, config_str)
-        .map_err(|e| anyhow::anyhow!("Failed to write config file: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to write config file: {}", e))?;
 
     Ok(())
 }
@@ -180,7 +184,7 @@ pub fn review_and_collect_configuration(
 pub fn expand_tilde_path(path: &str) -> Result<String> {
     if path.starts_with("~/") {
         let home =
-            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+            dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
         Ok(home.join(&path[2..]).to_string_lossy().to_string())
     } else {
         Ok(path.to_string())
@@ -198,7 +202,7 @@ pub fn load_fee_payer_keypair(
             path.bright_white()
         );
         let keypair = Keypair::read_from_file(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to load keypair from {}: {}", path, e))?;
+            .map_err(|e| eyre::eyre!("Failed to load keypair from {}: {}", path, e))?;
         Ok(Some(keypair))
     } else if let Some(path) = &config.fee_payer_path {
         println!(
@@ -207,7 +211,7 @@ pub fn load_fee_payer_keypair(
             path.bright_white()
         );
         let keypair = Keypair::read_from_file(path).map_err(|e| {
-            anyhow::anyhow!("Failed to load keypair from config path {}: {}", path, e)
+            eyre::eyre!("Failed to load keypair from config path {}: {}", path, e)
         })?;
         Ok(Some(keypair))
     } else {
@@ -264,11 +268,7 @@ pub fn prompt_for_fee_payer_path(config: &Config) -> Result<String> {
 }
 
 pub fn prompt_for_network(config: &Config) -> Result<String> {
-    let default_network = if !config.networks.is_empty() {
-        &config.networks[0]
-    } else {
-        &config.network
-    };
+    let default_network = &config.networks[0]; // We guarantee networks is not empty after migration
 
     loop {
         let input = Text::new("Enter RPC URL for deployment:")
@@ -281,7 +281,7 @@ pub fn prompt_for_network(config: &Config) -> Result<String> {
                 println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
                 let retry = Confirm::new("Try again?").with_default(true).prompt()?;
                 if !retry {
-                    return Err(anyhow::anyhow!("User cancelled network entry"));
+                    return Err(eyre::eyre!("User cancelled network entry"));
                 }
             }
         }
@@ -559,17 +559,17 @@ pub async fn create_and_send_transaction_proposal(
         "activation" => create_feature_activation_transaction_message(),
         "revocation" => create_feature_revocation_transaction_message(),
         _ => {
-            return Err(anyhow::anyhow!(
+            return Err(eyre::eyre!(
                 "Invalid transaction type: {}",
                 transaction_type
             ))
         }
     };
 
-    let rpc_client = RpcClient::new(rpc_url);
+    let rpc_client = create_rpc_client(rpc_url);
     let recent_blockhash = rpc_client
         .get_latest_blockhash()
-        .map_err(|e| anyhow::anyhow!("Failed to get recent blockhash: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to get recent blockhash: {}", e))?;
 
     let fee_payer_pubkey = fee_payer_keypair
         .as_ref()
@@ -587,10 +587,10 @@ pub async fn create_and_send_transaction_proposal(
             0, // Vault index 0 (default vault for feature gates)
             transaction_message,
             Some(5000),    // Priority fee
-            Some(300_000), // Compute unit limit
+            Some(DEFAULT_COMPUTE_UNITS), // Compute unit limit
             recent_blockhash,
         )
-        .map_err(|e| anyhow::anyhow!("Failed to create transaction and proposal message: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to create transaction and proposal message: {}", e))?;
 
     println!(
         "  {}: {}",
@@ -618,7 +618,7 @@ pub async fn create_and_send_transaction_proposal(
     };
 
     let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), signers)
-        .map_err(|e| anyhow::anyhow!("Failed to create signed transaction: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to create signed transaction: {}", e))?;
 
     // Display the transaction signature before sending
     let expected_signature = transaction.signatures[0];
@@ -633,15 +633,8 @@ pub async fn create_and_send_transaction_proposal(
         "📤".bright_blue()
     );
 
-    let signature = rpc_client
-        .send_transaction_with_config(
-            &transaction,
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..RpcSendTransactionConfig::default()
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to send transaction and proposal: {}", e))?;
+    let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
+        .map_err(|e| eyre::eyre!("Failed to send transaction and proposal: {}", e))?;
 
     println!(
         "{} Transaction and proposal created successfully in one step!",
@@ -681,7 +674,7 @@ pub fn validate_pubkey_with_retry(prompt: &str) -> Result<Pubkey> {
 
                 let retry = Confirm::new("Try again?").with_default(true).prompt()?;
                 if !retry {
-                    return Err(anyhow::anyhow!("User cancelled public key entry"));
+                    return Err(eyre::eyre!("User cancelled public key entry"));
                 }
             }
         }
@@ -694,8 +687,8 @@ pub fn validate_threshold(input: &str, max_members: usize, default: u16) -> Resu
     }
 
     match input.trim().parse::<u16>() {
-        Ok(threshold) if threshold == 0 => Err(anyhow::anyhow!("Threshold must be at least 1")),
-        Ok(threshold) if threshold > max_members as u16 => Err(anyhow::anyhow!(
+        Ok(threshold) if threshold == 0 => Err(eyre::eyre!("Threshold must be at least 1")),
+        Ok(threshold) if threshold > max_members as u16 => Err(eyre::eyre!(
             "Threshold cannot exceed number of members ({})",
             max_members
         )),
@@ -707,7 +700,7 @@ pub fn validate_threshold(input: &str, max_members: usize, default: u16) -> Resu
             );
             Ok(threshold)
         }
-        Err(_) => Err(anyhow::anyhow!(
+        Err(_) => Err(eyre::eyre!(
             "Invalid number format. Please enter a positive integer."
         )),
     }
@@ -717,17 +710,17 @@ pub fn validate_rpc_url(url: &str) -> Result<String> {
     let url = url.trim();
 
     if url.is_empty() {
-        return Err(anyhow::anyhow!("URL cannot be empty"));
+        return Err(eyre::eyre!("URL cannot be empty"));
     }
 
     // Check if it's a valid URL
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(anyhow::anyhow!("URL must start with http:// or https://"));
+        return Err(eyre::eyre!("URL must start with http:// or https://"));
     }
 
     // Basic URL validation - check for valid characters and structure
     if !url.contains("://") {
-        return Err(anyhow::anyhow!("Invalid URL format"));
+        return Err(eyre::eyre!("Invalid URL format"));
     }
 
     // Check for common Solana RPC patterns
@@ -746,7 +739,7 @@ pub fn validate_rpc_url(url: &str) -> Result<String> {
             .with_default(false)
             .prompt()?;
         if !confirm {
-            return Err(anyhow::anyhow!("User cancelled due to unusual URL"));
+            return Err(eyre::eyre!("User cancelled due to unusual URL"));
         }
     }
 
@@ -805,11 +798,7 @@ pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(b
         return Ok((false, Vec::new()));
     }
 
-    let available_networks = if !config.networks.is_empty() {
-        config.networks.clone()
-    } else {
-        vec![config.network.clone()]
-    };
+    let available_networks = config.networks.clone();
 
     if available_networks.is_empty() {
         return Ok((false, Vec::new()));
@@ -877,11 +866,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
     }
 
     // Show networks
-    let networks_to_show = if !config.networks.is_empty() {
-        &config.networks
-    } else {
-        &vec![config.network.clone()]
-    };
+    let networks_to_show = &config.networks;
 
     println!(
         "  {}: {}",
