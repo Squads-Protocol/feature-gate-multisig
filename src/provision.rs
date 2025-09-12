@@ -1,10 +1,12 @@
 use crate::squads::{
     get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
-    Member, MultisigCreateArgsV2, MultisigCreateProposalAccounts, MultisigCreateProposalArgs,
-    MultisigCreateProposalData, MultisigCreateTransaction, MultisigCreateV2Accounts,
-    MultisigCreateV2Data, Permissions, ProgramConfig, TransactionMessage,
+    Member, MultisigApproveProposalData, MultisigCreateArgsV2, MultisigCreateProposalAccounts,
+    MultisigCreateProposalArgs, MultisigCreateProposalData, MultisigCreateTransaction,
+    MultisigCreateV2Accounts, MultisigCreateV2Data, MultisigVoteOnProposalAccounts,
+    MultisigVoteOnProposalArgs, Permissions, ProgramConfig, TransactionMessage,
     VaultTransactionCreateArgs, VaultTransactionCreateArgsData,
 };
+use crate::utils::decode_permissions;
 use colored::Colorize;
 use dialoguer::Confirm;
 use eyre::eyre;
@@ -70,29 +72,29 @@ pub fn send_and_confirm_transaction(
 pub async fn create_multisig(
     rpc_url: String,
     program_id: Option<String>,
-    contributor_keypair: &dyn Signer,
+    fee_payer_keypair: &dyn Signer,
     create_key: &Keypair,
-    config_authority: Option<Pubkey>,
     members: Vec<Member>,
     threshold: u16,
-    rent_collector: Option<Pubkey>,
     priority_fee_lamports: Option<u64>,
 ) -> eyre::Result<(Pubkey, String)> {
     let program_id =
         program_id.unwrap_or_else(|| "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf".to_string());
     let program_id = Pubkey::from_str(&program_id).expect("Invalid program ID");
+    let multisig_address = crate::squads::get_multisig_pda(&create_key.pubkey(), None).0;
+    let vault_address = get_vault_pda(&multisig_address, 0, None).0;
 
-    let transaction_creator = contributor_keypair.pubkey();
+    let transaction_creator = fee_payer_keypair.pubkey();
 
     println!();
     println!(
         "{}",
-        "👀 You're about to create a multisig, please review the details:"
+        "👀 Review Feature Gate Multisig Details"
             .bright_yellow()
             .bold()
     );
     println!();
-    println!("{}: {}", "RPC Cluster URL".cyan(), rpc_url.bright_white());
+    println!("{}: {}", "Network".cyan(), rpc_url.bright_white());
     println!(
         "{}: {}",
         "Program ID".cyan(),
@@ -100,37 +102,53 @@ pub async fn create_multisig(
     );
     println!(
         "{}: {}",
-        "Your Public Key".cyan(),
+        "Fee Payer".cyan(),
         transaction_creator.to_string().bright_white()
+    );
+    println!();
+    println!("{}", "⚙️ General Info".bright_yellow().bold());
+    println!();
+    println!(
+        "{}: {}",
+        "Feature Gate Multisig".cyan(),
+        multisig_address.to_string().bright_white()
+    );
+    println!(
+        "{}: {}",
+        "Feature Gate ID".cyan(),
+        vault_address.to_string().bright_white()
     );
     println!();
     println!("{}", "⚙️ Config Parameters".bright_yellow().bold());
     println!();
     println!(
         "{}: {}",
-        "Config Authority".cyan(),
-        config_authority
-            .map(|k| k.to_string())
-            .unwrap_or_else(|| "None".to_string())
-            .bright_white()
+        "Members".cyan(),
+        members.len().to_string().bright_green()
     );
+    for (i, member) in members.iter().enumerate() {
+        let perms = decode_permissions(member.permissions.mask);
+        if perms.len() == 1 && perms[0] == "Initiate" {
+            println!(
+                "  {} Setup Keypair: {} ({})",
+                "✓".bright_green(),
+                member.key.to_string().bright_white(),
+                "Initiate".bright_cyan()
+            );
+        } else {
+            println!(
+                "  {} Member {}: {} ({})",
+                "✓".bright_green(),
+                i + 1,
+                member.key.to_string().bright_white(),
+                perms.join(", ").bright_cyan()
+            );
+        }
+    }
     println!(
         "{}: {}",
         "Threshold".cyan(),
         threshold.to_string().bright_green()
-    );
-    println!(
-        "{}: {}",
-        "Rent Collector".cyan(),
-        rent_collector
-            .map(|k| k.to_string())
-            .unwrap_or_else(|| "None".to_string())
-            .bright_white()
-    );
-    println!(
-        "{}: {}",
-        "Members amount".cyan(),
-        members.len().to_string().bright_green()
     );
     println!();
 
@@ -187,12 +205,12 @@ pub async fn create_multisig(
                 .to_account_metas(Some(false)),
                 data: MultisigCreateV2Data {
                     args: MultisigCreateArgsV2 {
-                        config_authority,
+                        config_authority: None,
                         members,
                         threshold,
                         time_lock: 0,
                         memo: None,
-                        rent_collector,
+                        rent_collector: None,
                     },
                 }
                 .data(),
@@ -206,7 +224,7 @@ pub async fn create_multisig(
 
     let transaction = VersionedTransaction::try_new(
         VersionedMessage::V0(message),
-        &[contributor_keypair, create_key as &dyn Signer],
+        &[fee_payer_keypair, create_key as &dyn Signer],
     )
     .expect("Failed to create transaction");
 
@@ -434,7 +452,7 @@ pub fn create_transaction_and_proposal_message(
 
     // Serialize the TransactionMessage to bytes as expected by the on-chain program
     let transaction_message_bytes = borsh::to_vec(&transaction_message)?;
-    
+
     let create_transaction_data = VaultTransactionCreateArgsData {
         args: VaultTransactionCreateArgs {
             vault_index,
@@ -495,6 +513,42 @@ pub fn create_transaction_and_proposal_message(
     let message = Message::try_compile(fee_payer_pubkey, &instructions, &[], recent_blockhash)?;
 
     Ok((message, transaction_pda, proposal_pda))
+}
+
+pub fn create_approve_activation_transaction_message(
+    program_id: &Pubkey,
+    feature_gate_multisig_address: &Pubkey,
+    member_pubkey: &Pubkey,
+    fee_payer_pubkey: &Pubkey,
+    recent_blockhash: Hash,
+) -> eyre::Result<Message> {
+    let (proposal_pda, _proposal_bump) =
+        get_proposal_pda(feature_gate_multisig_address, 0, Some(program_id));
+
+    let account_keys = MultisigVoteOnProposalAccounts {
+        multisig: *feature_gate_multisig_address,
+        member: *member_pubkey,
+        proposal: proposal_pda,
+    };
+    let instruction_args = MultisigVoteOnProposalArgs { memo: None };
+    let instruction_data = MultisigApproveProposalData {
+        args: instruction_args,
+    };
+
+    let approve_instruction = Instruction::new_with_bytes(
+        *program_id,
+        &instruction_data.data(),
+        account_keys.to_account_metas(),
+    );
+
+    let message = Message::try_compile(
+        fee_payer_pubkey,
+        &[approve_instruction],
+        &[],
+        recent_blockhash,
+    )?;
+
+    Ok(message)
 }
 
 pub fn parse_members(member_strings: Vec<String>) -> Result<Vec<Member>, String> {
@@ -619,9 +673,10 @@ mod tests {
         assert_eq!(deserialized_args.vault_index, 0);
         assert_eq!(deserialized_args.ephemeral_signers, 0);
         assert_eq!(deserialized_args.memo, None);
-        
+
         // Deserialize the transaction message bytes and verify
-        let deserialized_transaction_message = TransactionMessage::try_from_slice(&deserialized_args.transaction_message).unwrap();
+        let deserialized_transaction_message =
+            TransactionMessage::try_from_slice(&deserialized_args.transaction_message).unwrap();
         assert_eq!(
             deserialized_transaction_message.num_signers,
             transaction_message.num_signers
@@ -847,31 +902,48 @@ mod tests {
     #[test]
     fn test_debug_serialization() {
         let transaction_message = create_test_transaction_message();
-        
+
         println!("Transaction message created with:");
         println!("  num_signers: {}", transaction_message.num_signers);
-        println!("  num_writable_signers: {}", transaction_message.num_writable_signers);
-        println!("  num_writable_non_signers: {}", transaction_message.num_writable_non_signers);
-        println!("  account_keys.len(): {}", transaction_message.account_keys.len());
-        println!("  instructions.len(): {}", transaction_message.instructions.len());
-        
+        println!(
+            "  num_writable_signers: {}",
+            transaction_message.num_writable_signers
+        );
+        println!(
+            "  num_writable_non_signers: {}",
+            transaction_message.num_writable_non_signers
+        );
+        println!(
+            "  account_keys.len(): {}",
+            transaction_message.account_keys.len()
+        );
+        println!(
+            "  instructions.len(): {}",
+            transaction_message.instructions.len()
+        );
+
         // Try to serialize just the transaction message
         let serialized = borsh::to_vec(&transaction_message).unwrap();
-        println!("  serialized transaction_message length: {}", serialized.len());
-        
+        println!(
+            "  serialized transaction_message length: {}",
+            serialized.len()
+        );
+
         // Show detailed hex breakdown
         println!("  Detailed serialization breakdown:");
         println!("    num_signers (u8): {:02x}", serialized[0]);
-        println!("    num_writable_signers (u8): {:02x}", serialized[1]);  
+        println!("    num_writable_signers (u8): {:02x}", serialized[1]);
         println!("    num_writable_non_signers (u8): {:02x}", serialized[2]);
-        
+
         // Check account_keys serialization - should be length as u8 then pubkeys
         println!("    account_keys length byte: {:02x}", serialized[3]);
-        
+
         // If it shows more than 1 byte for length, there's the issue
-        println!("    bytes 4-7: {:02x} {:02x} {:02x} {:02x}", 
-            serialized[4], serialized[5], serialized[6], serialized[7]);
-        
+        println!(
+            "    bytes 4-7: {:02x} {:02x} {:02x} {:02x}",
+            serialized[4], serialized[5], serialized[6], serialized[7]
+        );
+
         // Create VaultTransactionCreateArgs and see its serialization
         let transaction_message_bytes = borsh::to_vec(&transaction_message).unwrap();
         let vault_args = VaultTransactionCreateArgs {
@@ -880,47 +952,71 @@ mod tests {
             transaction_message: transaction_message_bytes.clone(),
             memo: None,
         };
-        
+
         let vault_args_serialized = borsh::to_vec(&vault_args).unwrap();
-        println!("  vault_args serialized length: {}", vault_args_serialized.len());
+        println!(
+            "  vault_args serialized length: {}",
+            vault_args_serialized.len()
+        );
         println!("  vault_args hex breakdown:");
         println!("    vault_index: {:02x}", vault_args_serialized[0]);
         println!("    ephemeral_signers: {:02x}", vault_args_serialized[1]);
-        
+
         // Next should be the Vec<u8> length (u32) then the transaction_message bytes
         let tm_vec_len = u32::from_le_bytes([
-            vault_args_serialized[2], vault_args_serialized[3], 
-            vault_args_serialized[4], vault_args_serialized[5]
+            vault_args_serialized[2],
+            vault_args_serialized[3],
+            vault_args_serialized[4],
+            vault_args_serialized[5],
         ]);
-        println!("    transaction_message Vec<u8> length: {} bytes", tm_vec_len);
-        
+        println!(
+            "    transaction_message Vec<u8> length: {} bytes",
+            tm_vec_len
+        );
+
         // The actual transaction message bytes start at offset 6, then after memo option
         let tm_offset = 6;
-        
+
         // memo is Option<String> which serializes as 1 byte (0 for None, 1 for Some) + content
         let memo_len_byte = vault_args_serialized[tm_offset + tm_vec_len as usize];
-        println!("    memo option byte: {:02x} (0=None, 1=Some)", memo_len_byte);
-        
+        println!(
+            "    memo option byte: {:02x} (0=None, 1=Some)",
+            memo_len_byte
+        );
+
         // Transaction message data starts after the memo
         let actual_tm_offset = tm_offset;
         if vault_args_serialized.len() > actual_tm_offset + 5 {
             println!("    tm bytes start at offset {}", actual_tm_offset);
-            println!("    tm.num_signers: {:02x}", vault_args_serialized[actual_tm_offset]);
-            println!("    tm.num_writable_signers: {:02x}", vault_args_serialized[actual_tm_offset + 1]);
-            println!("    tm.num_writable_non_signers: {:02x}", vault_args_serialized[actual_tm_offset + 2]);
-            println!("    tm.account_keys length: {:02x}", vault_args_serialized[actual_tm_offset + 3]);
+            println!(
+                "    tm.num_signers: {:02x}",
+                vault_args_serialized[actual_tm_offset]
+            );
+            println!(
+                "    tm.num_writable_signers: {:02x}",
+                vault_args_serialized[actual_tm_offset + 1]
+            );
+            println!(
+                "    tm.num_writable_non_signers: {:02x}",
+                vault_args_serialized[actual_tm_offset + 2]
+            );
+            println!(
+                "    tm.account_keys length: {:02x}",
+                vault_args_serialized[actual_tm_offset + 3]
+            );
         }
-        
+
         // Create the full data structure
-        let create_transaction_data = VaultTransactionCreateArgsData {
-            args: vault_args,
-        };
-        
+        let create_transaction_data = VaultTransactionCreateArgsData { args: vault_args };
+
         let full_data = create_transaction_data.data();
         println!("  full data length: {}", full_data.len());
-        
+
         // Convert to hex string like the blockchain data
-        let hex_string = full_data.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let hex_string = full_data
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
         println!("  full hex: {}", hex_string);
     }
 

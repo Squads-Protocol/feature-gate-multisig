@@ -3,7 +3,7 @@ use crate::squads::{CompiledInstruction, Member, Permissions, TransactionMessage
 use anyhow::Result;
 use colored::*;
 use dirs;
-use inquire::{Confirm, Text};
+use inquire::{Confirm, Select, Text};
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
@@ -12,6 +12,7 @@ use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_signer::{EncodableKey, Signer};
 use solana_transaction::versioned::VersionedTransaction;
+use std::fmt::Display;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -231,6 +232,20 @@ pub fn prompt_for_threshold(config: &Config) -> Result<u16> {
                 println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
                 continue;
             }
+        }
+    }
+}
+
+pub fn prompt_for_pubkey(prompt: &str) -> Result<Pubkey> {
+    let input = Text::new(prompt).prompt()?;
+    match Pubkey::from_str(&input) {
+        Ok(pubkey) => Ok(pubkey),
+        Err(_) => {
+            println!(
+                "  {} Invalid public key, please try again.",
+                "❌".bright_red()
+            );
+            prompt_for_pubkey(prompt)
         }
     }
 }
@@ -738,6 +753,53 @@ pub fn validate_rpc_url(url: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TransactionEncoding {
+    #[serde(rename = "base58")]
+    Base58,
+    #[serde(rename = "base64")]
+    Base64,
+}
+
+impl Display for TransactionEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", match self {
+            TransactionEncoding::Base58 => "base58",
+            TransactionEncoding::Base64 => "base64",
+        })
+    }
+}
+pub fn choose_transaction_encoding() -> Result<TransactionEncoding> {
+    let choice = Select::new(
+        "Transaction encoding format?",
+        vec![TransactionEncoding::Base58, TransactionEncoding::Base64],
+    )
+    .prompt()?;
+    Ok(choice)
+}
+
+pub fn choose_network_from_config(config: &Config) -> Result<String> {
+    let available_networks = if !config.networks.is_empty() {
+        config.networks.clone()
+    } else {
+        vec![
+            "https://api.devnet.solana.com".to_string(),
+            "https://api.testnet.solana.com".to_string(),
+            "https://api.mainnet.solana.com".to_string(),
+        ]
+    };
+
+    if available_networks.is_empty() {
+        return Err(anyhow::anyhow!("No networks available"));
+    }
+    let choice = Select::new(
+        "What network would you like to use for transaction generation?",
+        available_networks,
+    )
+    .prompt()?;
+    Ok(choice.to_string())
+}
+
 pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(bool, Vec<String>)> {
     if !use_saved_config {
         return Ok((false, Vec::new()));
@@ -822,7 +884,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
     };
 
     println!(
-        "  {}: {} networks",
+        "  {}: {}",
         "Saved networks".cyan(),
         networks_to_show.len().to_string().bright_green()
     );
@@ -836,7 +898,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
 
     if !config.members.is_empty() {
         println!(
-            "  {}: {} members",
+            "  {}: {}",
             "Saved members".cyan(),
             config.members.len().to_string().bright_green()
         );

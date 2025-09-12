@@ -294,6 +294,41 @@ pub struct MultisigCreateProposalArgs {
     pub is_draft: bool,
 }
 
+
+pub struct MultisigVoteOnProposalAccounts {
+    pub multisig: Pubkey,
+    pub member: Pubkey,
+    pub proposal: Pubkey,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct MultisigVoteOnProposalArgs {
+    pub memo: Option<String>,
+}
+
+pub struct MultisigApproveProposalData {
+    pub args: MultisigVoteOnProposalArgs,
+}
+
+impl MultisigVoteOnProposalAccounts {
+    pub fn to_account_metas(&self) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new_readonly(self.multisig, false),
+            AccountMeta::new(self.member, true),
+            AccountMeta::new(self.proposal, false),
+        ]
+    }
+}
+
+impl MultisigApproveProposalData {
+    pub fn data(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(PROPOSAL_APPROVE_DISCRIMINATOR);
+        data.extend_from_slice(&borsh::to_vec(&self.args).unwrap());
+        data
+    }
+}
+
 // transaction wire structs
 #[derive(BorshSerialize, BorshDeserialize, Clone)]
 pub struct TransactionMessage {
