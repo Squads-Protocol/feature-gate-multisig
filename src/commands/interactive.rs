@@ -3,7 +3,7 @@ use crate::commands::{
 };
 use crate::squads::get_vault_pda;
 use crate::utils::*;
-use anyhow::Result;
+use eyre::Result;
 use inquire::{Confirm, Select, Text};
 use solana_pubkey::Pubkey;
 
