@@ -2,9 +2,10 @@ use crate::constants::*;
 use crate::feature_gate_program::create_feature_activation;
 use crate::provision::create_rpc_client;
 use crate::squads::{CompiledInstruction, Member, Permissions, TransactionMessage};
-use eyre::Result;
 use colored::*;
 use dirs;
+use eyre::Result;
+use indicatif::ProgressBar;
 use inquire::{Confirm, Select, Text};
 use serde::{Deserialize, Serialize};
 use solana_keypair::Keypair;
@@ -16,6 +17,7 @@ use std::fmt::Display;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -26,9 +28,6 @@ pub struct Config {
     pub networks: Vec<String>,
     #[serde(default)]
     pub fee_payer_path: Option<String>,
-    // Legacy field for migration - will be removed after migration
-    #[serde(default, skip_serializing)]
-    network: String,
 }
 
 impl Default for Config {
@@ -38,7 +37,6 @@ impl Default for Config {
             members: Vec::new(),
             networks: vec![DEFAULT_DEVNET_URL.to_string()],
             fee_payer_path: None,
-            network: String::new(),
         }
     }
 }
@@ -53,8 +51,7 @@ pub struct DeploymentResult {
 
 // Config management functions
 pub fn get_config_path() -> Result<PathBuf> {
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
+    let home_dir = dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
     Ok(home_dir
         .join(".feature-gate-multisig-tool")
         .join("config.json"))
@@ -74,14 +71,6 @@ pub fn load_config() -> Result<Config> {
 
     let mut config: Config = serde_json::from_str(&config_str)
         .map_err(|e| eyre::eyre!("Failed to parse config file: {}", e))?;
-
-    // Migrate legacy single network field to networks array
-    if !config.network.is_empty() && config.networks.is_empty() {
-        config.networks = vec![config.network.clone()];
-        config.network = String::new();
-        // Save the migrated config
-        save_config(&config)?;
-    }
 
     Ok(config)
 }
@@ -216,8 +205,7 @@ pub fn review_and_collect_configuration(
 // Keypair management functions
 pub fn expand_tilde_path(path: &str) -> Result<String> {
     if path.starts_with("~/") {
-        let home =
-            dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
+        let home = dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
         Ok(home.join(&path[2..]).to_string_lossy().to_string())
     } else {
         Ok(path.to_string())
@@ -238,9 +226,8 @@ pub fn load_fee_payer_keypair(
             "💰".bright_blue(),
             path.bright_white()
         );
-        let keypair = Keypair::read_from_file(path).map_err(|e| {
-            eyre::eyre!("Failed to load keypair from config path {}: {}", path, e)
-        })?;
+        let keypair = Keypair::read_from_file(path)
+            .map_err(|e| eyre::eyre!("Failed to load keypair from config path {}: {}", path, e))?;
         Ok(Some(keypair))
     } else {
         println!("{} No fee payer keypair provided", "⚠️".bright_yellow());
@@ -596,12 +583,6 @@ pub async fn create_and_send_transaction_proposal(
     transaction_type: &str,
     transaction_index: u64,
 ) -> Result<()> {
-    println!(
-        "\n{} Creating transaction and proposal for multisig governance ({})...",
-        "📋".bright_blue(),
-        transaction_type.bright_cyan()
-    );
-
     let transaction_message = match transaction_type {
         "activation" => create_feature_activation_transaction_message(),
         "revocation" => create_feature_revocation_transaction_message(),
@@ -624,7 +605,7 @@ pub async fn create_and_send_transaction_proposal(
         .unwrap_or_else(|| contributor_keypair.pubkey());
 
     // Use the integrated create_transaction_and_proposal_message function from provision.rs
-    let (message, transaction_pda, proposal_pda) =
+    let (message, _transaction_pda, _proposal_pda) =
         crate::provision::create_transaction_and_proposal_message(
             None, // Use default program ID
             &fee_payer_pubkey,
@@ -633,27 +614,11 @@ pub async fn create_and_send_transaction_proposal(
             transaction_index,
             0, // Vault index 0 (default vault for feature gates)
             transaction_message,
-            Some(5000),    // Priority fee
+            Some(5000),                  // Priority fee
             Some(DEFAULT_COMPUTE_UNITS), // Compute unit limit
             recent_blockhash,
         )
         .map_err(|e| eyre::eyre!("Failed to create transaction and proposal message: {}", e))?;
-
-    println!(
-        "  {}: {}",
-        "Transaction PDA".cyan(),
-        transaction_pda.to_string().bright_green()
-    );
-    println!(
-        "  {}: {}",
-        "Proposal PDA".cyan(),
-        proposal_pda.to_string().bright_green()
-    );
-    println!(
-        "  {}: {} instructions",
-        "Combined Transaction & Proposal".cyan(),
-        "4".bright_white() // set_compute_unit_price, set_compute_unit_limit, create_transaction, create_proposal
-    );
 
     let signers: &[&dyn Signer] = if fee_payer_pubkey == contributor_keypair.pubkey() {
         &[contributor_keypair]
@@ -667,32 +632,36 @@ pub async fn create_and_send_transaction_proposal(
     let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), signers)
         .map_err(|e| eyre::eyre!("Failed to create signed transaction: {}", e))?;
 
-    // Display the transaction signature before sending
-    let expected_signature = transaction.signatures[0];
-    println!(
-        "  {}: {}",
-        "Transaction Signature (before send)".cyan(),
-        expected_signature.to_string().bright_white()
-    );
-
-    println!(
-        "{} Sending combined transaction to RPC...",
-        "📤".bright_blue()
-    );
+    let progress = ProgressBar::new_spinner().with_message("Sending transaction...");
+    progress.enable_steady_tick(Duration::from_millis(100));
 
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to send transaction and proposal: {}", e))?;
 
-    println!(
-        "{} Transaction and proposal created successfully in one step!",
-        "✅".bright_green()
-    );
-    println!(
-        "  {}: {}",
-        "Confirmed Transaction Signature".cyan(),
-        signature.to_string().bright_white()
-    );
+    // Simple signature output with description and network
+    let description = match transaction_type {
+        "activation" => "Feature Gate Activation Proposal Confirmed",
+        "revocation" => "Feature Gate Revocation Proposal Confirmed",
+        _ => "Transaction",
+    };
 
+    let network_display = if rpc_url.contains("devnet") {
+        "Devnet"
+    } else if rpc_url.contains("mainnet") {
+        "Mainnet"
+    } else if rpc_url.contains("testnet") {
+        "Testnet"
+    } else {
+        "Custom"
+    };
+
+    progress.finish_with_message(format!(
+        "{} ({}): {}",
+        description,
+        network_display,
+        signature.to_string().bright_green()
+    ));
+    println!("");
     Ok(())
 }
 
@@ -834,7 +803,7 @@ pub fn choose_network_from_config(config: &Config) -> Result<String> {
     };
 
     if available_networks.is_empty() {
-        return Err(anyhow::anyhow!("No networks available"));
+        return Err(eyre::eyre!("No networks available"));
     }
     let choice = Select::new(
         "What network would you like to use for transaction generation?",
@@ -971,4 +940,113 @@ pub fn decode_permissions(mask: u8) -> Vec<String> {
         permissions.push("Execute".to_string());
     }
     permissions
+}
+
+/// Check that the fee payer has sufficient SOL balance on all networks
+/// Returns a Result indicating success or failure with network-specific errors
+pub async fn check_fee_payer_balance_on_networks(
+    fee_payer_pubkey: &Pubkey,
+    networks: &[String],
+    required_balance_sol: f64,
+) -> Result<()> {
+    use crate::output::Output;
+
+    const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+    let required_lamports = (required_balance_sol * LAMPORTS_PER_SOL as f64) as u64;
+
+    Output::header("💰 Checking Fee Payer Balance");
+    println!();
+
+    let mut insufficient_balance_networks = Vec::new();
+    let mut network_errors = Vec::new();
+
+    for network in networks {
+        let network_display = if network.contains("devnet") {
+            "Devnet"
+        } else if network.contains("mainnet") {
+            "Mainnet"
+        } else if network.contains("testnet") {
+            "Testnet"
+        } else {
+            "Custom"
+        };
+
+        // Create RPC client for this network
+        let rpc_client = crate::provision::create_rpc_client(network);
+
+        // Check balance with retries
+        match rpc_client.get_balance(fee_payer_pubkey) {
+            Ok(balance_lamports) => {
+                let balance_sol = balance_lamports as f64 / LAMPORTS_PER_SOL as f64;
+
+                if balance_lamports >= required_lamports {
+                    println!(
+                        "  {} {}: {} SOL",
+                        "✓".bright_green(),
+                        network_display.bright_white(),
+                        format!("{:.4}", balance_sol).bright_green()
+                    );
+                } else {
+                    println!(
+                        "  {} {}: {} SOL (insufficient - need {:.3})",
+                        "❌".bright_red(),
+                        network_display.bright_white(),
+                        format!("{:.4}", balance_sol).bright_red(),
+                        required_balance_sol.to_string().bright_yellow()
+                    );
+                    insufficient_balance_networks.push((network_display.to_string(), balance_sol));
+                }
+            }
+            Err(e) => {
+                println!(
+                    "  {} {}: {}",
+                    "⚠️".bright_yellow(),
+                    network_display.bright_white(),
+                    "Could not check balance".bright_red()
+                );
+                network_errors.push((network_display.to_string(), e.to_string()));
+            }
+        }
+    }
+
+    println!();
+
+    // Report any issues
+    if !insufficient_balance_networks.is_empty() {
+        Output::error(&format!(
+            "Fee payer has insufficient balance on {} network(s)",
+            insufficient_balance_networks.len()
+        ));
+        for (network, balance) in &insufficient_balance_networks {
+            println!(
+                "  {} {}: {:.4} SOL (need {:.3} SOL)",
+                "•".bright_red(),
+                network.bright_white(),
+                balance,
+                required_balance_sol.to_string().bright_yellow()
+            );
+        }
+        println!();
+        return Err(eyre::eyre!(
+            "Fee payer needs at least {:.3} SOL on all networks for deployment",
+            required_balance_sol
+        ));
+    }
+
+    if !network_errors.is_empty() {
+        Output::warning(&format!(
+            "Could not check balance on {} network(s) - proceeding anyway",
+            network_errors.len()
+        ));
+        for (network, error) in &network_errors {
+            println!("  {} {}: {}", "•".bright_yellow(), network.bright_white(), error);
+        }
+        println!();
+    }
+
+    if insufficient_balance_networks.is_empty() && network_errors.is_empty() {
+        Output::success("Fee payer has sufficient balance on all networks");
+    }
+
+    Ok(())
 }

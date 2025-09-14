@@ -41,16 +41,33 @@ pub fn send_and_confirm_transaction(
 ) -> eyre::Result<String> {
     const MAX_RETRIES: usize = MAX_TX_RETRIES;
     const BASE_DELAY_MS: u64 = BASE_RETRY_DELAY_MS;
-    
+    const MAX_TOTAL_RETRY_TIME_MS: u64 = 10_000; // 10 seconds total
+
     let mut last_error: Option<eyre::Report> = None;
-    
+    let retry_start = std::time::Instant::now();
+
     for attempt in 0..MAX_RETRIES {
+        // Check if we've exceeded our total retry time budget
+        if retry_start.elapsed().as_millis() as u64 >= MAX_TOTAL_RETRY_TIME_MS {
+            println!("Exceeded maximum retry time of {}ms", MAX_TOTAL_RETRY_TIME_MS);
+            break;
+        }
+
         if attempt > 0 {
             let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32 - 1));
-            println!("Retrying transaction in {}ms... (attempt {}/{})", delay, attempt + 1, MAX_RETRIES);
-            std::thread::sleep(Duration::from_millis(delay));
+            // Ensure we don't exceed our total time budget with this delay
+            let remaining_time = MAX_TOTAL_RETRY_TIME_MS.saturating_sub(retry_start.elapsed().as_millis() as u64);
+            let actual_delay = std::cmp::min(delay, remaining_time);
+
+            if actual_delay > 0 {
+                println!("Retrying transaction in {}ms... (attempt {}/{}, {}ms elapsed)",
+                    actual_delay, attempt + 1, MAX_RETRIES, retry_start.elapsed().as_millis());
+                std::thread::sleep(Duration::from_millis(actual_delay));
+            } else {
+                println!("No time remaining for delay, proceeding with retry attempt {}/{}", attempt + 1, MAX_RETRIES);
+            }
         }
-        
+
         // First try to send the transaction
         let signature = match rpc_client.send_transaction_with_config(
             transaction,
@@ -69,16 +86,16 @@ pub fn send_and_confirm_transaction(
                     ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
                         // Common retryable RPC errors
                         *code == -32005 ||  // Node is unhealthy
-                        *code == -32004 ||  // RPC request timed out  
+                        *code == -32004 ||  // RPC request timed out
                         *code == -32603 ||  // Internal error
                         *code == -32002 ||  // Transaction simulation failed
                         *code == -32001     // Generic server error
                     }
                     ClientErrorKind::Io(_) => true,  // Network issues
-                    ClientErrorKind::Reqwest(_) => true,  // HTTP client issues  
+                    ClientErrorKind::Reqwest(_) => true,  // HTTP client issues
                     _ => false
                 };
-                
+
                 if let ClientErrorKind::RpcError(RpcError::RpcResponseError {
                     data:
                         RpcResponseErrorData::SendTransactionPreflightFailure(
@@ -91,37 +108,32 @@ pub fn send_and_confirm_transaction(
                 {
                     println!("Simulation logs:\n\n{}\n", logs.join("\n").bright_yellow());
                 }
-                
+
                 last_error = Some(eyre::eyre!("{}", err));
-                
+
                 // Don't retry on the last attempt or if error is not retryable
                 if attempt == MAX_RETRIES - 1 || !is_retryable {
                     break;
                 }
-                
-                println!("Retryable error occurred: {}", 
+
+                println!("Retryable error occurred: {}",
                     last_error.as_ref().unwrap().to_string().bright_yellow());
                 continue;
             }
         };
-        
+
         // Now wait for confirmation with exponential backoff polling
         let confirmation_start = std::time::Instant::now();
         let mut confirmation_poll_delay = CONFIRMATION_POLL_INTERVAL_MS;
-        
+
         loop {
             if confirmation_start.elapsed().as_millis() as u64 > CONFIRMATION_TIMEOUT_MS {
                 println!("Transaction confirmation timeout after {}ms", CONFIRMATION_TIMEOUT_MS);
                 break; // Will retry sending
             }
-            
+
             match rpc_client.get_signature_status(&signature) {
                 Ok(Some(Ok(()))) => {
-                    // Transaction confirmed successfully
-                    println!(
-                        "Transaction confirmed: {}\n\n",
-                        signature.to_string().bright_green()
-                    );
                     return Ok(signature.to_string());
                 }
                 Ok(Some(Err(_))) => {
@@ -157,16 +169,16 @@ pub fn send_and_confirm_transaction(
                     }
                 }
             }
-            
+
             // Wait before next confirmation check with exponential backoff (capped at 5 seconds)
             std::thread::sleep(Duration::from_millis(confirmation_poll_delay));
             confirmation_poll_delay = std::cmp::min(confirmation_poll_delay * 2, 5000);
         }
-        
+
         // If we reach here, confirmation failed or timed out
         last_error = Some(eyre!("Transaction sent but confirmation failed or timed out"));
     }
-    
+
     Err(eyre!(
         "Transaction failed after {} attempts: {}",
         MAX_RETRIES,
@@ -180,15 +192,15 @@ pub fn get_account_data_with_retry(
 ) -> eyre::Result<Vec<u8>> {
     const MAX_RETRIES: usize = MAX_ACCOUNT_RETRIES;
     const BASE_DELAY_MS: u64 = BASE_ACCOUNT_RETRY_DELAY_MS;
-    
+
     let mut last_error = None;
-    
+
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
             let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32 - 1));
             std::thread::sleep(Duration::from_millis(delay));
         }
-        
+
         match rpc_client.get_account_data(pubkey) {
             Ok(data) => return Ok(data),
             Err(err) => {
@@ -200,16 +212,16 @@ pub fn get_account_data_with_retry(
                     ClientErrorKind::Reqwest(_) => true,
                     _ => false
                 };
-                
+
                 last_error = Some(err);
-                
+
                 if attempt == MAX_RETRIES - 1 || !is_retryable {
                     break;
                 }
             }
         }
     }
-    
+
     Err(eyre!(
         "Failed to get account data after {} attempts: {}",
         MAX_RETRIES,
@@ -302,7 +314,7 @@ pub async fn create_multisig(
 
     let proceed = Confirm::new()
         .with_prompt("Do you want to proceed?")
-        .default(false)
+        .default(true)
         .interact()?;
     if !proceed {
         println!("{}", "OK, aborting.".bright_red());
@@ -312,7 +324,7 @@ pub async fn create_multisig(
 
     let rpc_client = create_rpc_client(&rpc_url);
 
-    let progress = ProgressBar::new_spinner().with_message("Sending transaction...");
+    let progress = ProgressBar::new_spinner().with_message("Sending transactions...");
     progress.enable_steady_tick(Duration::from_millis(100));
 
     let blockhash = rpc_client
@@ -378,14 +390,17 @@ pub async fn create_multisig(
 
     let signature = send_and_confirm_transaction(&transaction, &rpc_client)?;
 
-    progress.finish_with_message("Transaction confirmed!");
+    let network_display = if rpc_url.contains("devnet") {
+        "Devnet"
+    } else if rpc_url.contains("mainnet") {
+        "Mainnet"
+    } else if rpc_url.contains("testnet") {
+        "Testnet"
+    } else {
+        "Custom"
+    };
 
-    println!(
-        "{} Created Multisig: {}. Signature: {}",
-        "✅".bright_green(),
-        multisig_key.0.to_string().bright_green(),
-        signature.bright_cyan()
-    );
+    progress.finish_with_message(format!("Multisig creation confirmed: {} ({})", signature.to_string().bright_green(), network_display));
 
     Ok((multisig_key.0, signature))
 }

@@ -1,11 +1,11 @@
+use crate::output::Output;
 use crate::provision::create_multisig;
-use crate::squads::{get_vault_pda, Member, Permissions};
+use crate::squads::{get_proposal_pda, get_vault_pda, Member, Permissions};
 use crate::utils::*;
-use eyre::Result;
 use colored::*;
+use eyre::Result;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
-use tabled::{settings::Style, Table, Tabled};
 
 pub async fn create_command(
     config: &mut Config,
@@ -53,6 +53,16 @@ pub async fn create_command(
 
     // Determine network deployment mode and deploy
     let (use_saved_networks, saved_networks) = choose_network_mode(config, true)?;
+
+    // Check fee payer balance on all networks before deployment
+    if use_saved_networks && !saved_networks.is_empty() {
+        let fee_payer_pubkey = fee_payer_keypair
+            .as_ref()
+            .map(|kp| kp.pubkey())
+            .unwrap_or_else(|| setup_keypair.pubkey());
+
+        check_fee_payer_balance_on_networks(&fee_payer_pubkey, &saved_networks, 0.05).await?;
+    }
 
     let deployments = if use_saved_networks && !saved_networks.is_empty() {
         deploy_to_saved_networks(
@@ -139,15 +149,9 @@ async fn deploy_to_single_network(
         Some(5000), // Priority fee
     )
     .await
-    .map_err(|e| anyhow::anyhow!("Failed to create multisig: {}", e))?;
+    .map_err(|e| eyre::eyre!("Failed to create multisig: {}", e))?;
 
     let vault_address = get_vault_pda(&multisig_address, 0, None).0;
-
-    println!(
-        "{} Deployment successful on {}",
-        "✅".bright_green(),
-        rpc_url.bright_white()
-    );
 
     // Create both activation and revocation transactions
     create_and_send_transaction_proposal(
@@ -186,7 +190,6 @@ async fn deploy_to_saved_networks(
     members: &[Member],
     threshold: u16,
 ) -> Result<Vec<DeploymentResult>> {
-
     let mut deployments = Vec::new();
 
     for (i, rpc_url) in networks.iter().enumerate() {
@@ -279,129 +282,82 @@ async fn deploy_to_manual_networks(
     Ok(deployments)
 }
 
-#[derive(Tabled)]
-struct MemberRow {
-    #[tabled(rename = "#")]
-    index: usize,
-    #[tabled(rename = "Public Key")]
-    public_key: String,
-    #[tabled(rename = "Permissions")]
-    permissions: String,
-}
-
-#[derive(Tabled)]
-struct DeploymentRow {
-    #[tabled(rename = "RPC URL")]
-    rpc_url: String,
-    #[tabled(rename = "Multisig Address")]
-    multisig_address: String,
-    #[tabled(rename = "Vault Address (Index 0)")]
-    vault_address: String,
-}
-
 fn print_deployment_summary(
     deployments: &[DeploymentResult],
     members: &[Member],
     threshold: u16,
-    create_key: &solana_pubkey::Pubkey,
+    _create_key: &solana_pubkey::Pubkey,
 ) {
     if deployments.is_empty() {
-        println!(
-            "\n{} No successful deployments to summarize.",
-            "❌".bright_red()
-        );
+        Output::error("No successful deployments to summarize.");
         return;
     }
 
-    println!("\n{}", "🎉 DEPLOYMENT SUMMARY".bright_magenta().bold());
-    println!("{}", "═".repeat(80).bright_blue());
+    println!("");
+    Output::header("👀 Deployment Complete");
 
-    // Configuration section
-    println!("\n{}", "📋 Configuration:".bright_yellow().bold());
-    println!(
-        "  {}: {}",
-        "Create Key".cyan(),
-        create_key.to_string().bright_white()
-    );
-    println!(
-        "  {}: {}",
-        "Threshold".cyan(),
-        threshold.to_string().bright_green()
-    );
-    println!(
-        "  {}: {}",
-        "Total Members".cyan(),
-        members.len().to_string().bright_green()
-    );
+    for deployment in deployments {
+        // Feature Gate ID is the vault address (index 0)
+        let feature_gate_id = deployment.vault_address;
 
-    // Members table
-    println!("\n{}", "👥 Members & Permissions:".bright_yellow().bold());
-    let member_rows: Vec<MemberRow> = members
-        .iter()
-        .enumerate()
-        .map(|(i, member)| {
+        // Calculate proposal PDAs for activation and revocation transactions
+        let activation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 1, None).0;
+        let revocation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 2, None).0;
+
+        println!("\n{}", "⚙️ General Info".bright_white().bold());
+        println!();
+        Output::field(
+            "Feature Gate Multisig",
+            &deployment.multisig_address.to_string(),
+        );
+        Output::field("Feature Gate ID", &feature_gate_id.to_string());
+
+        println!("\n{}", "⚙️ Config Parameters".bright_white().bold());
+        println!();
+        Output::field("Members", &members.len().to_string());
+
+        // Display members with their permissions
+        for (i, member) in members.iter().enumerate() {
             let perms = decode_permissions(member.permissions.mask);
             let role_indicator = if member.permissions.mask == 1 {
                 " (Contributor)"
             } else {
                 ""
             };
-            MemberRow {
-                index: i + 1,
-                public_key: format!("{}{}", member.key.to_string(), role_indicator),
-                permissions: perms.join(", "),
-            }
-        })
-        .collect();
-
-    let members_table = Table::new(member_rows).with(Style::rounded()).to_string();
-    println!("{}", members_table);
-
-    // Deployments table
-    println!("\n{}", "🌐 Network Deployments:".bright_yellow().bold());
-    let deployment_rows: Vec<DeploymentRow> = deployments
-        .iter()
-        .map(|deployment| {
-            let rpc_display = if deployment.rpc_url.len() > 35 {
-                format!("{}...", &deployment.rpc_url[..32])
+            let member_display = format!(
+                "{}{} ({})",
+                member.key.to_string(),
+                role_indicator,
+                perms.join(", ")
+            );
+            let member_label = if member.permissions.mask == 1 {
+                "Temporary Setup Keypair".to_string()
             } else {
-                deployment.rpc_url.clone()
+                format!("Member {}", i + 1)
             };
+            println!(
+                "  {} {}: {}",
+                "✓".bright_green(),
+                member_label,
+                member_display.bright_white()
+            );
+        }
+        println!();
+        Output::field("Threshold", &threshold.to_string());
 
-            DeploymentRow {
-                rpc_url: rpc_display,
-                multisig_address: deployment.multisig_address.to_string(),
-                vault_address: deployment.vault_address.to_string(),
-            }
-        })
-        .collect();
-
-    let deployments_table = Table::new(deployment_rows)
-        .with(Style::rounded())
-        .to_string();
-    println!("{}", deployments_table);
-
-    // Transaction signatures
-    println!("\n{}", "📜 Transaction Signatures:".bright_yellow().bold());
-    for (i, deployment) in deployments.iter().enumerate() {
-        let rpc_display = if deployment.rpc_url.len() > 25 {
-            format!("{}...", &deployment.rpc_url[..22])
-        } else {
-            deployment.rpc_url.clone()
-        };
-
-        println!(
-            "  {}: {} → {}",
-            format!("{}.", i + 1).bright_cyan(),
-            rpc_display.bright_white(),
-            deployment.transaction_signature.bright_green()
+        println!("\n{}", "⚙️ Proposals".bright_white().bold());
+        println!();
+        Output::field(
+            "Feature Gate Activation Proposal",
+            &activation_proposal_pda.to_string(),
         );
-    }
+        Output::field(
+            "Feature Gate Revocation Proposal",
+            &revocation_proposal_pda.to_string(),
+        );
 
-    println!(
-        "\n{} Successfully deployed to {} network(s)!",
-        "✅".bright_green().bold(),
-        deployments.len().to_string().bright_green().bold()
-    );
-    println!("{}", "═".repeat(80).bright_blue());
+        if deployments.len() > 1 {
+            println!("\n{}", "─".repeat(50).bright_cyan());
+        }
+    }
 }

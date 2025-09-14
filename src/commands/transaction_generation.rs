@@ -1,4 +1,4 @@
-use anyhow::Result;
+use eyre::Result;
 use colored::Colorize;
 use serde::Serialize;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -39,7 +39,7 @@ pub async fn approve_feature_gate_activation_proposal(
         blockhash,
     )
     .map_err(|e| {
-        anyhow::anyhow!(
+        eyre::eyre!(
             "Failed to create approve activation transaction message: {}",
             e
         )
