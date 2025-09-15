@@ -1,10 +1,13 @@
+use crate::constants::*;
 use crate::squads::{
     get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
-    Member, MultisigCreateArgsV2, MultisigCreateProposalAccounts, MultisigCreateProposalArgs,
-    MultisigCreateProposalData, MultisigCreateTransaction, MultisigCreateV2Accounts,
-    MultisigCreateV2Data, Permissions, ProgramConfig, TransactionMessage,
+    Member, MultisigApproveProposalData, MultisigCreateArgsV2, MultisigCreateProposalAccounts,
+    MultisigCreateProposalArgs, MultisigCreateProposalData, MultisigCreateTransaction,
+    MultisigCreateV2Accounts, MultisigCreateV2Data, MultisigVoteOnProposalAccounts,
+    MultisigVoteOnProposalArgs, Permissions, ProgramConfig, TransactionMessage,
     VaultTransactionCreateArgs, VaultTransactionCreateArgsData,
 };
+use crate::utils::decode_permissions;
 use colored::Colorize;
 use dialoguer::Confirm;
 use eyre::eyre;
@@ -27,72 +30,230 @@ use solana_transaction::versioned::VersionedTransaction;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Creates an RPC client with consistent commitment configuration
+pub fn create_rpc_client(url: &str) -> RpcClient {
+    RpcClient::new_with_commitment(url, CommitmentConfig::confirmed())
+}
+
 pub fn send_and_confirm_transaction(
     transaction: &VersionedTransaction,
     rpc_client: &RpcClient,
 ) -> eyre::Result<String> {
-    // Try to send and confirm the transaction
-    match rpc_client.send_transaction_with_config(
-        transaction,
-        RpcSendTransactionConfig {
-            skip_preflight: true,
-            ..RpcSendTransactionConfig::default()
-        },
-    ) {
-        Ok(signature) => {
-            println!(
-                "Transaction confirmed: {}\n\n",
-                signature.to_string().bright_green()
-            );
-            Ok(signature.to_string())
+    const MAX_RETRIES: usize = MAX_TX_RETRIES;
+    const BASE_DELAY_MS: u64 = BASE_RETRY_DELAY_MS;
+    const MAX_TOTAL_RETRY_TIME_MS: u64 = 10_000; // 10 seconds total
+
+    let mut last_error: Option<eyre::Report> = None;
+    let retry_start = std::time::Instant::now();
+
+    for attempt in 0..MAX_RETRIES {
+        // Check if we've exceeded our total retry time budget
+        if retry_start.elapsed().as_millis() as u64 >= MAX_TOTAL_RETRY_TIME_MS {
+            println!("Exceeded maximum retry time of {}ms", MAX_TOTAL_RETRY_TIME_MS);
+            break;
         }
-        Err(err) => {
-            if let ClientErrorKind::RpcError(RpcError::RpcResponseError {
-                data:
-                    RpcResponseErrorData::SendTransactionPreflightFailure(
-                        RpcSimulateTransactionResult {
-                            logs: Some(logs), ..
-                        },
-                    ),
-                ..
-            }) = &err.kind
-            {
-                println!("Simulation logs:\n\n{}\n", logs.join("\n").bright_yellow());
+
+        if attempt > 0 {
+            let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32 - 1));
+            // Ensure we don't exceed our total time budget with this delay
+            let remaining_time = MAX_TOTAL_RETRY_TIME_MS.saturating_sub(retry_start.elapsed().as_millis() as u64);
+            let actual_delay = std::cmp::min(delay, remaining_time);
+
+            if actual_delay > 0 {
+                println!("Retrying transaction in {}ms... (attempt {}/{}, {}ms elapsed)",
+                    actual_delay, attempt + 1, MAX_RETRIES, retry_start.elapsed().as_millis());
+                std::thread::sleep(Duration::from_millis(actual_delay));
+            } else {
+                println!("No time remaining for delay, proceeding with retry attempt {}/{}", attempt + 1, MAX_RETRIES);
+            }
+        }
+
+        // First try to send the transaction
+        let signature = match rpc_client.send_transaction_with_config(
+            transaction,
+            RpcSendTransactionConfig {
+                skip_preflight: false,
+                preflight_commitment: Some(rpc_client.commitment().commitment),
+                encoding: None,
+                max_retries: Some(0), // We handle retries ourselves
+                min_context_slot: None,
+            },
+        ) {
+            Ok(sig) => sig,
+            Err(err) => {
+                // Check if this is a retryable error
+                let is_retryable = match &err.kind {
+                    ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
+                        // Common retryable RPC errors
+                        *code == -32005 ||  // Node is unhealthy
+                        *code == -32004 ||  // RPC request timed out
+                        *code == -32603 ||  // Internal error
+                        *code == -32002 ||  // Transaction simulation failed
+                        *code == -32001     // Generic server error
+                    }
+                    ClientErrorKind::Io(_) => true,  // Network issues
+                    ClientErrorKind::Reqwest(_) => true,  // HTTP client issues
+                    _ => false
+                };
+
+                if let ClientErrorKind::RpcError(RpcError::RpcResponseError {
+                    data:
+                        RpcResponseErrorData::SendTransactionPreflightFailure(
+                            RpcSimulateTransactionResult {
+                                logs: Some(logs), ..
+                            },
+                        ),
+                    ..
+                }) = &err.kind
+                {
+                    println!("Simulation logs:\n\n{}\n", logs.join("\n").bright_yellow());
+                }
+
+                last_error = Some(eyre::eyre!("{}", err));
+
+                // Don't retry on the last attempt or if error is not retryable
+                if attempt == MAX_RETRIES - 1 || !is_retryable {
+                    break;
+                }
+
+                println!("Retryable error occurred: {}",
+                    last_error.as_ref().unwrap().to_string().bright_yellow());
+                continue;
+            }
+        };
+
+        // Now wait for confirmation with exponential backoff polling
+        let confirmation_start = std::time::Instant::now();
+        let mut confirmation_poll_delay = CONFIRMATION_POLL_INTERVAL_MS;
+
+        loop {
+            if confirmation_start.elapsed().as_millis() as u64 > CONFIRMATION_TIMEOUT_MS {
+                println!("Transaction confirmation timeout after {}ms", CONFIRMATION_TIMEOUT_MS);
+                break; // Will retry sending
             }
 
-            Err(eyre!(
-                "Transaction failed: {}",
-                err.to_string().bright_red()
-            ))
+            match rpc_client.get_signature_status(&signature) {
+                Ok(Some(Ok(()))) => {
+                    return Ok(signature.to_string());
+                }
+                Ok(Some(Err(_))) => {
+                    // Transaction failed
+                    println!("Transaction failed confirmation");
+                    break;
+                }
+                Ok(None) => {
+                    // Transaction not yet confirmed, continue polling
+                }
+                Err(confirmation_err) => {
+                    // Check if confirmation error is retryable
+                    match &confirmation_err.kind {
+                        ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
+                            if *code == -32004 || *code == -32005 || *code == -32603 {
+                                // Temporary RPC issue, continue polling
+                                println!("Temporary confirmation error: {}", confirmation_err.to_string().bright_yellow());
+                            } else {
+                                // Non-retryable confirmation error, break and retry transaction
+                                println!("Non-retryable confirmation error: {}", confirmation_err.to_string().bright_red());
+                                break;
+                            }
+                        }
+                        ClientErrorKind::Io(_) | ClientErrorKind::Reqwest(_) => {
+                            // Network issues, continue polling
+                            println!("Network error during confirmation: {}", confirmation_err.to_string().bright_yellow());
+                        }
+                        _ => {
+                            // Unknown error, break and retry transaction
+                            println!("Unknown confirmation error: {}", confirmation_err.to_string().bright_red());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Wait before next confirmation check with exponential backoff (capped at 5 seconds)
+            std::thread::sleep(Duration::from_millis(confirmation_poll_delay));
+            confirmation_poll_delay = std::cmp::min(confirmation_poll_delay * 2, 5000);
+        }
+
+        // If we reach here, confirmation failed or timed out
+        last_error = Some(eyre!("Transaction sent but confirmation failed or timed out"));
+    }
+
+    Err(eyre!(
+        "Transaction failed after {} attempts: {}",
+        MAX_RETRIES,
+        last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
+    ))
+}
+
+pub fn get_account_data_with_retry(
+    rpc_client: &RpcClient,
+    pubkey: &Pubkey,
+) -> eyre::Result<Vec<u8>> {
+    const MAX_RETRIES: usize = MAX_ACCOUNT_RETRIES;
+    const BASE_DELAY_MS: u64 = BASE_ACCOUNT_RETRY_DELAY_MS;
+
+    let mut last_error = None;
+
+    for attempt in 0..MAX_RETRIES {
+        if attempt > 0 {
+            let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32 - 1));
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+
+        match rpc_client.get_account_data(pubkey) {
+            Ok(data) => return Ok(data),
+            Err(err) => {
+                let is_retryable = match &err.kind {
+                    ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
+                        *code == -32005 || *code == -32004 || *code == -32603
+                    }
+                    ClientErrorKind::Io(_) => true,
+                    ClientErrorKind::Reqwest(_) => true,
+                    _ => false
+                };
+
+                last_error = Some(err);
+
+                if attempt == MAX_RETRIES - 1 || !is_retryable {
+                    break;
+                }
+            }
         }
     }
+
+    Err(eyre!(
+        "Failed to get account data after {} attempts: {}",
+        MAX_RETRIES,
+        last_error.unwrap().to_string()
+    ))
 }
 pub async fn create_multisig(
     rpc_url: String,
     program_id: Option<String>,
-    contributor_keypair: &dyn Signer,
+    fee_payer_keypair: &dyn Signer,
     create_key: &Keypair,
-    config_authority: Option<Pubkey>,
     members: Vec<Member>,
     threshold: u16,
-    rent_collector: Option<Pubkey>,
     priority_fee_lamports: Option<u64>,
 ) -> eyre::Result<(Pubkey, String)> {
     let program_id =
-        program_id.unwrap_or_else(|| "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf".to_string());
+        program_id.unwrap_or_else(|| SQUADS_PROGRAM_ID_STR.to_string());
     let program_id = Pubkey::from_str(&program_id).expect("Invalid program ID");
+    let multisig_address = crate::squads::get_multisig_pda(&create_key.pubkey(), None).0;
+    let vault_address = get_vault_pda(&multisig_address, 0, None).0;
 
-    let transaction_creator = contributor_keypair.pubkey();
+    let transaction_creator = fee_payer_keypair.pubkey();
 
     println!();
     println!(
         "{}",
-        "👀 You're about to create a multisig, please review the details:"
+        "👀 Review Feature Gate Multisig Details"
             .bright_yellow()
             .bold()
     );
     println!();
-    println!("{}: {}", "RPC Cluster URL".cyan(), rpc_url.bright_white());
+    println!("{}: {}", "Network".cyan(), rpc_url.bright_white());
     println!(
         "{}: {}",
         "Program ID".cyan(),
@@ -100,43 +261,60 @@ pub async fn create_multisig(
     );
     println!(
         "{}: {}",
-        "Your Public Key".cyan(),
+        "Fee Payer".cyan(),
         transaction_creator.to_string().bright_white()
     );
     println!();
-    println!("{}", "⚙️ Config Parameters".bright_yellow().bold());
+    println!("{}", "⚙️ General Info".bright_white().bold());
     println!();
     println!(
         "{}: {}",
-        "Config Authority".cyan(),
-        config_authority
-            .map(|k| k.to_string())
-            .unwrap_or_else(|| "None".to_string())
-            .bright_white()
+        "Feature Gate Multisig".cyan(),
+        multisig_address.to_string().bright_white()
     );
+    println!(
+        "{}: {}",
+        "Feature Gate ID".cyan(),
+        vault_address.to_string().bright_white()
+    );
+    println!();
+    println!("{}", "⚙️ Config Parameters".bright_white().bold());
+    println!();
+    println!(
+        "{}: {}",
+        "Members".cyan(),
+        members.len().to_string().bright_green()
+    );
+    for (i, member) in members.iter().enumerate() {
+        let perms = decode_permissions(member.permissions.mask);
+        if perms.len() == 1 && perms[0] == "Initiate" {
+            println!(
+                "  {} Temporary Setup Keypair: {} ({})",
+                "✓".bright_green(),
+                member.key.to_string().bright_white(),
+                "Initiate".bright_cyan()
+            );
+        } else {
+            println!(
+                "  {} Member {}: {} ({})",
+                "✓".bright_green(),
+                i + 1,
+                member.key.to_string().bright_white(),
+                perms.join(", ").bright_cyan()
+            );
+        }
+    }
+    println!("");
     println!(
         "{}: {}",
         "Threshold".cyan(),
         threshold.to_string().bright_green()
     );
-    println!(
-        "{}: {}",
-        "Rent Collector".cyan(),
-        rent_collector
-            .map(|k| k.to_string())
-            .unwrap_or_else(|| "None".to_string())
-            .bright_white()
-    );
-    println!(
-        "{}: {}",
-        "Members amount".cyan(),
-        members.len().to_string().bright_green()
-    );
     println!();
 
     let proceed = Confirm::new()
         .with_prompt("Do you want to proceed?")
-        .default(false)
+        .default(true)
         .interact()?;
     if !proceed {
         println!("{}", "OK, aborting.".bright_red());
@@ -144,9 +322,9 @@ pub async fn create_multisig(
     }
     println!();
 
-    let rpc_client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+    let rpc_client = create_rpc_client(&rpc_url);
 
-    let progress = ProgressBar::new_spinner().with_message("Sending transaction...");
+    let progress = ProgressBar::new_spinner().with_message("Sending transactions...");
     progress.enable_steady_tick(Duration::from_millis(100));
 
     let blockhash = rpc_client
@@ -173,8 +351,8 @@ pub async fn create_multisig(
     let message = Message::try_compile(
         &transaction_creator,
         &[
-            ComputeBudgetInstruction::set_compute_unit_limit(50_000),
-            ComputeBudgetInstruction::set_compute_unit_price(priority_fee_lamports.unwrap_or(5000)),
+            ComputeBudgetInstruction::set_compute_unit_limit(CREATE_MULTISIG_COMPUTE_UNITS),
+            ComputeBudgetInstruction::set_compute_unit_price(priority_fee_lamports.unwrap_or(DEFAULT_PRIORITY_FEE)),
             Instruction {
                 accounts: MultisigCreateV2Accounts {
                     create_key: create_key.pubkey(),
@@ -187,12 +365,12 @@ pub async fn create_multisig(
                 .to_account_metas(Some(false)),
                 data: MultisigCreateV2Data {
                     args: MultisigCreateArgsV2 {
-                        config_authority,
+                        config_authority: None,
                         members,
                         threshold,
                         time_lock: 0,
                         memo: None,
-                        rent_collector,
+                        rent_collector: None,
                     },
                 }
                 .data(),
@@ -206,20 +384,23 @@ pub async fn create_multisig(
 
     let transaction = VersionedTransaction::try_new(
         VersionedMessage::V0(message),
-        &[contributor_keypair, create_key as &dyn Signer],
+        &[fee_payer_keypair, create_key as &dyn Signer],
     )
     .expect("Failed to create transaction");
 
     let signature = send_and_confirm_transaction(&transaction, &rpc_client)?;
 
-    progress.finish_with_message("Transaction confirmed!");
+    let network_display = if rpc_url.contains("devnet") {
+        "Devnet"
+    } else if rpc_url.contains("mainnet") {
+        "Mainnet"
+    } else if rpc_url.contains("testnet") {
+        "Testnet"
+    } else {
+        "Custom"
+    };
 
-    println!(
-        "{} Created Multisig: {}. Signature: {}",
-        "✅".bright_green(),
-        multisig_key.0.to_string().bright_green(),
-        signature.bright_cyan()
-    );
+    progress.finish_with_message(format!("Multisig creation confirmed: {} ({})", signature.to_string().bright_green(), network_display));
 
     Ok((multisig_key.0, signature))
 }
@@ -232,7 +413,7 @@ pub async fn create_feature_gate_proposal(
     priority_fee_lamports: Option<u64>,
 ) -> eyre::Result<()> {
     let program_id =
-        program_id.unwrap_or_else(|| "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf".to_string());
+        program_id.unwrap_or_else(|| SQUADS_PROGRAM_ID_STR.to_string());
     let program_id = Pubkey::from_str(&program_id).expect("Invalid program ID");
 
     let transaction_creator = contributor_keypair.pubkey();
@@ -282,7 +463,7 @@ pub async fn create_feature_gate_proposal(
             rpc_urls.len()
         );
 
-        let rpc_client = RpcClient::new(rpc_url.clone());
+        let rpc_client = create_rpc_client(rpc_url);
         let progress =
             ProgressBar::new_spinner().with_message("Processing feature gate transactions...");
         progress.enable_steady_tick(Duration::from_millis(100));
@@ -325,7 +506,7 @@ pub async fn create_feature_gate_proposal(
                 0, // vault_index
                 activation_message,
                 priority_fee_lamports.map(|fee| fee as u32),
-                Some(300_000), // compute_unit_limit
+                Some(DEFAULT_COMPUTE_UNITS), // compute_unit_limit
                 blockhash,
             )?;
 
@@ -349,7 +530,7 @@ pub async fn create_feature_gate_proposal(
                 0, // vault_index
                 revocation_message,
                 priority_fee_lamports.map(|fee| fee as u32),
-                Some(300_000), // compute_unit_limit
+                Some(DEFAULT_COMPUTE_UNITS), // compute_unit_limit
                 blockhash,
             )?;
 
@@ -434,7 +615,7 @@ pub fn create_transaction_and_proposal_message(
 
     // Serialize the TransactionMessage to bytes as expected by the on-chain program
     let transaction_message_bytes = borsh::to_vec(&transaction_message)?;
-    
+
     let create_transaction_data = VaultTransactionCreateArgsData {
         args: VaultTransactionCreateArgs {
             vault_index,
@@ -495,6 +676,42 @@ pub fn create_transaction_and_proposal_message(
     let message = Message::try_compile(fee_payer_pubkey, &instructions, &[], recent_blockhash)?;
 
     Ok((message, transaction_pda, proposal_pda))
+}
+
+pub fn create_approve_activation_transaction_message(
+    program_id: &Pubkey,
+    feature_gate_multisig_address: &Pubkey,
+    member_pubkey: &Pubkey,
+    fee_payer_pubkey: &Pubkey,
+    recent_blockhash: Hash,
+) -> eyre::Result<Message> {
+    let (proposal_pda, _proposal_bump) =
+        get_proposal_pda(feature_gate_multisig_address, 0, Some(program_id));
+
+    let account_keys = MultisigVoteOnProposalAccounts {
+        multisig: *feature_gate_multisig_address,
+        member: *member_pubkey,
+        proposal: proposal_pda,
+    };
+    let instruction_args = MultisigVoteOnProposalArgs { memo: None };
+    let instruction_data = MultisigApproveProposalData {
+        args: instruction_args,
+    };
+
+    let approve_instruction = Instruction::new_with_bytes(
+        *program_id,
+        &instruction_data.data(),
+        account_keys.to_account_metas(),
+    );
+
+    let message = Message::try_compile(
+        fee_payer_pubkey,
+        &[approve_instruction],
+        &[],
+        recent_blockhash,
+    )?;
+
+    Ok(message)
 }
 
 pub fn parse_members(member_strings: Vec<String>) -> Result<Vec<Member>, String> {
@@ -619,9 +836,10 @@ mod tests {
         assert_eq!(deserialized_args.vault_index, 0);
         assert_eq!(deserialized_args.ephemeral_signers, 0);
         assert_eq!(deserialized_args.memo, None);
-        
+
         // Deserialize the transaction message bytes and verify
-        let deserialized_transaction_message = TransactionMessage::try_from_slice(&deserialized_args.transaction_message).unwrap();
+        let deserialized_transaction_message =
+            TransactionMessage::try_from_slice(&deserialized_args.transaction_message).unwrap();
         assert_eq!(
             deserialized_transaction_message.num_signers,
             transaction_message.num_signers
@@ -847,31 +1065,48 @@ mod tests {
     #[test]
     fn test_debug_serialization() {
         let transaction_message = create_test_transaction_message();
-        
+
         println!("Transaction message created with:");
         println!("  num_signers: {}", transaction_message.num_signers);
-        println!("  num_writable_signers: {}", transaction_message.num_writable_signers);
-        println!("  num_writable_non_signers: {}", transaction_message.num_writable_non_signers);
-        println!("  account_keys.len(): {}", transaction_message.account_keys.len());
-        println!("  instructions.len(): {}", transaction_message.instructions.len());
-        
+        println!(
+            "  num_writable_signers: {}",
+            transaction_message.num_writable_signers
+        );
+        println!(
+            "  num_writable_non_signers: {}",
+            transaction_message.num_writable_non_signers
+        );
+        println!(
+            "  account_keys.len(): {}",
+            transaction_message.account_keys.len()
+        );
+        println!(
+            "  instructions.len(): {}",
+            transaction_message.instructions.len()
+        );
+
         // Try to serialize just the transaction message
         let serialized = borsh::to_vec(&transaction_message).unwrap();
-        println!("  serialized transaction_message length: {}", serialized.len());
-        
+        println!(
+            "  serialized transaction_message length: {}",
+            serialized.len()
+        );
+
         // Show detailed hex breakdown
         println!("  Detailed serialization breakdown:");
         println!("    num_signers (u8): {:02x}", serialized[0]);
-        println!("    num_writable_signers (u8): {:02x}", serialized[1]);  
+        println!("    num_writable_signers (u8): {:02x}", serialized[1]);
         println!("    num_writable_non_signers (u8): {:02x}", serialized[2]);
-        
+
         // Check account_keys serialization - should be length as u8 then pubkeys
         println!("    account_keys length byte: {:02x}", serialized[3]);
-        
+
         // If it shows more than 1 byte for length, there's the issue
-        println!("    bytes 4-7: {:02x} {:02x} {:02x} {:02x}", 
-            serialized[4], serialized[5], serialized[6], serialized[7]);
-        
+        println!(
+            "    bytes 4-7: {:02x} {:02x} {:02x} {:02x}",
+            serialized[4], serialized[5], serialized[6], serialized[7]
+        );
+
         // Create VaultTransactionCreateArgs and see its serialization
         let transaction_message_bytes = borsh::to_vec(&transaction_message).unwrap();
         let vault_args = VaultTransactionCreateArgs {
@@ -880,47 +1115,71 @@ mod tests {
             transaction_message: transaction_message_bytes.clone(),
             memo: None,
         };
-        
+
         let vault_args_serialized = borsh::to_vec(&vault_args).unwrap();
-        println!("  vault_args serialized length: {}", vault_args_serialized.len());
+        println!(
+            "  vault_args serialized length: {}",
+            vault_args_serialized.len()
+        );
         println!("  vault_args hex breakdown:");
         println!("    vault_index: {:02x}", vault_args_serialized[0]);
         println!("    ephemeral_signers: {:02x}", vault_args_serialized[1]);
-        
+
         // Next should be the Vec<u8> length (u32) then the transaction_message bytes
         let tm_vec_len = u32::from_le_bytes([
-            vault_args_serialized[2], vault_args_serialized[3], 
-            vault_args_serialized[4], vault_args_serialized[5]
+            vault_args_serialized[2],
+            vault_args_serialized[3],
+            vault_args_serialized[4],
+            vault_args_serialized[5],
         ]);
-        println!("    transaction_message Vec<u8> length: {} bytes", tm_vec_len);
-        
+        println!(
+            "    transaction_message Vec<u8> length: {} bytes",
+            tm_vec_len
+        );
+
         // The actual transaction message bytes start at offset 6, then after memo option
         let tm_offset = 6;
-        
+
         // memo is Option<String> which serializes as 1 byte (0 for None, 1 for Some) + content
         let memo_len_byte = vault_args_serialized[tm_offset + tm_vec_len as usize];
-        println!("    memo option byte: {:02x} (0=None, 1=Some)", memo_len_byte);
-        
+        println!(
+            "    memo option byte: {:02x} (0=None, 1=Some)",
+            memo_len_byte
+        );
+
         // Transaction message data starts after the memo
         let actual_tm_offset = tm_offset;
         if vault_args_serialized.len() > actual_tm_offset + 5 {
             println!("    tm bytes start at offset {}", actual_tm_offset);
-            println!("    tm.num_signers: {:02x}", vault_args_serialized[actual_tm_offset]);
-            println!("    tm.num_writable_signers: {:02x}", vault_args_serialized[actual_tm_offset + 1]);
-            println!("    tm.num_writable_non_signers: {:02x}", vault_args_serialized[actual_tm_offset + 2]);
-            println!("    tm.account_keys length: {:02x}", vault_args_serialized[actual_tm_offset + 3]);
+            println!(
+                "    tm.num_signers: {:02x}",
+                vault_args_serialized[actual_tm_offset]
+            );
+            println!(
+                "    tm.num_writable_signers: {:02x}",
+                vault_args_serialized[actual_tm_offset + 1]
+            );
+            println!(
+                "    tm.num_writable_non_signers: {:02x}",
+                vault_args_serialized[actual_tm_offset + 2]
+            );
+            println!(
+                "    tm.account_keys length: {:02x}",
+                vault_args_serialized[actual_tm_offset + 3]
+            );
         }
-        
+
         // Create the full data structure
-        let create_transaction_data = VaultTransactionCreateArgsData {
-            args: vault_args,
-        };
-        
+        let create_transaction_data = VaultTransactionCreateArgsData { args: vault_args };
+
         let full_data = create_transaction_data.data();
         println!("  full data length: {}", full_data.len());
-        
+
         // Convert to hex string like the blockchain data
-        let hex_string = full_data.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let hex_string = full_data
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
         println!("  full hex: {}", hex_string);
     }
 

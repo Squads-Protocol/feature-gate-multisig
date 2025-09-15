@@ -1,20 +1,23 @@
+use crate::constants::*;
 use crate::feature_gate_program::create_feature_activation;
+use crate::provision::create_rpc_client;
 use crate::squads::{CompiledInstruction, Member, Permissions, TransactionMessage};
-use anyhow::Result;
 use colored::*;
 use dirs;
-use inquire::{Confirm, Text};
+use eyre::Result;
+use indicatif::ProgressBar;
+use inquire::{Confirm, Select, Text};
 use serde::{Deserialize, Serialize};
-use solana_client::rpc_client::RpcClient;
-use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_keypair::Keypair;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_signer::{EncodableKey, Signer};
 use solana_transaction::versioned::VersionedTransaction;
+use std::fmt::Display;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -23,12 +26,6 @@ pub struct Config {
     pub members: Vec<String>,
     #[serde(default)]
     pub networks: Vec<String>,
-    // Legacy single network field for backward compatibility
-    #[serde(default)]
-    pub network: String,
-    // Keep for backward compatibility but don't use
-    #[serde(default, skip_serializing)]
-    pub signers: Vec<Vec<String>>,
     #[serde(default)]
     pub fee_payer_path: Option<String>,
 }
@@ -38,9 +35,7 @@ impl Default for Config {
         Self {
             threshold: 1,
             members: Vec::new(),
-            networks: vec!["https://api.devnet.solana.com".to_string()],
-            network: "https://api.devnet.solana.com".to_string(),
-            signers: vec![vec![]],
+            networks: vec![DEFAULT_DEVNET_URL.to_string()],
             fee_payer_path: None,
         }
     }
@@ -56,8 +51,7 @@ pub struct DeploymentResult {
 
 // Config management functions
 pub fn get_config_path() -> Result<PathBuf> {
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let home_dir = dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
     Ok(home_dir
         .join(".feature-gate-multisig-tool")
         .join("config.json"))
@@ -73,10 +67,10 @@ pub fn load_config() -> Result<Config> {
     }
 
     let config_str = fs::read_to_string(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to read config file: {}", e))?;
 
-    let config: Config = serde_json::from_str(&config_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
+    let mut config: Config = serde_json::from_str(&config_str)
+        .map_err(|e| eyre::eyre!("Failed to parse config file: {}", e))?;
 
     Ok(config)
 }
@@ -86,14 +80,14 @@ pub fn save_config(config: &Config) -> Result<()> {
 
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
+            .map_err(|e| eyre::eyre!("Failed to create config directory: {}", e))?;
     }
 
     let config_str = serde_json::to_string_pretty(config)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize config: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to serialize config: {}", e))?;
 
     fs::write(&config_path, config_str)
-        .map_err(|e| anyhow::anyhow!("Failed to write config file: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to write config file: {}", e))?;
 
     Ok(())
 }
@@ -119,6 +113,14 @@ pub fn parse_saved_members(config: &Config) -> Vec<Member> {
         }
     }
     parsed_members
+}
+
+pub fn parse_saved_threshold(config: &Config) -> Option<u16> {
+    if config.threshold > 0 {
+        Some(config.threshold)
+    } else {
+        None
+    }
 }
 
 pub fn collect_members_interactively() -> Result<Vec<Member>> {
@@ -160,26 +162,50 @@ pub fn collect_members_interactively() -> Result<Vec<Member>> {
 
 pub fn review_and_collect_configuration(
     config: &Config,
-    threshold: u16,
+    threshold: Option<u16>,
 ) -> Result<(u16, Vec<Member>)> {
     let use_saved_config = review_config(config)?;
 
     if use_saved_config {
-        println!("{} Using saved configuration", "✅".bright_green());
         let parsed_members = parse_saved_members(config);
         Ok((config.threshold, parsed_members))
     } else {
-        println!("{} Collecting members interactively", "🔄".bright_cyan());
+        println!(
+            "{} Collecting configuration interactively",
+            "🔄".bright_cyan()
+        );
+
+        // First collect members
         let interactive_members = collect_members_interactively()?;
-        Ok((threshold, interactive_members))
+
+        // Then get threshold based on member count
+        let final_threshold =
+            if let Some(t) = threshold {
+                // Validate CLI threshold against member count
+                let max_members = interactive_members.len() + 1; // +1 for contributor
+                if t as usize > max_members {
+                    println!(
+                    "  {} CLI threshold ({}) exceeds member count ({}), prompting for new value",
+                    "⚠️".bright_yellow(), t, max_members
+                );
+                    prompt_for_threshold_with_max(max_members)?
+                } else {
+                    println!("  {} Using threshold from CLI: {}", "✓".bright_green(), t);
+                    t
+                }
+            } else {
+                let max_members = interactive_members.len() + 1; // +1 for contributor
+                prompt_for_threshold_with_max(max_members)?
+            };
+
+        Ok((final_threshold, interactive_members))
     }
 }
 
 // Keypair management functions
 pub fn expand_tilde_path(path: &str) -> Result<String> {
     if path.starts_with("~/") {
-        let home =
-            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+        let home = dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
         Ok(home.join(&path[2..]).to_string_lossy().to_string())
     } else {
         Ok(path.to_string())
@@ -191,13 +217,8 @@ pub fn load_fee_payer_keypair(
     keypair_path: Option<String>,
 ) -> Result<Option<Keypair>> {
     if let Some(path) = keypair_path {
-        println!(
-            "{} Loading fee payer keypair from CLI: {}",
-            "💰".bright_blue(),
-            path.bright_white()
-        );
         let keypair = Keypair::read_from_file(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to load keypair from {}: {}", path, e))?;
+            .map_err(|e| eyre::eyre!("Failed to load keypair from {}: {}", path, e))?;
         Ok(Some(keypair))
     } else if let Some(path) = &config.fee_payer_path {
         println!(
@@ -205,9 +226,8 @@ pub fn load_fee_payer_keypair(
             "💰".bright_blue(),
             path.bright_white()
         );
-        let keypair = Keypair::read_from_file(path).map_err(|e| {
-            anyhow::anyhow!("Failed to load keypair from config path {}: {}", path, e)
-        })?;
+        let keypair = Keypair::read_from_file(path)
+            .map_err(|e| eyre::eyre!("Failed to load keypair from config path {}: {}", path, e))?;
         Ok(Some(keypair))
     } else {
         println!("{} No fee payer keypair provided", "⚠️".bright_yellow());
@@ -235,6 +255,39 @@ pub fn prompt_for_threshold(config: &Config) -> Result<u16> {
     }
 }
 
+pub fn prompt_for_threshold_with_max(max_members: usize) -> Result<u16> {
+    loop {
+        let input = Text::new(&format!(
+            "Enter threshold (required signatures) [max: {}]:",
+            max_members
+        ))
+        .prompt()
+        .unwrap_or_default();
+
+        match validate_threshold(&input, max_members, 1) {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
+                continue;
+            }
+        }
+    }
+}
+
+pub fn prompt_for_pubkey(prompt: &str) -> Result<Pubkey> {
+    let input = Text::new(prompt).prompt()?;
+    match Pubkey::from_str(&input) {
+        Ok(pubkey) => Ok(pubkey),
+        Err(_) => {
+            println!(
+                "  {} Invalid public key, please try again.",
+                "❌".bright_red()
+            );
+            prompt_for_pubkey(prompt)
+        }
+    }
+}
+
 pub fn prompt_for_fee_payer_path(config: &Config) -> Result<String> {
     let default_feepayer = config
         .fee_payer_path
@@ -249,11 +302,7 @@ pub fn prompt_for_fee_payer_path(config: &Config) -> Result<String> {
 }
 
 pub fn prompt_for_network(config: &Config) -> Result<String> {
-    let default_network = if !config.networks.is_empty() {
-        &config.networks[0]
-    } else {
-        &config.network
-    };
+    let default_network = &config.networks[0]; // We guarantee networks is not empty after migration
 
     loop {
         let input = Text::new("Enter RPC URL for deployment:")
@@ -266,7 +315,7 @@ pub fn prompt_for_network(config: &Config) -> Result<String> {
                 println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
                 let retry = Confirm::new("Try again?").with_default(true).prompt()?;
                 if !retry {
-                    return Err(anyhow::anyhow!("User cancelled network entry"));
+                    return Err(eyre::eyre!("User cancelled network entry"));
                 }
             }
         }
@@ -534,27 +583,21 @@ pub async fn create_and_send_transaction_proposal(
     transaction_type: &str,
     transaction_index: u64,
 ) -> Result<()> {
-    println!(
-        "\n{} Creating transaction and proposal for multisig governance ({})...",
-        "📋".bright_blue(),
-        transaction_type.bright_cyan()
-    );
-
     let transaction_message = match transaction_type {
         "activation" => create_feature_activation_transaction_message(),
         "revocation" => create_feature_revocation_transaction_message(),
         _ => {
-            return Err(anyhow::anyhow!(
+            return Err(eyre::eyre!(
                 "Invalid transaction type: {}",
                 transaction_type
             ))
         }
     };
 
-    let rpc_client = RpcClient::new(rpc_url);
+    let rpc_client = create_rpc_client(rpc_url);
     let recent_blockhash = rpc_client
         .get_latest_blockhash()
-        .map_err(|e| anyhow::anyhow!("Failed to get recent blockhash: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to get recent blockhash: {}", e))?;
 
     let fee_payer_pubkey = fee_payer_keypair
         .as_ref()
@@ -562,7 +605,7 @@ pub async fn create_and_send_transaction_proposal(
         .unwrap_or_else(|| contributor_keypair.pubkey());
 
     // Use the integrated create_transaction_and_proposal_message function from provision.rs
-    let (message, transaction_pda, proposal_pda) =
+    let (message, _transaction_pda, _proposal_pda) =
         crate::provision::create_transaction_and_proposal_message(
             None, // Use default program ID
             &fee_payer_pubkey,
@@ -571,27 +614,11 @@ pub async fn create_and_send_transaction_proposal(
             transaction_index,
             0, // Vault index 0 (default vault for feature gates)
             transaction_message,
-            Some(5000),    // Priority fee
-            Some(300_000), // Compute unit limit
+            Some(5000),                  // Priority fee
+            Some(DEFAULT_COMPUTE_UNITS), // Compute unit limit
             recent_blockhash,
         )
-        .map_err(|e| anyhow::anyhow!("Failed to create transaction and proposal message: {}", e))?;
-
-    println!(
-        "  {}: {}",
-        "Transaction PDA".cyan(),
-        transaction_pda.to_string().bright_green()
-    );
-    println!(
-        "  {}: {}",
-        "Proposal PDA".cyan(),
-        proposal_pda.to_string().bright_green()
-    );
-    println!(
-        "  {}: {} instructions",
-        "Combined Transaction & Proposal".cyan(),
-        "4".bright_white() // set_compute_unit_price, set_compute_unit_limit, create_transaction, create_proposal
-    );
+        .map_err(|e| eyre::eyre!("Failed to create transaction and proposal message: {}", e))?;
 
     let signers: &[&dyn Signer] = if fee_payer_pubkey == contributor_keypair.pubkey() {
         &[contributor_keypair]
@@ -603,41 +630,38 @@ pub async fn create_and_send_transaction_proposal(
     };
 
     let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), signers)
-        .map_err(|e| anyhow::anyhow!("Failed to create signed transaction: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to create signed transaction: {}", e))?;
 
-    // Display the transaction signature before sending
-    let expected_signature = transaction.signatures[0];
-    println!(
-        "  {}: {}",
-        "Transaction Signature (before send)".cyan(),
-        expected_signature.to_string().bright_white()
-    );
+    let progress = ProgressBar::new_spinner().with_message("Sending transaction...");
+    progress.enable_steady_tick(Duration::from_millis(100));
 
-    println!(
-        "{} Sending combined transaction to RPC...",
-        "📤".bright_blue()
-    );
+    let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
+        .map_err(|e| eyre::eyre!("Failed to send transaction and proposal: {}", e))?;
 
-    let signature = rpc_client
-        .send_transaction_with_config(
-            &transaction,
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..RpcSendTransactionConfig::default()
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to send transaction and proposal: {}", e))?;
+    // Simple signature output with description and network
+    let description = match transaction_type {
+        "activation" => "Feature Gate Activation Proposal Confirmed",
+        "revocation" => "Feature Gate Revocation Proposal Confirmed",
+        _ => "Transaction",
+    };
 
-    println!(
-        "{} Transaction and proposal created successfully in one step!",
-        "✅".bright_green()
-    );
-    println!(
-        "  {}: {}",
-        "Confirmed Transaction Signature".cyan(),
-        signature.to_string().bright_white()
-    );
+    let network_display = if rpc_url.contains("devnet") {
+        "Devnet"
+    } else if rpc_url.contains("mainnet") {
+        "Mainnet"
+    } else if rpc_url.contains("testnet") {
+        "Testnet"
+    } else {
+        "Custom"
+    };
 
+    progress.finish_with_message(format!(
+        "{} ({}): {}",
+        description,
+        network_display,
+        signature.to_string().bright_green()
+    ));
+    println!("");
     Ok(())
 }
 
@@ -666,7 +690,7 @@ pub fn validate_pubkey_with_retry(prompt: &str) -> Result<Pubkey> {
 
                 let retry = Confirm::new("Try again?").with_default(true).prompt()?;
                 if !retry {
-                    return Err(anyhow::anyhow!("User cancelled public key entry"));
+                    return Err(eyre::eyre!("User cancelled public key entry"));
                 }
             }
         }
@@ -679,8 +703,8 @@ pub fn validate_threshold(input: &str, max_members: usize, default: u16) -> Resu
     }
 
     match input.trim().parse::<u16>() {
-        Ok(threshold) if threshold == 0 => Err(anyhow::anyhow!("Threshold must be at least 1")),
-        Ok(threshold) if threshold > max_members as u16 => Err(anyhow::anyhow!(
+        Ok(threshold) if threshold == 0 => Err(eyre::eyre!("Threshold must be at least 1")),
+        Ok(threshold) if threshold > max_members as u16 => Err(eyre::eyre!(
             "Threshold cannot exceed number of members ({})",
             max_members
         )),
@@ -692,7 +716,7 @@ pub fn validate_threshold(input: &str, max_members: usize, default: u16) -> Resu
             );
             Ok(threshold)
         }
-        Err(_) => Err(anyhow::anyhow!(
+        Err(_) => Err(eyre::eyre!(
             "Invalid number format. Please enter a positive integer."
         )),
     }
@@ -702,17 +726,17 @@ pub fn validate_rpc_url(url: &str) -> Result<String> {
     let url = url.trim();
 
     if url.is_empty() {
-        return Err(anyhow::anyhow!("URL cannot be empty"));
+        return Err(eyre::eyre!("URL cannot be empty"));
     }
 
     // Check if it's a valid URL
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(anyhow::anyhow!("URL must start with http:// or https://"));
+        return Err(eyre::eyre!("URL must start with http:// or https://"));
     }
 
     // Basic URL validation - check for valid characters and structure
     if !url.contains("://") {
-        return Err(anyhow::anyhow!("Invalid URL format"));
+        return Err(eyre::eyre!("Invalid URL format"));
     }
 
     // Check for common Solana RPC patterns
@@ -731,11 +755,62 @@ pub fn validate_rpc_url(url: &str) -> Result<String> {
             .with_default(false)
             .prompt()?;
         if !confirm {
-            return Err(anyhow::anyhow!("User cancelled due to unusual URL"));
+            return Err(eyre::eyre!("User cancelled due to unusual URL"));
         }
     }
 
     Ok(url.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TransactionEncoding {
+    #[serde(rename = "base58")]
+    Base58,
+    #[serde(rename = "base64")]
+    Base64,
+}
+
+impl Display for TransactionEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                TransactionEncoding::Base58 => "base58",
+                TransactionEncoding::Base64 => "base64",
+            }
+        )
+    }
+}
+pub fn choose_transaction_encoding() -> Result<TransactionEncoding> {
+    let choice = Select::new(
+        "Transaction encoding format?",
+        vec![TransactionEncoding::Base58, TransactionEncoding::Base64],
+    )
+    .prompt()?;
+    Ok(choice)
+}
+
+pub fn choose_network_from_config(config: &Config) -> Result<String> {
+    let available_networks = if !config.networks.is_empty() {
+        config.networks.clone()
+    } else {
+        vec![
+            "https://api.devnet.solana.com".to_string(),
+            "https://api.testnet.solana.com".to_string(),
+            "https://api.mainnet.solana.com".to_string(),
+        ]
+    };
+
+    if available_networks.is_empty() {
+        return Err(eyre::eyre!("No networks available"));
+    }
+    let choice = Select::new(
+        "What network would you like to use for transaction generation?",
+        available_networks,
+    )
+    .prompt()?;
+    Ok(choice.to_string())
 }
 
 pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(bool, Vec<String>)> {
@@ -743,21 +818,20 @@ pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(b
         return Ok((false, Vec::new()));
     }
 
-    let available_networks = if !config.networks.is_empty() {
-        config.networks.clone()
-    } else {
-        vec![config.network.clone()]
-    };
+    let available_networks = config.networks.clone();
 
     if available_networks.is_empty() {
         return Ok((false, Vec::new()));
     }
 
+    println!("");
+    println!("{}", "Saved Network Configuration".bold().bright_yellow(),);
+    println!("");
     println!(
-        "\n{}",
-        "🌐 Network Deployment Options:".bright_blue().bold()
+        "  {}: {}",
+        "Networks".cyan(),
+        available_networks.len().to_string().cyan()
     );
-    println!("  Option 1: Deploy to all saved networks automatically");
     for (i, network) in available_networks.iter().enumerate() {
         let network_name = if network.contains("devnet") {
             "Devnet"
@@ -775,8 +849,6 @@ pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(b
             network.bright_white()
         );
     }
-    println!("  Option 2: Manual network entry (prompt for each deployment)");
-
     let use_saved_networks = Confirm::new("Use saved networks for deployment?")
         .with_default(true)
         .prompt()?;
@@ -793,6 +865,22 @@ pub fn review_config(config: &Config) -> Result<bool> {
         "\n{}",
         "📋 Found existing configuration:".bright_yellow().bold()
     );
+    println!("");
+    if !config.members.is_empty() {
+        println!(
+            "  {}: {}",
+            "Saved members".cyan(),
+            config.members.len().to_string().bright_green()
+        );
+        for (i, member) in config.members.iter().enumerate() {
+            println!(
+                "    {}: {}",
+                format!("Member {}", i + 1).cyan(),
+                member.bright_white()
+            );
+        }
+    }
+    println!("");
     println!(
         "  {}: {}",
         "Threshold".cyan(),
@@ -800,6 +888,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
     );
 
     // Show fee payer path
+    println!("");
     if let Some(fee_payer_path) = &config.fee_payer_path {
         println!(
             "  {}: {}",
@@ -815,14 +904,11 @@ pub fn review_config(config: &Config) -> Result<bool> {
     }
 
     // Show networks
-    let networks_to_show = if !config.networks.is_empty() {
-        &config.networks
-    } else {
-        &vec![config.network.clone()]
-    };
+    let networks_to_show = &config.networks;
 
+    println!("");
     println!(
-        "  {}: {} networks",
+        "  {}: {}",
         "Saved networks".cyan(),
         networks_to_show.len().to_string().bright_green()
     );
@@ -832,21 +918,6 @@ pub fn review_config(config: &Config) -> Result<bool> {
             format!("Network {}", i + 1).cyan(),
             network.bright_white()
         );
-    }
-
-    if !config.members.is_empty() {
-        println!(
-            "  {}: {} members",
-            "Saved members".cyan(),
-            config.members.len().to_string().bright_green()
-        );
-        for (i, member) in config.members.iter().enumerate() {
-            println!(
-                "    {}: {}",
-                format!("Member {}", i + 1).cyan(),
-                member.bright_white()
-            );
-        }
     }
 
     println!();
@@ -869,4 +940,113 @@ pub fn decode_permissions(mask: u8) -> Vec<String> {
         permissions.push("Execute".to_string());
     }
     permissions
+}
+
+/// Check that the fee payer has sufficient SOL balance on all networks
+/// Returns a Result indicating success or failure with network-specific errors
+pub async fn check_fee_payer_balance_on_networks(
+    fee_payer_pubkey: &Pubkey,
+    networks: &[String],
+    required_balance_sol: f64,
+) -> Result<()> {
+    use crate::output::Output;
+
+    const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+    let required_lamports = (required_balance_sol * LAMPORTS_PER_SOL as f64) as u64;
+
+    Output::header("💰 Checking Fee Payer Balance");
+    println!();
+
+    let mut insufficient_balance_networks = Vec::new();
+    let mut network_errors = Vec::new();
+
+    for network in networks {
+        let network_display = if network.contains("devnet") {
+            "Devnet"
+        } else if network.contains("mainnet") {
+            "Mainnet"
+        } else if network.contains("testnet") {
+            "Testnet"
+        } else {
+            "Custom"
+        };
+
+        // Create RPC client for this network
+        let rpc_client = crate::provision::create_rpc_client(network);
+
+        // Check balance with retries
+        match rpc_client.get_balance(fee_payer_pubkey) {
+            Ok(balance_lamports) => {
+                let balance_sol = balance_lamports as f64 / LAMPORTS_PER_SOL as f64;
+
+                if balance_lamports >= required_lamports {
+                    println!(
+                        "  {} {}: {} SOL",
+                        "✓".bright_green(),
+                        network_display.bright_white(),
+                        format!("{:.4}", balance_sol).bright_green()
+                    );
+                } else {
+                    println!(
+                        "  {} {}: {} SOL (insufficient - need {:.3})",
+                        "❌".bright_red(),
+                        network_display.bright_white(),
+                        format!("{:.4}", balance_sol).bright_red(),
+                        required_balance_sol.to_string().bright_yellow()
+                    );
+                    insufficient_balance_networks.push((network_display.to_string(), balance_sol));
+                }
+            }
+            Err(e) => {
+                println!(
+                    "  {} {}: {}",
+                    "⚠️".bright_yellow(),
+                    network_display.bright_white(),
+                    "Could not check balance".bright_red()
+                );
+                network_errors.push((network_display.to_string(), e.to_string()));
+            }
+        }
+    }
+
+    println!();
+
+    // Report any issues
+    if !insufficient_balance_networks.is_empty() {
+        Output::error(&format!(
+            "Fee payer has insufficient balance on {} network(s)",
+            insufficient_balance_networks.len()
+        ));
+        for (network, balance) in &insufficient_balance_networks {
+            println!(
+                "  {} {}: {:.4} SOL (need {:.3} SOL)",
+                "•".bright_red(),
+                network.bright_white(),
+                balance,
+                required_balance_sol.to_string().bright_yellow()
+            );
+        }
+        println!();
+        return Err(eyre::eyre!(
+            "Fee payer needs at least {:.3} SOL on all networks for deployment",
+            required_balance_sol
+        ));
+    }
+
+    if !network_errors.is_empty() {
+        Output::warning(&format!(
+            "Could not check balance on {} network(s) - proceeding anyway",
+            network_errors.len()
+        ));
+        for (network, error) in &network_errors {
+            println!("  {} {}: {}", "•".bright_yellow(), network.bright_white(), error);
+        }
+        println!();
+    }
+
+    if insufficient_balance_networks.is_empty() && network_errors.is_empty() {
+        Output::success("Fee payer has sufficient balance on all networks");
+    }
+
+    Ok(())
 }

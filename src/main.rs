@@ -1,12 +1,15 @@
 mod commands;
+mod constants;
 mod feature_gate_program;
+mod output;
 mod provision;
 mod squads;
 mod utils;
 
 use crate::commands::{config_command, create_command, interactive_mode, show_command};
+use crate::output::Output;
 use crate::utils::{load_config, prompt_for_threshold};
-use anyhow::Result;
+use eyre::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
 
@@ -101,42 +104,22 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!(
-            "{} {}",
-            "❌ Error:".bright_red().bold(),
-            e.to_string().bright_red()
-        );
+        Output::error(&format!("Error: {}", e));
 
         // Provide helpful error messages for common issues
         let error_msg = e.to_string();
         if error_msg.contains("config") {
-            eprintln!(
-                "{} Try running: {}",
-                "💡 Hint:".bright_blue(),
-                "feature-gate-multisig-tool config".bright_cyan()
-            );
+            Output::hint("Try running: feature-gate-multisig-tool config");
         } else if error_msg.contains("address") || error_msg.contains("pubkey") {
-            eprintln!(
-                "{} Public keys should be valid base58-encoded addresses",
-                "💡 Hint:".bright_blue()
-            );
+            Output::hint("Public keys should be valid base58-encoded addresses");
         } else if error_msg.contains("network") || error_msg.contains("URL") {
-            eprintln!(
-                "{} Network URLs should start with https:// (e.g., https://api.devnet.solana.com)",
-                "💡 Hint:".bright_blue()
-            );
+            Output::hint("Network URLs should start with https:// (e.g., https://api.devnet.solana.com)");
         } else if error_msg.contains("threshold") {
-            eprintln!(
-                "{} Threshold must be a positive number not exceeding member count",
-                "💡 Hint:".bright_blue()
-            );
+            Output::hint("Threshold must be a positive number not exceeding member count");
         }
 
-        eprintln!(
-            "\n{} Run {} for usage information",
-            "💡".bright_blue(),
-            "--help".bright_cyan()
-        );
+        Output::separator();
+        Output::hint("Run --help for usage information");
         std::process::exit(1);
     }
 }
@@ -150,22 +133,19 @@ async fn handle_command(command: Commands) -> Result<()> {
             signers: _,
             keypair,
         } => {
-            let threshold = if let Some(t) = threshold {
+            let threshold_option = threshold.map(|t| {
                 if t == 0 {
                     println!(
-                        "{} Threshold cannot be 0, using default: {}",
-                        "⚠️".bright_yellow(),
-                        config.threshold
+                        "{} Threshold cannot be 0, will prompt later",
+                        "⚠️".bright_yellow()
                     );
-                    config.threshold
+                    None
                 } else {
-                    t as u16
+                    Some(t as u16)
                 }
-            } else {
-                prompt_for_threshold(&config)?
-            };
+            }).flatten();
 
-            create_command(&mut config, threshold, vec![], keypair).await
+            create_command(&mut config, threshold_option, vec![], keypair).await
         }
         Commands::Show { address } => {
             show_command(&config, address).await
