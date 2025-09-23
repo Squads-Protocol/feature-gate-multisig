@@ -90,6 +90,51 @@ pub struct VaultTransaction {
     pub message: VaultTransactionMessage,
 }
 
+impl VaultTransactionMessage {
+    /// Returns the number of all the account keys (static + dynamic) in the message.
+    pub fn num_all_account_keys(&self) -> usize {
+        let num_account_keys_from_lookups = self
+            .address_table_lookups
+            .iter()
+            .map(|lookup| lookup.writable_indexes.len() + lookup.readonly_indexes.len())
+            .sum::<usize>();
+
+        self.account_keys.len() + num_account_keys_from_lookups
+    }
+
+    /// Returns true if the account at the specified index is a part of static `account_keys` and was requested to be writable.
+    pub fn is_static_writable_index(&self, key_index: usize) -> bool {
+        let num_account_keys = self.account_keys.len();
+        let num_signers = usize::from(self.num_signers);
+        let num_writable_signers = usize::from(self.num_writable_signers);
+        let num_writable_non_signers = usize::from(self.num_writable_non_signers);
+
+        if key_index >= num_account_keys {
+            // `index` is not a part of static `account_keys`.
+            return false;
+        }
+
+        if key_index < num_writable_signers {
+            // `index` is within the range of writable signer keys.
+            return true;
+        }
+
+        if key_index >= num_signers {
+            // `index` is within the range of non-signer keys.
+            let index_into_non_signers = key_index.saturating_sub(num_signers);
+            // Whether `index` is within the range of writable non-signer keys.
+            return index_into_non_signers < num_writable_non_signers;
+        }
+
+        false
+    }
+
+    /// Returns true if the account at the specified index was requested to be a signer.
+    pub fn is_signer_index(&self, key_index: usize) -> bool {
+        key_index < usize::from(self.num_signers)
+    }
+}
+
 #[derive(BorshDeserialize, BorshSerialize, Clone)]
 pub struct VaultTransactionMessage {
     pub num_signers: u8,
@@ -294,7 +339,6 @@ pub struct MultisigCreateProposalArgs {
     pub is_draft: bool,
 }
 
-
 pub struct MultisigVoteOnProposalAccounts {
     pub multisig: Pubkey,
     pub member: Pubkey,
@@ -308,6 +352,34 @@ pub struct MultisigVoteOnProposalArgs {
 
 pub struct MultisigApproveProposalData {
     pub args: MultisigVoteOnProposalArgs,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct MultisigExecuteTransactionArgs {
+    pub memo: Option<String>,
+}
+
+pub struct MultisigExecuteTransactionAccounts {
+    pub multisig: Pubkey,
+    pub proposal: Pubkey,
+    pub transaction: Pubkey,
+    pub member: Pubkey,
+}
+
+impl MultisigExecuteTransactionAccounts {
+    pub fn to_account_metas(&self, execution_accounts: Vec<AccountMeta>) -> Vec<AccountMeta> {
+        let mut metas = vec![
+            AccountMeta::new_readonly(self.multisig, false),
+            AccountMeta::new(self.proposal, false),
+            AccountMeta::new_readonly(self.transaction, false),
+            AccountMeta::new_readonly(self.member, true),
+        ];
+        metas.extend(execution_accounts);
+        metas
+    }
+}
+pub struct MultisigExecuteTransactionData {
+    pub args: MultisigExecuteTransactionArgs,
 }
 
 impl MultisigVoteOnProposalAccounts {

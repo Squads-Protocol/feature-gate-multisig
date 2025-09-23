@@ -1,5 +1,5 @@
 use crate::commands::{
-    approve_feature_gate_activation_proposal, config_command, create_command, show_command,
+    approve_feature_gate_activation_proposal, config_command, create_command, execute_feature_gate_activation_proposal, show_command
 };
 use crate::squads::get_vault_pda;
 use crate::utils::*;
@@ -53,6 +53,25 @@ pub async fn interactive_mode() -> Result<()> {
                             "Enter the voting key: (Can be either EOA or parent multisig)",
                         )?;
                         approve_feature_gate_activation_proposal(
+                            &config,
+                            feature_gate_multisig_address,
+                            voting_key,
+                            fee_payer_path,
+                            None,
+                        )
+                        .await?;
+                    }
+                    "Execute feature gate activation proposal" => {
+                        Confirm::new(&format!(
+                            "You're executing the activation of the following feature gate: {}?",
+                            feature_gate_id
+                        ))
+                        .with_default(true)
+                        .prompt()?;
+                        let voting_key = prompt_for_pubkey(
+                            "Enter the voting key: (Can be either EOA or parent multisig)",
+                        )?;
+                        execute_feature_gate_activation_proposal(
                             &config,
                             feature_gate_multisig_address,
                             voting_key,
