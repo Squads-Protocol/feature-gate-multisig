@@ -1,7 +1,7 @@
 use crate::constants::*;
-use crate::feature_gate_program::create_feature_activation;
+use crate::feature_gate_program::{activate_feature_funded, create_feature_activation};
 use crate::provision::create_rpc_client;
-use crate::squads::{CompiledInstruction, Member, Permissions, TransactionMessage};
+use crate::squads::{get_vault_pda, CompiledInstruction, Member, Permissions, TransactionMessage};
 use colored::*;
 use dirs;
 use eyre::Result;
@@ -459,17 +459,13 @@ pub fn display_deployment_info(
 }
 
 // Transaction creation functions
-pub fn create_feature_activation_transaction_message() -> TransactionMessage {
+pub fn create_feature_activation_transaction_message(feature_id: Pubkey) -> TransactionMessage {
     use crate::squads::SmallVec;
 
-    // Create feature activation instructions for a test feature
-    let feature_id = Pubkey::new_unique();
-    let funding_address = Pubkey::new_unique();
-    let instructions = create_feature_activation(&feature_id, &funding_address);
+    let instructions = activate_feature_funded(&feature_id);
 
     // Build account keys list for the message
     let mut account_keys = vec![
-        funding_address,                      // 0: Funding address (signer, writable)
         feature_id,                           // 1: Feature account (writable)
         solana_system_interface::program::ID, // 2: System program
         crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID, // 3: Feature gate program
@@ -511,20 +507,19 @@ pub fn create_feature_activation_transaction_message() -> TransactionMessage {
     }
 
     TransactionMessage {
-        num_signers: 1,              // funding_address is the signer
-        num_writable_signers: 1,     // funding_address is writable signer
-        num_writable_non_signers: 1, // feature_id is writable non-signer
+        num_signers: 1,              // feature_id is the signer
+        num_writable_signers: 1,     // feature_id is writable signer
+        num_writable_non_signers: 0,
         account_keys: SmallVec::from(account_keys),
         instructions: SmallVec::from(compiled_instructions),
         address_table_lookups: SmallVec::from(vec![]),
     }
 }
 
-pub fn create_feature_revocation_transaction_message() -> TransactionMessage {
+pub fn create_feature_revocation_transaction_message(feature_id: Pubkey) -> TransactionMessage {
     use crate::squads::SmallVec;
 
     // Create feature revocation instruction for a test feature
-    let feature_id = Pubkey::new_unique();
     let instruction = crate::feature_gate_program::revoke_pending_activation(&feature_id);
 
     // Build account keys list for the message
@@ -583,9 +578,11 @@ pub async fn create_and_send_transaction_proposal(
     transaction_type: &str,
     transaction_index: u64,
 ) -> Result<()> {
+    let vault_address = get_vault_pda(multisig_address, 0, None).0;
+
     let transaction_message = match transaction_type {
-        "activation" => create_feature_activation_transaction_message(),
-        "revocation" => create_feature_revocation_transaction_message(),
+        "activation" => create_feature_activation_transaction_message(vault_address),
+        "revocation" => create_feature_revocation_transaction_message(vault_address),
         _ => {
             return Err(eyre::eyre!(
                 "Invalid transaction type: {}",

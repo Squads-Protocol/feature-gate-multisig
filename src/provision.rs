@@ -3,16 +3,19 @@ use crate::squads::{
     get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
     Member, MultisigApproveProposalData, MultisigCreateArgsV2, MultisigCreateProposalAccounts,
     MultisigCreateProposalArgs, MultisigCreateProposalData, MultisigCreateTransaction,
-    MultisigCreateV2Accounts, MultisigCreateV2Data, MultisigVoteOnProposalAccounts,
-    MultisigVoteOnProposalArgs, Permissions, ProgramConfig, TransactionMessage,
-    VaultTransactionCreateArgs, VaultTransactionCreateArgsData,
+    MultisigCreateV2Accounts, MultisigCreateV2Data, MultisigExecuteTransactionAccounts,
+    MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs, Permissions, ProgramConfig,
+    TransactionMessage, VaultTransaction, VaultTransactionCreateArgs,
+    VaultTransactionCreateArgsData, EXECUTE_TRANSACTION_DISCRIMINATOR,
 };
 use crate::utils::decode_permissions;
+use borsh::BorshDeserialize;
 use colored::Colorize;
 use dialoguer::Confirm;
 use eyre::eyre;
 use indicatif::ProgressBar;
 use solana_client::client_error::ClientErrorKind;
+use solana_client::nonblocking;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_client::rpc_request::{RpcError, RpcResponseErrorData};
@@ -20,7 +23,7 @@ use solana_client::rpc_response::RpcSimulateTransactionResult;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_hash::Hash;
-use solana_instruction::Instruction;
+use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_message::v0::Message;
 use solana_message::VersionedMessage;
@@ -49,22 +52,35 @@ pub fn send_and_confirm_transaction(
     for attempt in 0..MAX_RETRIES {
         // Check if we've exceeded our total retry time budget
         if retry_start.elapsed().as_millis() as u64 >= MAX_TOTAL_RETRY_TIME_MS {
-            println!("Exceeded maximum retry time of {}ms", MAX_TOTAL_RETRY_TIME_MS);
+            println!(
+                "Exceeded maximum retry time of {}ms",
+                MAX_TOTAL_RETRY_TIME_MS
+            );
             break;
         }
 
         if attempt > 0 {
             let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32 - 1));
             // Ensure we don't exceed our total time budget with this delay
-            let remaining_time = MAX_TOTAL_RETRY_TIME_MS.saturating_sub(retry_start.elapsed().as_millis() as u64);
+            let remaining_time =
+                MAX_TOTAL_RETRY_TIME_MS.saturating_sub(retry_start.elapsed().as_millis() as u64);
             let actual_delay = std::cmp::min(delay, remaining_time);
 
             if actual_delay > 0 {
-                println!("Retrying transaction in {}ms... (attempt {}/{}, {}ms elapsed)",
-                    actual_delay, attempt + 1, MAX_RETRIES, retry_start.elapsed().as_millis());
+                println!(
+                    "Retrying transaction in {}ms... (attempt {}/{}, {}ms elapsed)",
+                    actual_delay,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    retry_start.elapsed().as_millis()
+                );
                 std::thread::sleep(Duration::from_millis(actual_delay));
             } else {
-                println!("No time remaining for delay, proceeding with retry attempt {}/{}", attempt + 1, MAX_RETRIES);
+                println!(
+                    "No time remaining for delay, proceeding with retry attempt {}/{}",
+                    attempt + 1,
+                    MAX_RETRIES
+                );
             }
         }
 
@@ -89,11 +105,11 @@ pub fn send_and_confirm_transaction(
                         *code == -32004 ||  // RPC request timed out
                         *code == -32603 ||  // Internal error
                         *code == -32002 ||  // Transaction simulation failed
-                        *code == -32001     // Generic server error
+                        *code == -32001 // Generic server error
                     }
-                    ClientErrorKind::Io(_) => true,  // Network issues
-                    ClientErrorKind::Reqwest(_) => true,  // HTTP client issues
-                    _ => false
+                    ClientErrorKind::Io(_) => true, // Network issues
+                    ClientErrorKind::Reqwest(_) => true, // HTTP client issues
+                    _ => false,
                 };
 
                 if let ClientErrorKind::RpcError(RpcError::RpcResponseError {
@@ -116,8 +132,10 @@ pub fn send_and_confirm_transaction(
                     break;
                 }
 
-                println!("Retryable error occurred: {}",
-                    last_error.as_ref().unwrap().to_string().bright_yellow());
+                println!(
+                    "Retryable error occurred: {}",
+                    last_error.as_ref().unwrap().to_string().bright_yellow()
+                );
                 continue;
             }
         };
@@ -128,7 +146,10 @@ pub fn send_and_confirm_transaction(
 
         loop {
             if confirmation_start.elapsed().as_millis() as u64 > CONFIRMATION_TIMEOUT_MS {
-                println!("Transaction confirmation timeout after {}ms", CONFIRMATION_TIMEOUT_MS);
+                println!(
+                    "Transaction confirmation timeout after {}ms",
+                    CONFIRMATION_TIMEOUT_MS
+                );
                 break; // Will retry sending
             }
 
@@ -150,20 +171,32 @@ pub fn send_and_confirm_transaction(
                         ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
                             if *code == -32004 || *code == -32005 || *code == -32603 {
                                 // Temporary RPC issue, continue polling
-                                println!("Temporary confirmation error: {}", confirmation_err.to_string().bright_yellow());
+                                println!(
+                                    "Temporary confirmation error: {}",
+                                    confirmation_err.to_string().bright_yellow()
+                                );
                             } else {
                                 // Non-retryable confirmation error, break and retry transaction
-                                println!("Non-retryable confirmation error: {}", confirmation_err.to_string().bright_red());
+                                println!(
+                                    "Non-retryable confirmation error: {}",
+                                    confirmation_err.to_string().bright_red()
+                                );
                                 break;
                             }
                         }
                         ClientErrorKind::Io(_) | ClientErrorKind::Reqwest(_) => {
                             // Network issues, continue polling
-                            println!("Network error during confirmation: {}", confirmation_err.to_string().bright_yellow());
+                            println!(
+                                "Network error during confirmation: {}",
+                                confirmation_err.to_string().bright_yellow()
+                            );
                         }
                         _ => {
                             // Unknown error, break and retry transaction
-                            println!("Unknown confirmation error: {}", confirmation_err.to_string().bright_red());
+                            println!(
+                                "Unknown confirmation error: {}",
+                                confirmation_err.to_string().bright_red()
+                            );
                             break;
                         }
                     }
@@ -176,13 +209,17 @@ pub fn send_and_confirm_transaction(
         }
 
         // If we reach here, confirmation failed or timed out
-        last_error = Some(eyre!("Transaction sent but confirmation failed or timed out"));
+        last_error = Some(eyre!(
+            "Transaction sent but confirmation failed or timed out"
+        ));
     }
 
     Err(eyre!(
         "Transaction failed after {} attempts: {}",
         MAX_RETRIES,
-        last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
+        last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "Unknown error".to_string())
     ))
 }
 
@@ -210,7 +247,7 @@ pub fn get_account_data_with_retry(
                     }
                     ClientErrorKind::Io(_) => true,
                     ClientErrorKind::Reqwest(_) => true,
-                    _ => false
+                    _ => false,
                 };
 
                 last_error = Some(err);
@@ -237,8 +274,7 @@ pub async fn create_multisig(
     threshold: u16,
     priority_fee_lamports: Option<u64>,
 ) -> eyre::Result<(Pubkey, String)> {
-    let program_id =
-        program_id.unwrap_or_else(|| SQUADS_PROGRAM_ID_STR.to_string());
+    let program_id = program_id.unwrap_or_else(|| SQUADS_PROGRAM_ID_STR.to_string());
     let program_id = Pubkey::from_str(&program_id).expect("Invalid program ID");
     let multisig_address = crate::squads::get_multisig_pda(&create_key.pubkey(), None).0;
     let vault_address = get_vault_pda(&multisig_address, 0, None).0;
@@ -352,7 +388,9 @@ pub async fn create_multisig(
         &transaction_creator,
         &[
             ComputeBudgetInstruction::set_compute_unit_limit(CREATE_MULTISIG_COMPUTE_UNITS),
-            ComputeBudgetInstruction::set_compute_unit_price(priority_fee_lamports.unwrap_or(DEFAULT_PRIORITY_FEE)),
+            ComputeBudgetInstruction::set_compute_unit_price(
+                priority_fee_lamports.unwrap_or(DEFAULT_PRIORITY_FEE),
+            ),
             Instruction {
                 accounts: MultisigCreateV2Accounts {
                     create_key: create_key.pubkey(),
@@ -400,7 +438,11 @@ pub async fn create_multisig(
         "Custom"
     };
 
-    progress.finish_with_message(format!("Multisig creation confirmed: {} ({})", signature.to_string().bright_green(), network_display));
+    progress.finish_with_message(format!(
+        "Multisig creation confirmed: {} ({})",
+        signature.to_string().bright_green(),
+        network_display
+    ));
 
     Ok((multisig_key.0, signature))
 }
@@ -412,8 +454,7 @@ pub async fn create_feature_gate_proposal(
     contributor_keypair: &dyn Signer,
     priority_fee_lamports: Option<u64>,
 ) -> eyre::Result<()> {
-    let program_id =
-        program_id.unwrap_or_else(|| SQUADS_PROGRAM_ID_STR.to_string());
+    let program_id = program_id.unwrap_or_else(|| SQUADS_PROGRAM_ID_STR.to_string());
     let program_id = Pubkey::from_str(&program_id).expect("Invalid program ID");
 
     let transaction_creator = contributor_keypair.pubkey();
@@ -492,8 +533,8 @@ pub async fn create_feature_gate_proposal(
         let revocation_tx_index = base_tx_index + 2;
 
         // Create transaction messages using utility functions
-        let activation_message = crate::utils::create_feature_activation_transaction_message();
-        let revocation_message = crate::utils::create_feature_revocation_transaction_message();
+        let activation_message = crate::utils::create_feature_activation_transaction_message(vault_pda.0);
+        let revocation_message = crate::utils::create_feature_revocation_transaction_message(vault_pda.0);
 
         // Transaction 1: Create activation transaction and proposal in one step
         let (activation_combined_message, activation_transaction_pda, activation_proposal_pda) =
@@ -707,6 +748,109 @@ pub fn create_approve_activation_transaction_message(
     let message = Message::try_compile(
         fee_payer_pubkey,
         &[approve_instruction],
+        &[],
+        recent_blockhash,
+    )?;
+
+    Ok(message)
+}
+
+pub fn create_approve_activation_revocation_transaction_message(
+    program_id: &Pubkey,
+    feature_gate_multisig_address: &Pubkey,
+    member_pubkey: &Pubkey,
+    fee_payer_pubkey: &Pubkey,
+    recent_blockhash: Hash,
+) -> eyre::Result<Message> {
+    let (proposal_pda, _proposal_bump) =
+        get_proposal_pda(feature_gate_multisig_address, 1, Some(program_id));
+
+    let account_keys = MultisigVoteOnProposalAccounts {
+        multisig: *feature_gate_multisig_address,
+        member: *member_pubkey,
+        proposal: proposal_pda,
+    };
+    let instruction_args = MultisigVoteOnProposalArgs { memo: None };
+    let instruction_data = MultisigApproveProposalData {
+        args: instruction_args,
+    };
+
+    let approve_instruction = Instruction::new_with_bytes(
+        *program_id,
+        &instruction_data.data(),
+        account_keys.to_account_metas(),
+    );
+
+    let message = Message::try_compile(
+        fee_payer_pubkey,
+        &[approve_instruction],
+        &[],
+        recent_blockhash,
+    )?;
+
+    Ok(message)
+}
+pub async fn create_execute_activation_transaction_message(
+    program_id: &Pubkey,
+    feature_gate_multisig_address: &Pubkey,
+    member_pubkey: &Pubkey,
+    fee_payer_pubkey: &Pubkey,
+    rpc_client: &nonblocking::rpc_client::RpcClient,
+    recent_blockhash: Hash,
+) -> eyre::Result<Message> {
+    let (proposal_pda, _proposal_bump) =
+        get_proposal_pda(feature_gate_multisig_address, 0, Some(program_id));
+    let (transaction_pda, _transaction_bump) =
+        get_transaction_pda(feature_gate_multisig_address, 0, Some(program_id));
+    let vault_pda = get_vault_pda(feature_gate_multisig_address, 0, Some(program_id));
+
+    let transaction_account_data = rpc_client.get_account_data(&transaction_pda).await?;
+    let transaction_contents =
+        VaultTransaction::try_from_slice(&transaction_account_data[8..]).unwrap();
+    let transaction_message = transaction_contents.message;
+
+    let mut execution_account_metas = Vec::new();
+    // Build account metas from transaction_message
+    for (i, account_key) in transaction_message.account_keys.iter().enumerate() {
+        let mut is_signer = transaction_message.is_signer_index(i);
+        // Set vault to not be a signer to prevent transaction sending failure
+        if *account_key == vault_pda.0 {
+            is_signer = false;
+        }
+        let is_writable = transaction_message.is_static_writable_index(i);
+        if is_writable {
+            if is_signer {
+                execution_account_metas.push(AccountMeta::new(*account_key, true));
+            } else {
+                execution_account_metas.push(AccountMeta::new(*account_key, false));
+            }
+        } else {
+            if is_signer {
+                execution_account_metas.push(AccountMeta::new_readonly(*account_key, true));
+            } else {
+                execution_account_metas.push(AccountMeta::new_readonly(*account_key, false));
+            }
+        }
+    }
+
+    let account_keys = MultisigExecuteTransactionAccounts {
+        multisig: *feature_gate_multisig_address,
+        proposal: proposal_pda,
+        transaction: transaction_pda,
+        member: *member_pubkey,
+    };
+
+    let account_metas = account_keys.to_account_metas(Vec::new());
+
+    let execute_instruction = Instruction::new_with_bytes(
+        *program_id,
+        &EXECUTE_TRANSACTION_DISCRIMINATOR,
+        account_metas,
+    );
+
+    let message = Message::try_compile(
+        fee_payer_pubkey,
+        &[execute_instruction],
         &[],
         recent_blockhash,
     )?;
