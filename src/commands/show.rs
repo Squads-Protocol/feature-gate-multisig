@@ -1,8 +1,8 @@
 use crate::constants::*;
 use crate::provision::{create_rpc_client, get_account_data_with_retry};
 use crate::squads::{
-    get_proposal_pda, get_transaction_pda, get_vault_pda, Multisig, Proposal, ProposalStatus,
-    VaultTransaction,
+    get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction, ConfigTransaction,
+    Multisig, Proposal, ProposalStatus, VaultTransaction,
 };
 use crate::utils::*;
 use colored::*;
@@ -308,18 +308,14 @@ async fn fetch_and_display_transactions_and_proposals(
         return Ok(());
     }
 
-    println!("🔍 Fetching transaction and proposal data for indices 1 and 2...");
+    println!(
+        "🔍 Fetching transaction and proposal data for {} transaction(s)...",
+        multisig.transaction_index
+    );
     println!();
 
-    // Fetch data for indices 1 and 2
-    for tx_index in 1..=2u64 {
-        if tx_index > multisig.transaction_index {
-            println!(
-                "Transaction index {} not yet created (current max: {})",
-                tx_index, multisig.transaction_index
-            );
-            continue;
-        }
+    // Fetch data for all transactions
+    for tx_index in 1..=multisig.transaction_index {
 
         println!(
             "{}",
@@ -373,6 +369,12 @@ async fn fetch_and_display_transactions_and_proposals(
     Ok(())
 }
 
+/// Enum to hold either transaction type
+enum TransactionType {
+    Vault(VaultTransaction),
+    Config(ConfigTransaction),
+}
+
 async fn fetch_and_display_transaction(
     rpc_client: &RpcClient,
     transaction_pda: &Pubkey,
@@ -397,16 +399,99 @@ async fn fetch_and_display_transaction(
         return Ok(());
     }
 
-    // Deserialize the VaultTransaction
-    let transaction: VaultTransaction =
-        match borsh::BorshDeserialize::deserialize(&mut &account_data[8..]) {
-            Ok(tx) => tx,
-            Err(e) => {
-                println!("  ❌ Failed to deserialize transaction: {}", e);
-                return Ok(());
-            }
-        };
+    // Try to deserialize as VaultTransaction first, then ConfigTransaction
+    let transaction: TransactionType = if let Ok(vault_tx) =
+        borsh::BorshDeserialize::deserialize(&mut &account_data[8..])
+    {
+        TransactionType::Vault(vault_tx)
+    } else if let Ok(config_tx) = borsh::BorshDeserialize::deserialize(&mut &account_data[8..]) {
+        TransactionType::Config(config_tx)
+    } else {
+        println!("  ❌ Failed to deserialize transaction (neither Vault nor Config type)");
+        return Ok(());
+    };
 
+    match transaction {
+        TransactionType::Vault(transaction) => {
+            display_vault_transaction(&transaction, tx_index);
+        }
+        TransactionType::Config(transaction) => {
+            display_config_transaction(&transaction, tx_index);
+        }
+    }
+
+    Ok(())
+}
+
+fn display_config_transaction(transaction: &ConfigTransaction, tx_index: u64) {
+    #[derive(Tabled)]
+    struct TransactionInfo {
+        #[tabled(rename = "Property")]
+        property: String,
+        #[tabled(rename = "Value")]
+        value: String,
+    }
+
+    let tx_info = vec![
+        TransactionInfo {
+            property: "Type".to_string(),
+            value: "Config Transaction".to_string(),
+        },
+        TransactionInfo {
+            property: "Index".to_string(),
+            value: transaction.index.to_string(),
+        },
+        TransactionInfo {
+            property: "Creator".to_string(),
+            value: transaction.creator.to_string(),
+        },
+        TransactionInfo {
+            property: "Multisig".to_string(),
+            value: transaction.multisig.to_string(),
+        },
+        TransactionInfo {
+            property: "Account Bump".to_string(),
+            value: transaction.bump.to_string(),
+        },
+        TransactionInfo {
+            property: "Actions".to_string(),
+            value: transaction.actions.len().to_string(),
+        },
+    ];
+
+    let mut tx_table = Table::new(tx_info);
+    tx_table.with(Style::rounded());
+    println!("{}", tx_table);
+
+    // Display config actions
+    if !transaction.actions.is_empty() {
+        println!();
+        println!("📋 Config Actions:");
+
+        for (i, action) in transaction.actions.iter().enumerate() {
+            let action_desc = match action {
+                ConfigAction::AddMember { new_member } => {
+                    format!(
+                        "Add Member: {} (permissions: {})",
+                        new_member.key, new_member.permissions.mask
+                    )
+                }
+                ConfigAction::RemoveMember { old_member } => {
+                    format!("Remove Member: {}", old_member)
+                }
+                ConfigAction::ChangeThreshold { new_threshold } => {
+                    format!("Change Threshold to: {}", new_threshold)
+                }
+            };
+            println!("  {}. {}", i + 1, action_desc.bright_white());
+        }
+    }
+
+    println!("  ✅ Transaction {} details retrieved", tx_index);
+    println!();
+}
+
+fn display_vault_transaction(transaction: &VaultTransaction, tx_index: u64) {
     // Display transaction details in a table
     #[derive(Tabled)]
     struct TransactionInfo {
@@ -639,8 +724,6 @@ async fn fetch_and_display_transaction(
 
     println!("  ✅ Transaction {} details retrieved", tx_index);
     println!();
-
-    Ok(())
 }
 
 async fn fetch_and_display_proposal(
