@@ -125,6 +125,15 @@ pub struct VaultTransaction {
     pub message: VaultTransactionMessage,
 }
 
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct ConfigTransaction {
+    pub multisig: Pubkey,
+    pub creator: Pubkey,
+    pub index: u64,
+    pub bump: u8,
+    pub actions: Vec<ConfigAction>,
+}
+
 impl VaultTransactionMessage {
     /// Returns true if the account at the specified index is a part of static `account_keys` and was requested to be writable.
     pub fn is_static_writable_index(&self, key_index: usize) -> bool {

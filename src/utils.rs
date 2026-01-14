@@ -12,10 +12,14 @@ use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
+
+/// Default config file name for local project config
+const CONFIG_FILE_NAME: &str = "config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -63,20 +67,22 @@ pub fn get_network_display(rpc_url: &str) -> &'static str {
 }
 
 // Config management functions
+
+/// Returns the path to the local config file in the current working directory.
+/// The config file is named `feature-gate-multisig.json` and is stored in the
+/// directory where the tool is run from.
 pub fn get_config_path() -> Result<PathBuf> {
-    let home_dir = dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
-    Ok(home_dir
-        .join(".feature-gate-multisig-tool")
-        .join("config.json"))
+    let current_dir =
+        env::current_dir().map_err(|e| eyre::eyre!("Could not get current directory: {}", e))?;
+    Ok(current_dir.join(CONFIG_FILE_NAME))
 }
 
 pub fn load_config() -> Result<Config> {
     let config_path = get_config_path()?;
 
     if !config_path.exists() {
-        let config = Config::default();
-        save_config(&config)?;
-        return Ok(config);
+        // Return default config without saving - let user explicitly save when they want to
+        return Ok(Config::default());
     }
 
     let config_str = fs::read_to_string(&config_path)
@@ -90,11 +96,6 @@ pub fn load_config() -> Result<Config> {
 
 pub fn save_config(config: &Config) -> Result<()> {
     let config_path = get_config_path()?;
-
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| eyre::eyre!("Failed to create config directory: {}", e))?;
-    }
 
     let config_str = serde_json::to_string_pretty(config)
         .map_err(|e| eyre::eyre!("Failed to serialize config: {}", e))?;
@@ -361,7 +362,9 @@ pub fn create_child_vote_reject_transaction_message(
 }
 
 // Transaction creation functions
-pub fn create_feature_activation_transaction_message(feature_id: Pubkey) -> Result<TransactionMessage> {
+pub fn create_feature_activation_transaction_message(
+    feature_id: Pubkey,
+) -> Result<TransactionMessage> {
     // Build activation flow without any funding transfer: allocate + assign only.
     let instructions = activate_feature_funded(&feature_id);
 
@@ -477,10 +480,7 @@ pub async fn create_and_send_paired_proposals(
         solana_instruction::AccountMeta::new(config_transaction_pda, false),
         solana_instruction::AccountMeta::new_readonly(contributor_pubkey, true),
         solana_instruction::AccountMeta::new(fee_payer_pubkey, true),
-        solana_instruction::AccountMeta::new_readonly(
-            solana_system_interface::program::ID,
-            false,
-        ),
+        solana_instruction::AccountMeta::new_readonly(solana_system_interface::program::ID, false),
     ];
 
     let config_create_transaction_data = ConfigTransactionCreateData {
@@ -711,7 +711,6 @@ pub fn validate_rpc_url(url: &str) -> Result<String> {
 
     Ok(url.to_string())
 }
-
 
 pub fn choose_network_from_config(config: &Config) -> Result<String> {
     let available_networks = if !config.networks.is_empty() {

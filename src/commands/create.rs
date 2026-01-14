@@ -283,93 +283,102 @@ fn print_deployment_summary(
         return;
     }
 
+    // All deployments share the same multisig/vault addresses, so use the first one
+    let deployment = &deployments[0];
+
     println!("");
     Output::header("👀 Deployment Complete");
 
-    for deployment in deployments {
-        // Feature Gate ID is the vault address (index 0)
-        let feature_gate_id = deployment.vault_address;
-
-        // Calculate proposal PDAs for the 2 pre-created proposals
-        let activation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 1, None).0;
-        let lower_threshold_proposal_pda =
-            get_proposal_pda(&deployment.multisig_address, 2, None).0;
-
-        println!("\n{}", "⚙️ General Info".bright_white().bold());
+    // Show which networks were deployed to
+    if deployments.len() > 1 {
         println!();
-        Output::field(
-            "Feature Gate Multisig",
-            &deployment.multisig_address.to_string(),
-        );
-        Output::field("Feature Gate ID", &feature_gate_id.to_string());
-
-        println!("\n{}", "⚙️ Config Parameters".bright_white().bold());
-        println!();
-        Output::field("Members", &members.len().to_string());
-
-        // Display members with their permissions
-        for (i, member) in members.iter().enumerate() {
-            let perms = decode_permissions(member.permissions.mask);
-            let role_indicator = if member.permissions.mask == 1 {
-                " (Contributor)"
-            } else {
-                ""
-            };
-            let member_display = format!(
-                "{}{} ({})",
-                member.key.to_string(),
-                role_indicator,
-                perms.join(", ")
-            );
-            let member_label = if member.permissions.mask == 1 {
-                "Temporary Setup Keypair".to_string()
-            } else {
-                format!("Member {}", i + 1)
-            };
+        Output::field("Networks deployed", &deployments.len().to_string());
+        for d in deployments {
             println!(
-                "  {} {}: {}",
+                "  {} {}",
                 "✓".bright_green(),
-                member_label,
-                member_display.bright_white()
+                get_network_display(&d.rpc_url).bright_white()
             );
-        }
-        println!();
-        Output::field("Threshold", &threshold.to_string());
-
-        println!("\n{}", "⚙️ Pre-Created Proposals".bright_white().bold());
-        println!();
-        println!(
-            "  {} Index 1: {}",
-            "🔹".bright_cyan(),
-            "Activation".bright_white().bold()
-        );
-        println!(
-            "     Address: {}",
-            activation_proposal_pda.to_string().bright_green()
-        );
-        println!("     Type: Vault Transaction");
-        println!("     Requires: {}/{} approvals", threshold, threshold);
-        println!();
-
-        println!(
-            "  {} Index 2: {}",
-            "🔹".bright_cyan(),
-            "Lower Threshold".bright_white().bold()
-        );
-        println!(
-            "     Address: {}",
-            lower_threshold_proposal_pda.to_string().bright_green()
-        );
-        println!("     Type: Config Transaction");
-        println!("     Requires: {}/{} approvals", threshold, threshold);
-        println!(
-            "     {}: Execute BEFORE revocation to enable 1-approval emergency revocation",
-            "Note".yellow()
-        );
-        println!();
-
-        if deployments.len() > 1 {
-            println!("\n{}", "─".repeat(50).bright_cyan());
         }
     }
+
+    // Feature Gate ID is the vault address (index 0)
+    let feature_gate_id = deployment.vault_address;
+
+    // Calculate proposal PDAs for the 2 pre-created proposals
+    let activation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 1, None).0;
+    let lower_threshold_proposal_pda = get_proposal_pda(&deployment.multisig_address, 2, None).0;
+
+    println!("\n{}", "⚙️ General Info".bright_white().bold());
+    println!();
+    Output::field(
+        "Feature Gate Multisig",
+        &deployment.multisig_address.to_string(),
+    );
+    Output::field("Feature Gate ID", &feature_gate_id.to_string());
+
+    println!("\n{}", "⚙️ Config Parameters".bright_white().bold());
+    println!();
+    Output::field("Members", &members.len().to_string());
+
+    // Display members with their permissions
+    for (i, member) in members.iter().enumerate() {
+        let perms = decode_permissions(member.permissions.mask);
+        let role_indicator = if member.permissions.mask == 1 {
+            " (Contributor)"
+        } else {
+            ""
+        };
+        let member_display = format!(
+            "{}{} ({})",
+            member.key.to_string(),
+            role_indicator,
+            perms.join(", ")
+        );
+        let member_label = if member.permissions.mask == 1 {
+            "Temporary Setup Keypair".to_string()
+        } else {
+            format!("Member {}", i + 1)
+        };
+        println!(
+            "  {} {}: {}",
+            "✓".bright_green(),
+            member_label,
+            member_display.bright_white()
+        );
+    }
+    println!();
+    Output::field("Threshold", &threshold.to_string());
+
+    println!("\n{}", "⚙️ Pre-Created Proposals".bright_white().bold());
+    println!();
+    println!(
+        "  {} Index 1: {}",
+        "🔹".bright_cyan(),
+        "Activation".bright_white().bold()
+    );
+    println!(
+        "     Address: {}",
+        activation_proposal_pda.to_string().bright_green()
+    );
+    println!("     Type: Vault Transaction");
+    println!("     Requires: {}/{} approvals", threshold, threshold);
+    println!();
+
+    println!(
+        "  {} Index 2: {}",
+        "🔹".bright_cyan(),
+        "Lower Threshold".bright_white().bold()
+    );
+    println!(
+        "     Address: {}",
+        lower_threshold_proposal_pda.to_string().bright_green()
+    );
+    println!("     Type: Config Transaction");
+    println!("     Requires: {}/{} approvals", threshold, threshold);
+    println!(
+        "     {}: Execute BEFORE revocation to enable 1-approval emergency revocation",
+        "Note".yellow()
+    );
+    println!();
 }
