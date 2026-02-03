@@ -1317,19 +1317,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dialoguer"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "658bce805d770f407bc62102fca7c2c64ceef2fbcb2b8bd19d2765ce093980de"
-dependencies = [
- "console",
- "shell-words",
- "tempfile",
- "thiserror 1.0.69",
- "zeroize",
-]
-
-[[package]]
 name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1620,7 +1607,6 @@ dependencies = [
  "borsh 1.5.7",
  "clap 4.5.47",
  "colored",
- "dialoguer 0.11.0",
  "dirs",
  "eyre",
  "indicatif",
@@ -1639,7 +1625,6 @@ dependencies = [
  "solana-program",
  "solana-program-test",
  "solana-pubkey",
- "solana-rent",
  "solana-sdk",
  "solana-signer",
  "solana-system-interface",
@@ -5948,7 +5933,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34ce3c0d279796f7c590ea4ffd7bd66d49c79e2ba963fad0bbf3d72306af9633"
 dependencies = [
  "console",
- "dialoguer 0.10.4",
+ "dialoguer",
  "hidapi",
  "log",
  "num-derive",

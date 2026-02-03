@@ -14,7 +14,7 @@ use crate::squads::{
 use crate::utils::{decode_permissions, get_network_display};
 use borsh::BorshDeserialize;
 use colored::Colorize;
-use dialoguer::Confirm;
+use inquire::Confirm;
 use eyre::eyre;
 use indicatif::ProgressBar;
 use solana_client::client_error::ClientErrorKind;
@@ -485,10 +485,9 @@ pub async fn create_multisig(
     let proceed = if std::env::var("E2E_TEST_MODE").is_ok() {
         true
     } else {
-        Confirm::new()
-            .with_prompt("Do you want to proceed?")
-            .default(true)
-            .interact()?
+        Confirm::new("Do you want to proceed?")
+            .with_default(true)
+            .prompt()?
     };
     if !proceed {
         println!("{}", "OK, aborting.".bright_red());
