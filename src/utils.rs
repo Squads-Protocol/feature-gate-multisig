@@ -1,23 +1,25 @@
 use crate::constants::*;
 use crate::feature_gate_program::activate_feature_funded;
-use crate::provision::create_rpc_client;
-use crate::squads::{get_vault_pda, CompiledInstruction, Member, Permissions, TransactionMessage};
+use crate::provision::{build_squads_transaction_message, create_rpc_client};
+use crate::squads::{Member, Permissions, TransactionMessage};
 use colored::*;
 use dirs;
 use eyre::Result;
 use indicatif::ProgressBar;
 use inquire::{Confirm, Select, Text};
 use serde::{Deserialize, Serialize};
-use solana_keypair::Keypair;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
-use solana_signer::{EncodableKey, Signer};
+use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
-use std::fmt::Display;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
+
+/// Default config file name for local project config
+const CONFIG_FILE_NAME: &str = "config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -43,33 +45,50 @@ impl Default for Config {
 
 #[derive(Debug)]
 pub struct DeploymentResult {
+    #[allow(dead_code)]
     pub rpc_url: String,
     pub multisig_address: Pubkey,
     pub vault_address: Pubkey,
+    #[allow(dead_code)]
     pub transaction_signature: String,
 }
 
+/// Returns a human-readable network name based on the RPC URL.
+pub fn get_network_display(rpc_url: &str) -> &'static str {
+    if rpc_url.contains("devnet") {
+        "Devnet"
+    } else if rpc_url.contains("mainnet") {
+        "Mainnet"
+    } else if rpc_url.contains("testnet") {
+        "Testnet"
+    } else {
+        "Custom"
+    }
+}
+
 // Config management functions
+
+/// Returns the path to the local config file in the current working directory.
+/// The config file is named `feature-gate-multisig.json` and is stored in the
+/// directory where the tool is run from.
 pub fn get_config_path() -> Result<PathBuf> {
-    let home_dir = dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
-    Ok(home_dir
-        .join(".feature-gate-multisig-tool")
-        .join("config.json"))
+    let current_dir =
+        env::current_dir().map_err(|e| eyre::eyre!("Could not get current directory: {}", e))?;
+    Ok(current_dir.join(CONFIG_FILE_NAME))
 }
 
 pub fn load_config() -> Result<Config> {
     let config_path = get_config_path()?;
 
     if !config_path.exists() {
-        let config = Config::default();
-        save_config(&config)?;
-        return Ok(config);
+        // Return default config without saving - let user explicitly save when they want to
+        return Ok(Config::default());
     }
 
     let config_str = fs::read_to_string(&config_path)
         .map_err(|e| eyre::eyre!("Failed to read config file: {}", e))?;
 
-    let mut config: Config = serde_json::from_str(&config_str)
+    let config: Config = serde_json::from_str(&config_str)
         .map_err(|e| eyre::eyre!("Failed to parse config file: {}", e))?;
 
     Ok(config)
@@ -77,11 +96,6 @@ pub fn load_config() -> Result<Config> {
 
 pub fn save_config(config: &Config) -> Result<()> {
     let config_path = get_config_path()?;
-
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| eyre::eyre!("Failed to create config directory: {}", e))?;
-    }
 
     let config_str = serde_json::to_string_pretty(config)
         .map_err(|e| eyre::eyre!("Failed to serialize config: {}", e))?;
@@ -113,14 +127,6 @@ pub fn parse_saved_members(config: &Config) -> Vec<Member> {
         }
     }
     parsed_members
-}
-
-pub fn parse_saved_threshold(config: &Config) -> Option<u16> {
-    if config.threshold > 0 {
-        Some(config.threshold)
-    } else {
-        None
-    }
 }
 
 pub fn collect_members_interactively() -> Result<Vec<Member>> {
@@ -212,49 +218,6 @@ pub fn expand_tilde_path(path: &str) -> Result<String> {
     }
 }
 
-pub fn load_fee_payer_keypair(
-    config: &Config,
-    keypair_path: Option<String>,
-) -> Result<Option<Keypair>> {
-    if let Some(path) = keypair_path {
-        let keypair = Keypair::read_from_file(&path)
-            .map_err(|e| eyre::eyre!("Failed to load keypair from {}: {}", path, e))?;
-        Ok(Some(keypair))
-    } else if let Some(path) = &config.fee_payer_path {
-        println!(
-            "{} Loading fee payer keypair from config: {}",
-            "💰".bright_blue(),
-            path.bright_white()
-        );
-        let keypair = Keypair::read_from_file(path)
-            .map_err(|e| eyre::eyre!("Failed to load keypair from config path {}: {}", path, e))?;
-        Ok(Some(keypair))
-    } else {
-        println!("{} No fee payer keypair provided", "⚠️".bright_yellow());
-        Ok(None)
-    }
-}
-
-// CLI input helpers
-pub fn prompt_for_threshold(config: &Config) -> Result<u16> {
-    loop {
-        let input = Text::new(&format!(
-            "Enter threshold (required signatures) [{}]:",
-            config.threshold
-        ))
-        .prompt()
-        .unwrap_or_default();
-
-        match validate_threshold(&input, 10, config.threshold) {
-            Ok(t) => return Ok(t),
-            Err(e) => {
-                println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
-                continue;
-            }
-        }
-    }
-}
-
 pub fn prompt_for_threshold_with_max(max_members: usize) -> Result<u16> {
     loop {
         let input = Text::new(&format!(
@@ -319,71 +282,6 @@ pub fn prompt_for_network(config: &Config) -> Result<String> {
     }
 }
 
-// Display functions
-pub fn display_final_configuration(
-    contributor_pubkey: &Pubkey,
-    create_key: &Pubkey,
-    fee_payer_keypair: &Option<Keypair>,
-    threshold: u16,
-    members: &[Member],
-) {
-    println!("\n{}", "📋 Final Configuration:".bright_yellow().bold());
-    println!(
-        "  {}: {}",
-        "Contributor public key".cyan(),
-        contributor_pubkey.to_string().bright_white()
-    );
-    println!(
-        "  {}: {}",
-        "Create key".cyan(),
-        create_key.to_string().bright_white()
-    );
-    if let Some(fee_payer) = fee_payer_keypair {
-        println!(
-            "  {}: {}",
-            "Fee payer".cyan(),
-            fee_payer.pubkey().to_string().bright_green()
-        );
-    } else {
-        println!(
-            "  {}: {} (same as contributor)",
-            "Fee payer".cyan(),
-            contributor_pubkey.to_string().bright_yellow()
-        );
-    }
-    println!(
-        "  {}: {}",
-        "Threshold".cyan(),
-        threshold.to_string().bright_green()
-    );
-
-    println!("\n{}", "👥 All Members:".bright_yellow().bold());
-    println!(
-        "  {} Contributor: {} ({})",
-        "✓".bright_green(),
-        contributor_pubkey.to_string().bright_white(),
-        "Initiate".bright_cyan()
-    );
-
-    for (i, member) in members.iter().skip(1).enumerate() {
-        let perms = decode_permissions(member.permissions.mask);
-        println!(
-            "  {} Member {}: {} ({})",
-            "✓".bright_green(),
-            i + 1,
-            member.key.to_string().bright_white(),
-            perms.join(", ").bright_cyan()
-        );
-    }
-
-    println!(
-        "\n{} {}",
-        "📊 Total members:".bright_yellow().bold(),
-        members.len().to_string().bright_green()
-    );
-    println!();
-}
-
 /// Build a TransactionMessage for a parent multisig to approve a child's proposal.
 /// This creates a single instruction that calls Squads `ApproveProposal` on the child multisig,
 /// with `member_pubkey` set to the parent multisig address. The resulting TransactionMessage can
@@ -392,10 +290,10 @@ pub fn create_child_vote_approve_transaction_message(
     child_multisig: Pubkey,
     child_tx_index: u64,
     parent_member_pubkey: Pubkey,
-) -> TransactionMessage {
+) -> Result<TransactionMessage> {
     use crate::squads::{
-        get_proposal_pda, MultisigApproveProposalData, MultisigVoteOnProposalAccounts,
-        MultisigVoteOnProposalArgs, SmallVec, SQUADS_MULTISIG_PROGRAM_ID,
+        get_proposal_pda, InstructionData, MultisigApproveProposalData,
+        MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs, SQUADS_MULTISIG_PROGRAM_ID,
     };
     use solana_instruction::Instruction;
 
@@ -418,265 +316,92 @@ pub fn create_child_vote_approve_transaction_message(
 
     let ix = Instruction::new_with_bytes(
         SQUADS_MULTISIG_PROGRAM_ID,
-        &data.data(),
+        &data.data()?,
         accounts.to_account_metas(),
     );
 
-    // Compile to our TransactionMessage format
-    // Order matters for writability: after signer(s), the first `num_writable_non_signers`
-    // are considered writable. We need the child proposal to be writable for Approve.
-    let mut account_keys = vec![
-        parent_member_pubkey,       // 0: signer (parent vault PDA)
-        proposal_pda,               // 1: non-signer (writable)
-        child_multisig,             // 2: non-signer (readonly)
-        SQUADS_MULTISIG_PROGRAM_ID, // 3: program id
-    ];
-
-    // program_id_index for instruction
-    let program_id_index = account_keys
-        .iter()
-        .position(|k| *k == ix.program_id)
-        .unwrap_or_else(|| {
-            account_keys.push(ix.program_id);
-            account_keys.len() - 1
-        }) as u8;
-
-    // Map metas to indices
-    let account_indexes: Vec<u8> = ix
-        .accounts
-        .iter()
-        .map(|meta| {
-            account_keys
-                .iter()
-                .position(|k| *k == meta.pubkey)
-                .unwrap_or_else(|| {
-                    account_keys.push(meta.pubkey);
-                    account_keys.len() - 1
-                }) as u8
-        })
-        .collect();
-
-    let compiled = crate::squads::CompiledInstruction {
-        program_id_index,
-        account_indexes: SmallVec::from(account_indexes),
-        data: SmallVec::from(ix.data),
-    };
-
-    TransactionMessage {
-        // The first key (parent member) is a signer and writable, matching the child instruction metas
-        num_signers: 1,
-        num_writable_signers: 1,
-        // Mark the first non-signer (the proposal) as writable to satisfy Anchor's mut constraint
-        num_writable_non_signers: 1,
-        account_keys: SmallVec::from(account_keys),
-        instructions: SmallVec::from(vec![compiled]),
-        address_table_lookups: SmallVec::from(vec![]),
-    }
+    // Use centralized helper - parent_member_pubkey is the signer (vault PDA)
+    build_squads_transaction_message(&[ix], &parent_member_pubkey)
 }
 
-pub fn display_deployment_info(
-    network_index: usize,
-    total_networks: usize,
-    rpc_url: &str,
-    create_key: &Pubkey,
-    contributor_pubkey: &Pubkey,
-    multisig_address: &Pubkey,
-    vault_address: &Pubkey,
-    members: &[Member],
-) {
-    if total_networks > 1 {
-        println!(
-            "\n{} Deployment {} of {} to: {}",
-            "📡".bright_blue(),
-            (network_index + 1).to_string().bright_green(),
-            total_networks.to_string().bright_green(),
-            rpc_url.bright_white()
-        );
-    } else {
-        println!(
-            "\n{} {}",
-            "🌐 Deploying to:".bright_blue().bold(),
-            rpc_url.bright_white()
-        );
-    }
+/// Build a TransactionMessage for a parent multisig to reject a child's proposal.
+pub fn create_child_vote_reject_transaction_message(
+    child_multisig: Pubkey,
+    child_tx_index: u64,
+    parent_member_pubkey: Pubkey,
+) -> Result<TransactionMessage> {
+    use crate::squads::{
+        get_proposal_pda, InstructionData, MultisigRejectProposalData,
+        MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs, SQUADS_MULTISIG_PROGRAM_ID,
+    };
+    use solana_instruction::Instruction;
 
-    println!(
-        "{}",
-        "📦 All public keys for this deployment:"
-            .bright_yellow()
-            .bold()
+    let (proposal_pda, _bump) = get_proposal_pda(
+        &child_multisig,
+        child_tx_index,
+        Some(&SQUADS_MULTISIG_PROGRAM_ID),
     );
 
-    println!(
-        "  {}: {}",
-        "Create key".cyan(),
-        create_key.to_string().bright_white()
-    );
-    println!(
-        "  {}: {}",
-        "Contributor".cyan(),
-        contributor_pubkey.to_string().bright_white()
-    );
-    println!(
-        "  {}: {}",
-        "Multisig PDA".cyan(),
-        multisig_address.to_string().bright_green()
-    );
-    println!(
-        "  {}: {}",
-        "Vault PDA (index 0)".cyan(),
-        vault_address.to_string().bright_green()
+    let accounts = MultisigVoteOnProposalAccounts {
+        multisig: child_multisig,
+        member: parent_member_pubkey,
+        proposal: proposal_pda,
+    };
+    let data = MultisigRejectProposalData {
+        args: MultisigVoteOnProposalArgs { memo: None },
+    };
+
+    let ix = Instruction::new_with_bytes(
+        SQUADS_MULTISIG_PROGRAM_ID,
+        &data.data()?,
+        accounts.to_account_metas(),
     );
 
-    for (i, member) in members.iter().enumerate() {
-        let perms = decode_permissions(member.permissions.mask);
-        let label = if member.key == *contributor_pubkey {
-            "Contributor".to_string()
-        } else {
-            format!("Member {}", i)
-        };
-        println!(
-            "  {}: {} ({})",
-            label.cyan(),
-            member.key.to_string().bright_white(),
-            perms.join(", ").bright_cyan()
-        );
-    }
-    println!();
+    // Use centralized helper - parent_member_pubkey is the signer (vault PDA)
+    build_squads_transaction_message(&[ix], &parent_member_pubkey)
 }
 
 // Transaction creation functions
-pub fn create_feature_activation_transaction_message(feature_id: Pubkey) -> TransactionMessage {
-    use crate::squads::SmallVec;
-
+pub fn create_feature_activation_transaction_message(
+    feature_id: Pubkey,
+) -> Result<TransactionMessage> {
     // Build activation flow without any funding transfer: allocate + assign only.
     let instructions = activate_feature_funded(&feature_id);
 
-    // Account keys: feature signer first, then programs
-    let mut account_keys: Vec<Pubkey> = Vec::with_capacity(3);
-    account_keys.push(feature_id); // signer, writable
-    account_keys.push(solana_system_interface::program::ID);
-    account_keys.push(crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID);
-
-    // Compile instructions into CompiledInstructions with SmallVec
-    let mut compiled_instructions = Vec::new();
-
-    for instruction in instructions {
-        // Find program_id index in account_keys
-        let program_id_index = account_keys
-            .iter()
-            .position(|key| *key == instruction.program_id)
-            .unwrap_or_else(|| {
-                account_keys.push(instruction.program_id);
-                account_keys.len() - 1
-            }) as u8;
-
-        // Map account pubkeys to indices
-        let account_indexes: Vec<u8> = instruction
-            .accounts
-            .iter()
-            .map(|account_meta| {
-                account_keys
-                    .iter()
-                    .position(|key| *key == account_meta.pubkey)
-                    .unwrap_or_else(|| {
-                        account_keys.push(account_meta.pubkey);
-                        account_keys.len() - 1
-                    }) as u8
-            })
-            .collect();
-
-        compiled_instructions.push(CompiledInstruction {
-            program_id_index,
-            account_indexes: SmallVec::from(account_indexes),
-            data: SmallVec::from(instruction.data),
-        });
-    }
-
-    TransactionMessage {
-        num_signers: 1,
-        num_writable_signers: 1,
-        num_writable_non_signers: 0,
-        account_keys: SmallVec::from(account_keys),
-        instructions: SmallVec::from(compiled_instructions),
-        address_table_lookups: SmallVec::from(vec![]),
-    }
+    // Use centralized helper - feature_id is the signer (vault PDA)
+    build_squads_transaction_message(&instructions, &feature_id)
 }
 
-pub fn create_feature_revocation_transaction_message(feature_id: Pubkey) -> TransactionMessage {
-    use crate::squads::SmallVec;
-
-    // Create feature revocation instruction
-    let instruction = crate::feature_gate_program::revoke_pending_activation(&feature_id);
-
-    // Build account keys list for the message
-    let mut account_keys = vec![
-        feature_id,                                  // 0: Feature account (signer, writable)
-        crate::feature_gate_program::INCINERATOR_ID, // 1: Incinerator (writable)
-        solana_system_interface::program::ID,        // 2: System program
-        crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID, // 3: Feature gate program
-    ];
-
-    // Find program_id index in account_keys
-    let program_id_index = account_keys
-        .iter()
-        .position(|key| *key == instruction.program_id)
-        .unwrap_or_else(|| {
-            account_keys.push(instruction.program_id);
-            account_keys.len() - 1
-        }) as u8;
-
-    // Map account pubkeys to indices
-    let account_indexes: Vec<u8> = instruction
-        .accounts
-        .iter()
-        .map(|account_meta| {
-            account_keys
-                .iter()
-                .position(|key| *key == account_meta.pubkey)
-                .unwrap_or_else(|| {
-                    account_keys.push(account_meta.pubkey);
-                    account_keys.len() - 1
-                }) as u8
-        })
-        .collect();
-
-    let compiled_instructions = vec![CompiledInstruction {
-        program_id_index,
-        account_indexes: SmallVec::from(account_indexes),
-        data: SmallVec::from(instruction.data),
-    }];
-
-    TransactionMessage {
-        num_signers: 1,              // feature_id is the signer
-        num_writable_signers: 1,     // feature_id is writable signer
-        num_writable_non_signers: 1, // incinerator is writable non-signer
-        account_keys: SmallVec::from(account_keys),
-        instructions: SmallVec::from(compiled_instructions),
-        address_table_lookups: SmallVec::from(vec![]),
-    }
-}
-
-pub async fn create_and_send_transaction_proposal(
+/// Create and send PAIRED proposals (vault + config) in a single atomic transaction.
+/// This creates 4 instructions (no compute budget instructions to minimize transaction size):
+/// 1. VaultTransactionCreate (for activate/revoke)
+/// 2. ProposalCreate (for vault transaction)
+/// 3. ConfigTransactionCreate (for threshold change)
+/// 4. ProposalCreate (for config transaction)
+///
+/// Both proposals are created atomically - either both succeed or both fail.
+/// Note: Compute budget instructions are excluded to reduce transaction size.
+pub async fn create_and_send_paired_proposals(
     rpc_url: &str,
     fee_payer_signer: &Box<dyn Signer>,
-    contributor_keypair: &Keypair,
+    contributor_signer: &dyn Signer,
     multisig_address: &Pubkey,
-    transaction_type: &str,
-    transaction_index: u64,
+    vault_tx_index: u64,
+    config_tx_index: u64,
+    vault_message: crate::squads::TransactionMessage,
+    config_actions: Vec<crate::squads::ConfigAction>,
+    config_memo: Option<String>,
 ) -> Result<()> {
-    let vault_address = get_vault_pda(multisig_address, 0, None).0;
-
-    let transaction_message = match transaction_type {
-        "activation" => create_feature_activation_transaction_message(vault_address),
-        "revocation" => create_feature_revocation_transaction_message(vault_address),
-        _ => {
-            return Err(eyre::eyre!(
-                "Invalid transaction type: {}",
-                transaction_type
-            ))
-        }
+    use crate::squads::{
+        get_proposal_pda, get_transaction_pda, ConfigTransactionCreateArgs,
+        ConfigTransactionCreateData, InstructionData, MultisigCreateProposalAccounts,
+        MultisigCreateProposalArgs, MultisigCreateProposalData, MultisigCreateTransaction,
+        VaultTransactionCreateArgs, VaultTransactionCreateArgsData, SQUADS_MULTISIG_PROGRAM_ID,
     };
+    use solana_instruction::Instruction;
+    use solana_message::v0::Message;
+    use solana_message::VersionedMessage;
+    use solana_transaction::versioned::VersionedTransaction;
 
     let rpc_client = create_rpc_client(rpc_url);
     let recent_blockhash = rpc_client
@@ -684,61 +409,144 @@ pub async fn create_and_send_transaction_proposal(
         .map_err(|e| eyre::eyre!("Failed to get recent blockhash: {}", e))?;
 
     let fee_payer_pubkey = fee_payer_signer.pubkey();
+    let contributor_pubkey = contributor_signer.pubkey();
+    let program_id = &SQUADS_MULTISIG_PROGRAM_ID;
 
-    // Use the integrated create_transaction_and_proposal_message function from provision.rs
-    let (message, _transaction_pda, _proposal_pda) =
-        crate::provision::create_transaction_and_proposal_message(
-            None, // Use default program ID
-            &fee_payer_pubkey,
-            &contributor_keypair.pubkey(),
-            multisig_address,
-            transaction_index,
-            0, // Vault index 0 (default vault for feature gates)
-            transaction_message,
-            Some(5000),                  // Priority fee
-            Some(DEFAULT_COMPUTE_UNITS), // Compute unit limit
-            recent_blockhash,
-        )
-        .map_err(|e| eyre::eyre!("Failed to create transaction and proposal message: {}", e))?;
+    // Calculate PDAs for both transaction/proposal pairs
+    let (vault_transaction_pda, _) =
+        get_transaction_pda(multisig_address, vault_tx_index, Some(program_id));
+    let (vault_proposal_pda, _) =
+        get_proposal_pda(multisig_address, vault_tx_index, Some(program_id));
+    let (config_transaction_pda, _) =
+        get_transaction_pda(multisig_address, config_tx_index, Some(program_id));
+    let (config_proposal_pda, _) =
+        get_proposal_pda(multisig_address, config_tx_index, Some(program_id));
 
-    let signers: &[&dyn Signer] = if fee_payer_pubkey == contributor_keypair.pubkey() {
-        &[contributor_keypair]
+    // Build instructions list
+    let mut instructions = Vec::new();
+
+    // 1. Create vault transaction instruction
+    let vault_create_transaction_accounts = MultisigCreateTransaction {
+        multisig: *multisig_address,
+        transaction: vault_transaction_pda,
+        creator: contributor_pubkey,
+        rent_payer: fee_payer_pubkey,
+        system_program: solana_system_interface::program::ID,
+    };
+
+    let vault_transaction_message_bytes = borsh::to_vec(&vault_message)?;
+    let vault_create_transaction_data = VaultTransactionCreateArgsData {
+        args: VaultTransactionCreateArgs {
+            vault_index: 0,
+            ephemeral_signers: 0,
+            transaction_message: vault_transaction_message_bytes,
+            memo: None,
+        },
+    };
+
+    let vault_create_transaction_instruction = Instruction::new_with_bytes(
+        *program_id,
+        &vault_create_transaction_data.data()?,
+        vault_create_transaction_accounts.to_account_metas(),
+    );
+    instructions.push(vault_create_transaction_instruction);
+
+    // 2. Create vault proposal instruction
+    let vault_create_proposal_accounts = MultisigCreateProposalAccounts {
+        multisig: *multisig_address,
+        proposal: vault_proposal_pda,
+        creator: contributor_pubkey,
+        rent_payer: fee_payer_pubkey,
+        system_program: solana_system_interface::program::ID,
+    };
+
+    let vault_create_proposal_data = MultisigCreateProposalData {
+        args: MultisigCreateProposalArgs {
+            transaction_index: vault_tx_index,
+            is_draft: false,
+        },
+    };
+
+    let vault_create_proposal_instruction = Instruction::new_with_bytes(
+        *program_id,
+        &vault_create_proposal_data.data()?,
+        vault_create_proposal_accounts.to_account_metas(),
+    );
+    instructions.push(vault_create_proposal_instruction);
+
+    // 3. Create config transaction instruction
+    let config_create_transaction_accounts = vec![
+        solana_instruction::AccountMeta::new(*multisig_address, false),
+        solana_instruction::AccountMeta::new(config_transaction_pda, false),
+        solana_instruction::AccountMeta::new_readonly(contributor_pubkey, true),
+        solana_instruction::AccountMeta::new(fee_payer_pubkey, true),
+        solana_instruction::AccountMeta::new_readonly(solana_system_interface::program::ID, false),
+    ];
+
+    let config_create_transaction_data = ConfigTransactionCreateData {
+        args: ConfigTransactionCreateArgs {
+            actions: config_actions,
+            memo: config_memo.clone(),
+        },
+    };
+
+    let config_create_transaction_instruction = Instruction::new_with_bytes(
+        *program_id,
+        &config_create_transaction_data.data()?,
+        config_create_transaction_accounts,
+    );
+    instructions.push(config_create_transaction_instruction);
+
+    // 4. Create config proposal instruction
+    let config_create_proposal_accounts = MultisigCreateProposalAccounts {
+        multisig: *multisig_address,
+        proposal: config_proposal_pda,
+        creator: contributor_pubkey,
+        rent_payer: fee_payer_pubkey,
+        system_program: solana_system_interface::program::ID,
+    };
+
+    let config_create_proposal_data = MultisigCreateProposalData {
+        args: MultisigCreateProposalArgs {
+            transaction_index: config_tx_index,
+            is_draft: false,
+        },
+    };
+
+    let config_create_proposal_instruction = Instruction::new_with_bytes(
+        *program_id,
+        &config_create_proposal_data.data()?,
+        config_create_proposal_accounts.to_account_metas(),
+    );
+    instructions.push(config_create_proposal_instruction);
+
+    // Create message with all instructions
+    let message = Message::try_compile(&fee_payer_pubkey, &instructions, &[], recent_blockhash)?;
+
+    // Sign the transaction
+    let signers: &[&dyn Signer] = if fee_payer_pubkey == contributor_pubkey {
+        &[contributor_signer]
     } else {
-        &[
-            fee_payer_signer.as_ref(),
-            contributor_keypair as &dyn Signer,
-        ]
+        &[fee_payer_signer.as_ref(), contributor_signer]
     };
 
     let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), signers)
         .map_err(|e| eyre::eyre!("Failed to create signed transaction: {}", e))?;
 
-    let progress = ProgressBar::new_spinner().with_message("Sending transaction...");
+    // Send the transaction
+    let progress = ProgressBar::new_spinner().with_message("Creating paired proposals...");
     progress.enable_steady_tick(Duration::from_millis(100));
 
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
-        .map_err(|e| eyre::eyre!("Failed to send transaction and proposal: {}", e))?;
+        .map_err(|e| eyre::eyre!("Failed to send paired proposals: {}", e))?;
 
-    // Simple signature output with description and network
-    let description = match transaction_type {
-        "activation" => "Feature Gate Activation Proposal Confirmed",
-        "revocation" => "Feature Gate Revocation Proposal Confirmed",
-        _ => "Transaction",
-    };
-
-    let network_display = if rpc_url.contains("devnet") {
-        "Devnet"
-    } else if rpc_url.contains("mainnet") {
-        "Mainnet"
-    } else if rpc_url.contains("testnet") {
-        "Testnet"
-    } else {
-        "Custom"
-    };
+    let network_display = get_network_display(rpc_url);
 
     progress.finish_with_message(format!(
-        "{} ({}): {}",
-        description,
+        "Paired Proposals Created ({}) - Vault Index: {}, Config Index: {}\nSignature ({}): {}",
+        network_display,
+        vault_tx_index,
+        config_tx_index,
         network_display,
         signature.to_string().bright_green()
     ));
@@ -904,35 +712,6 @@ pub fn validate_rpc_url(url: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TransactionEncoding {
-    #[serde(rename = "base58")]
-    Base58,
-    #[serde(rename = "base64")]
-    Base64,
-}
-
-impl Display for TransactionEncoding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                TransactionEncoding::Base58 => "base58",
-                TransactionEncoding::Base64 => "base64",
-            }
-        )
-    }
-}
-pub fn choose_transaction_encoding() -> Result<TransactionEncoding> {
-    let choice = Select::new(
-        "Transaction encoding format?",
-        vec![TransactionEncoding::Base58, TransactionEncoding::Base64],
-    )
-    .prompt()?;
-    Ok(choice)
-}
-
 pub fn choose_network_from_config(config: &Config) -> Result<String> {
     let available_networks = if !config.networks.is_empty() {
         config.networks.clone()
@@ -947,6 +726,12 @@ pub fn choose_network_from_config(config: &Config) -> Result<String> {
     if available_networks.is_empty() {
         return Err(eyre::eyre!("No networks available"));
     }
+
+    // Non-interactive mode for E2E tests
+    if std::env::var("E2E_TEST_MODE").is_ok() {
+        return Ok(available_networks[0].to_string());
+    }
+
     let choice = Select::new(
         "What network would you like to use for transaction generation?",
         available_networks,
@@ -975,15 +760,7 @@ pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(b
         available_networks.len().to_string().cyan()
     );
     for (i, network) in available_networks.iter().enumerate() {
-        let network_name = if network.contains("devnet") {
-            "Devnet"
-        } else if network.contains("testnet") {
-            "Testnet"
-        } else if network.contains("mainnet") {
-            "Mainnet"
-        } else {
-            "Custom"
-        };
+        let network_name = get_network_display(network);
         println!(
             "    {}: {} ({})",
             format!("Network {}", i + 1).cyan(),
@@ -991,9 +768,14 @@ pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(b
             network.bright_white()
         );
     }
-    let use_saved_networks = Confirm::new("Use saved networks for deployment?")
-        .with_default(true)
-        .prompt()?;
+    // Auto-confirm in E2E test mode
+    let use_saved_networks = if std::env::var("E2E_TEST_MODE").is_ok() {
+        true
+    } else {
+        Confirm::new("Use saved networks for deployment?")
+            .with_default(true)
+            .prompt()?
+    };
 
     Ok((use_saved_networks, available_networks))
 }
@@ -1063,9 +845,14 @@ pub fn review_config(config: &Config) -> Result<bool> {
     }
 
     println!();
-    let use_config = Confirm::new("Use these saved members and settings?")
-        .with_default(true)
-        .prompt()?;
+    // Auto-confirm in E2E test mode
+    let use_config = if std::env::var("E2E_TEST_MODE").is_ok() {
+        true
+    } else {
+        Confirm::new("Use these saved members and settings?")
+            .with_default(true)
+            .prompt()?
+    };
 
     Ok(use_config)
 }
@@ -1103,15 +890,7 @@ pub async fn check_fee_payer_balance_on_networks(
     let mut network_errors = Vec::new();
 
     for network in networks {
-        let network_display = if network.contains("devnet") {
-            "Devnet"
-        } else if network.contains("mainnet") {
-            "Mainnet"
-        } else if network.contains("testnet") {
-            "Testnet"
-        } else {
-            "Custom"
-        };
+        let network_display = get_network_display(network);
 
         // Create RPC client for this network
         let rpc_client = crate::provision::create_rpc_client(network);

@@ -14,6 +14,19 @@ pub async fn create_command(
     _sub_multisigs: Vec<String>,
     keypair_path: Option<String>,
 ) -> Result<()> {
+    // Keep existing behaviour, but discard returned deployments
+    let _ =
+        create_command_with_deployments(config, threshold, _sub_multisigs, keypair_path).await?;
+    Ok(())
+}
+
+/// Variant of `create_command` that returns deployment details (used by E2E tests).
+pub async fn create_command_with_deployments(
+    config: &mut Config,
+    threshold: Option<u16>,
+    _sub_multisigs: Vec<String>,
+    keypair_path: Option<String>,
+) -> Result<Vec<DeploymentResult>> {
     println!(
         "{}",
         "🚀 Creating feature gate multisig configuration"
@@ -48,15 +61,6 @@ pub async fn create_command(
             permissions: Permissions { mask: 1 },
         },
     );
-
-    // // Display final configuration
-    // display_final_configuration(
-    //     &contributor_pubkey,
-    //     &create_key.pubkey(),
-    //     &fee_payer_keypair,
-    //     final_threshold,
-    //     &members,
-    // );
 
     // Determine network deployment mode and deploy
     let (use_saved_networks, saved_networks) = choose_network_mode(config, true)?;
@@ -114,30 +118,17 @@ pub async fn create_command(
         );
     }
 
-    Ok(())
+    Ok(deployments)
 }
 
 async fn deploy_to_single_network(
     rpc_url: &str,
-    network_index: usize,
-    total_networks: usize,
     create_key: &Keypair,
     setup_keypair: &Keypair,
     fee_payer_signer: &Box<dyn Signer>,
     members: &[Member],
     threshold: u16,
 ) -> Result<DeploymentResult> {
-    // display_deployment_info(
-    //     network_index,
-    //     total_networks,
-    //     rpc_url,
-    //     &create_key.pubkey(),
-    //     &contributor_keypair.pubkey(),
-    //     &multisig_address,
-    //     &vault_address,
-    //     members,
-    // );
-
     let signer_for_creation = fee_payer_signer.as_ref();
 
     let (multisig_address, signature) = create_multisig(
@@ -147,31 +138,30 @@ async fn deploy_to_single_network(
         create_key,
         members.to_vec(),
         threshold,
-        Some(5000), // Priority fee
+        Some(crate::constants::DEFAULT_PRIORITY_FEE), // Priority fee
     )
     .await
     .map_err(|e| eyre::eyre!("Failed to create multisig: {}", e))?;
 
     let vault_address = get_vault_pda(&multisig_address, 0, None).0;
 
-    // Create both activation and revocation transactions
-    create_and_send_transaction_proposal(
+    // Create paired proposals for activation flow (Indices 1 + 2 in ONE transaction)
+    // Index 1: Activation vault transaction
+    // Index 2: Lower threshold to 1 config transaction
+    // NOTE: Index 3 (Revocation) and Index 4 (Restore Threshold) are NOT created here
+    // because they would become stale after Index 2 executes (config change).
+    // They must be created dynamically via `create_feature_gate_proposal` command.
+    let activation_message = create_feature_activation_transaction_message(vault_address)?;
+    crate::utils::create_and_send_paired_proposals(
         rpc_url,
         fee_payer_signer,
-        setup_keypair,
+        setup_keypair as &dyn solana_signer::Signer,
         &multisig_address,
-        "activation",
-        1, // Transaction index 1 (activation)
-    )
-    .await?;
-
-    create_and_send_transaction_proposal(
-        rpc_url,
-        fee_payer_signer,
-        setup_keypair,
-        &multisig_address,
-        "revocation",
-        2, // Transaction index 2 (revocation)
+        1, // Vault transaction index (activation)
+        2, // Config transaction index (lower threshold)
+        activation_message,
+        vec![crate::squads::ConfigAction::ChangeThreshold { new_threshold: 1 }],
+        Some("Lower threshold to 1 for safe revocation".to_string()),
     )
     .await?;
 
@@ -199,8 +189,6 @@ async fn deploy_to_saved_networks(
     for (i, rpc_url) in networks.iter().enumerate() {
         match deploy_to_single_network(
             rpc_url,
-            i,
-            networks.len(),
             create_key,
             setup_keypair,
             fee_payer_signer,
@@ -248,8 +236,6 @@ async fn deploy_to_manual_networks(
 
         match deploy_to_single_network(
             &rpc_url,
-            0,
-            1,
             create_key,
             contributor_keypair,
             fee_payer_signer,
@@ -297,71 +283,102 @@ fn print_deployment_summary(
         return;
     }
 
+    // All deployments share the same multisig/vault addresses, so use the first one
+    let deployment = &deployments[0];
+
     println!("");
     Output::header("👀 Deployment Complete");
 
-    for deployment in deployments {
-        // Feature Gate ID is the vault address (index 0)
-        let feature_gate_id = deployment.vault_address;
-
-        // Calculate proposal PDAs for activation and revocation transactions
-        let activation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 1, None).0;
-        let revocation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 2, None).0;
-
-        println!("\n{}", "⚙️ General Info".bright_white().bold());
+    // Show which networks were deployed to
+    if deployments.len() > 1 {
         println!();
-        Output::field(
-            "Feature Gate Multisig",
-            &deployment.multisig_address.to_string(),
-        );
-        Output::field("Feature Gate ID", &feature_gate_id.to_string());
-
-        println!("\n{}", "⚙️ Config Parameters".bright_white().bold());
-        println!();
-        Output::field("Members", &members.len().to_string());
-
-        // Display members with their permissions
-        for (i, member) in members.iter().enumerate() {
-            let perms = decode_permissions(member.permissions.mask);
-            let role_indicator = if member.permissions.mask == 1 {
-                " (Contributor)"
-            } else {
-                ""
-            };
-            let member_display = format!(
-                "{}{} ({})",
-                member.key.to_string(),
-                role_indicator,
-                perms.join(", ")
-            );
-            let member_label = if member.permissions.mask == 1 {
-                "Temporary Setup Keypair".to_string()
-            } else {
-                format!("Member {}", i + 1)
-            };
+        Output::field("Networks deployed", &deployments.len().to_string());
+        for d in deployments {
             println!(
-                "  {} {}: {}",
+                "  {} {}",
                 "✓".bright_green(),
-                member_label,
-                member_display.bright_white()
+                get_network_display(&d.rpc_url).bright_white()
             );
-        }
-        println!();
-        Output::field("Threshold", &threshold.to_string());
-
-        println!("\n{}", "⚙️ Proposals".bright_white().bold());
-        println!();
-        Output::field(
-            "Feature Gate Activation Proposal",
-            &activation_proposal_pda.to_string(),
-        );
-        Output::field(
-            "Feature Gate Revocation Proposal",
-            &revocation_proposal_pda.to_string(),
-        );
-
-        if deployments.len() > 1 {
-            println!("\n{}", "─".repeat(50).bright_cyan());
         }
     }
+
+    // Feature Gate ID is the vault address (index 0)
+    let feature_gate_id = deployment.vault_address;
+
+    // Calculate proposal PDAs for the 2 pre-created proposals
+    let activation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 1, None).0;
+    let lower_threshold_proposal_pda = get_proposal_pda(&deployment.multisig_address, 2, None).0;
+
+    println!("\n{}", "⚙️ General Info".bright_white().bold());
+    println!();
+    Output::field(
+        "Feature Gate Multisig",
+        &deployment.multisig_address.to_string(),
+    );
+    Output::field("Feature Gate ID", &feature_gate_id.to_string());
+
+    println!("\n{}", "⚙️ Config Parameters".bright_white().bold());
+    println!();
+    Output::field("Members", &members.len().to_string());
+
+    // Display members with their permissions
+    for (i, member) in members.iter().enumerate() {
+        let perms = decode_permissions(member.permissions.mask);
+        let role_indicator = if member.permissions.mask == 1 {
+            " (Contributor)"
+        } else {
+            ""
+        };
+        let member_display = format!(
+            "{}{} ({})",
+            member.key.to_string(),
+            role_indicator,
+            perms.join(", ")
+        );
+        let member_label = if member.permissions.mask == 1 {
+            "Temporary Setup Keypair".to_string()
+        } else {
+            format!("Member {}", i + 1)
+        };
+        println!(
+            "  {} {}: {}",
+            "✓".bright_green(),
+            member_label,
+            member_display.bright_white()
+        );
+    }
+    println!();
+    Output::field("Threshold", &threshold.to_string());
+
+    println!("\n{}", "⚙️ Pre-Created Proposals".bright_white().bold());
+    println!();
+    println!(
+        "  {} Index 1: {}",
+        "🔹".bright_cyan(),
+        "Activation".bright_white().bold()
+    );
+    println!(
+        "     Address: {}",
+        activation_proposal_pda.to_string().bright_green()
+    );
+    println!("     Type: Vault Transaction");
+    println!("     Requires: {}/{} approvals", threshold, threshold);
+    println!();
+
+    println!(
+        "  {} Index 2: {}",
+        "🔹".bright_cyan(),
+        "Lower Threshold".bright_white().bold()
+    );
+    println!(
+        "     Address: {}",
+        lower_threshold_proposal_pda.to_string().bright_green()
+    );
+    println!("     Type: Config Transaction");
+    println!("     Requires: {}/{} approvals", threshold, threshold);
+    println!(
+        "     {}: Execute BEFORE revocation to enable 1-approval emergency revocation",
+        "Note".yellow()
+    );
+    println!();
 }

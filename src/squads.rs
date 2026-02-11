@@ -1,7 +1,27 @@
 use borsh::{BorshDeserialize, BorshSerialize};
+use eyre::Result;
 use solana_pubkey::Pubkey;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
+
+/// Trait for instruction data serialization with discriminator prefix.
+/// Provides a default `.data()` implementation that combines discriminator + borsh serialization.
+pub trait InstructionData {
+    /// The 8-byte discriminator for this instruction
+    const DISCRIMINATOR: &'static [u8];
+
+    /// Serialize the instruction-specific arguments to bytes
+    fn serialize_args(&self) -> Result<Vec<u8>>;
+
+    /// Build the full instruction data: discriminator + serialized args
+    fn data(&self) -> Result<Vec<u8>> {
+        let args_bytes = self.serialize_args()?;
+        let mut data = Vec::with_capacity(Self::DISCRIMINATOR.len() + args_bytes.len());
+        data.extend_from_slice(Self::DISCRIMINATOR);
+        data.extend_from_slice(&args_bytes);
+        Ok(data)
+    }
+}
 
 pub const CREATE_MULTISIG_V2_DISCRIMINATOR: &[u8] = &[50, 221, 199, 93, 40, 245, 139, 233];
 
@@ -14,6 +34,10 @@ pub const PROPOSAL_APPROVE_DISCRIMINATOR: &[u8] = &[144, 37, 164, 136, 188, 216,
 pub const PROPOSAL_REJECT_DISCRIMINATOR: &[u8] = &[243, 62, 134, 156, 230, 106, 246, 135];
 
 pub const EXECUTE_TRANSACTION_DISCRIMINATOR: &[u8] = &[194, 8, 161, 87, 153, 164, 25, 171];
+
+pub const CONFIG_TRANSACTION_CREATE_DISCRIMINATOR: &[u8] = &[155, 236, 87, 228, 137, 75, 81, 39];
+
+pub const CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR: &[u8] = &[114, 146, 244, 189, 252, 140, 36, 40];
 
 pub const SQUADS_MULTISIG_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
@@ -38,7 +62,7 @@ pub struct Multisig {
     pub members: Vec<Member>,
 }
 
-#[derive(BorshDeserialize, BorshSerialize, Eq, PartialEq, Clone)]
+#[derive(BorshDeserialize, BorshSerialize, Eq, PartialEq, Clone, Debug)]
 pub struct Member {
     pub key: Pubkey,
     pub permissions: Permissions,
@@ -51,21 +75,32 @@ pub enum Permission {
     Execute = 1 << 2,
 }
 
+/// Permission bit constants for checking member permissions
+pub const PERMISSION_INITIATE: u8 = 1 << 0;
+pub const PERMISSION_VOTE: u8 = 1 << 1;
+pub const PERMISSION_EXECUTE: u8 = 1 << 2;
+
 #[derive(BorshSerialize, BorshDeserialize, Eq, PartialEq, Clone, Copy, Default, Debug)]
 pub struct Permissions {
     pub mask: u8,
 }
 
-pub const SEED_EPHEMERAL_SIGNER: &[u8] = b"ephemeral_signer";
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub enum ConfigAction {
+    AddMember { new_member: Member },
+    RemoveMember { old_member: Pubkey },
+    ChangeThreshold { new_threshold: u16 },
+}
 
-pub const SQUADS_MULTISIG_PROGRAM: Pubkey =
-    Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
 
 #[derive(BorshDeserialize)]
 pub struct ProgramConfig {
+    #[allow(dead_code)]
     pub authority: Pubkey,
+    #[allow(dead_code)]
     pub multisig_creation_fee: u64,
     pub treasury: Pubkey,
+    #[allow(dead_code)]
     pub _reserved: [u8; 64],
 }
 #[derive(BorshSerialize)]
@@ -90,18 +125,16 @@ pub struct VaultTransaction {
     pub message: VaultTransactionMessage,
 }
 
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct ConfigTransaction {
+    pub multisig: Pubkey,
+    pub creator: Pubkey,
+    pub index: u64,
+    pub bump: u8,
+    pub actions: Vec<ConfigAction>,
+}
+
 impl VaultTransactionMessage {
-    /// Returns the number of all the account keys (static + dynamic) in the message.
-    pub fn num_all_account_keys(&self) -> usize {
-        let num_account_keys_from_lookups = self
-            .address_table_lookups
-            .iter()
-            .map(|lookup| lookup.writable_indexes.len() + lookup.readonly_indexes.len())
-            .sum::<usize>();
-
-        self.account_keys.len() + num_account_keys_from_lookups
-    }
-
     /// Returns true if the account at the specified index is a part of static `account_keys` and was requested to be writable.
     pub fn is_static_writable_index(&self, key_index: usize) -> bool {
         let num_account_keys = self.account_keys.len();
@@ -127,11 +160,6 @@ impl VaultTransactionMessage {
         }
 
         false
-    }
-
-    /// Returns true if the account at the specified index was requested to be a signer.
-    pub fn is_signer_index(&self, key_index: usize) -> bool {
-        key_index < usize::from(self.num_signers)
     }
 }
 
@@ -242,7 +270,7 @@ pub struct MultisigCreateTransaction {
 }
 
 impl MultisigCreateTransaction {
-    pub fn to_account_metas(&self, _is_signer: Option<bool>) -> Vec<AccountMeta> {
+    pub fn to_account_metas(&self) -> Vec<AccountMeta> {
         vec![
             AccountMeta::new(self.multisig, false),
             AccountMeta::new(self.transaction, false),
@@ -265,17 +293,17 @@ pub struct VaultTransactionCreateArgs {
     pub memo: Option<String>,
 }
 
-impl VaultTransactionCreateArgsData {
-    pub fn data(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(CREATE_TRANSACTION_DISCRIMINATOR);
-        data.extend_from_slice(&borsh::to_vec(&self.args).unwrap());
-        data
+impl InstructionData for VaultTransactionCreateArgsData {
+    const DISCRIMINATOR: &'static [u8] = CREATE_TRANSACTION_DISCRIMINATOR;
+
+    fn serialize_args(&self) -> Result<Vec<u8>> {
+        borsh::to_vec(&self.args)
+            .map_err(|e| eyre::eyre!("Failed to serialize VaultTransactionCreateArgs: {}", e))
     }
 }
 
 impl MultisigCreateV2Accounts {
-    pub fn to_account_metas(&self, _is_signer: Option<bool>) -> Vec<AccountMeta> {
+    pub fn to_account_metas(&self) -> Vec<AccountMeta> {
         vec![
             AccountMeta::new_readonly(self.program_config, false),
             AccountMeta::new(self.treasury, false),
@@ -291,12 +319,12 @@ pub struct MultisigCreateV2Data {
     pub args: MultisigCreateArgsV2,
 }
 
-impl MultisigCreateV2Data {
-    pub fn data(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(CREATE_MULTISIG_V2_DISCRIMINATOR);
-        data.extend_from_slice(&borsh::to_vec(&self.args).unwrap());
-        data
+impl InstructionData for MultisigCreateV2Data {
+    const DISCRIMINATOR: &'static [u8] = CREATE_MULTISIG_V2_DISCRIMINATOR;
+
+    fn serialize_args(&self) -> Result<Vec<u8>> {
+        borsh::to_vec(&self.args)
+            .map_err(|e| eyre::eyre!("Failed to serialize MultisigCreateArgsV2: {}", e))
     }
 }
 
@@ -309,7 +337,7 @@ pub struct MultisigCreateProposalAccounts {
 }
 
 impl MultisigCreateProposalAccounts {
-    pub fn to_account_metas(&self, _is_signer: Option<bool>) -> Vec<AccountMeta> {
+    pub fn to_account_metas(&self) -> Vec<AccountMeta> {
         vec![
             AccountMeta::new(self.multisig, false),
             AccountMeta::new(self.proposal, false),
@@ -324,12 +352,12 @@ pub struct MultisigCreateProposalData {
     pub args: MultisigCreateProposalArgs,
 }
 
-impl MultisigCreateProposalData {
-    pub fn data(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(CREATE_PROPOSAL_DISCRIMINATOR);
-        data.extend_from_slice(&borsh::to_vec(&self.args).unwrap());
-        data
+impl InstructionData for MultisigCreateProposalData {
+    const DISCRIMINATOR: &'static [u8] = CREATE_PROPOSAL_DISCRIMINATOR;
+
+    fn serialize_args(&self) -> Result<Vec<u8>> {
+        borsh::to_vec(&self.args)
+            .map_err(|e| eyre::eyre!("Failed to serialize MultisigCreateProposalArgs: {}", e))
     }
 }
 
@@ -337,6 +365,25 @@ impl MultisigCreateProposalData {
 pub struct MultisigCreateProposalArgs {
     pub transaction_index: u64,
     pub is_draft: bool,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct ConfigTransactionCreateArgs {
+    pub actions: Vec<ConfigAction>,
+    pub memo: Option<String>,
+}
+
+pub struct ConfigTransactionCreateData {
+    pub args: ConfigTransactionCreateArgs,
+}
+
+impl InstructionData for ConfigTransactionCreateData {
+    const DISCRIMINATOR: &'static [u8] = CONFIG_TRANSACTION_CREATE_DISCRIMINATOR;
+
+    fn serialize_args(&self) -> Result<Vec<u8>> {
+        borsh::to_vec(&self.args)
+            .map_err(|e| eyre::eyre!("Failed to serialize ConfigTransactionCreateArgs: {}", e))
+    }
 }
 
 pub struct MultisigVoteOnProposalAccounts {
@@ -351,6 +398,10 @@ pub struct MultisigVoteOnProposalArgs {
 }
 
 pub struct MultisigApproveProposalData {
+    pub args: MultisigVoteOnProposalArgs,
+}
+
+pub struct MultisigRejectProposalData {
     pub args: MultisigVoteOnProposalArgs,
 }
 
@@ -378,9 +429,6 @@ impl MultisigExecuteTransactionAccounts {
         metas
     }
 }
-pub struct MultisigExecuteTransactionData {
-    pub args: MultisigExecuteTransactionArgs,
-}
 
 impl MultisigVoteOnProposalAccounts {
     pub fn to_account_metas(&self) -> Vec<AccountMeta> {
@@ -392,12 +440,21 @@ impl MultisigVoteOnProposalAccounts {
     }
 }
 
-impl MultisigApproveProposalData {
-    pub fn data(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(PROPOSAL_APPROVE_DISCRIMINATOR);
-        data.extend_from_slice(&borsh::to_vec(&self.args).unwrap());
-        data
+impl InstructionData for MultisigApproveProposalData {
+    const DISCRIMINATOR: &'static [u8] = PROPOSAL_APPROVE_DISCRIMINATOR;
+
+    fn serialize_args(&self) -> Result<Vec<u8>> {
+        borsh::to_vec(&self.args)
+            .map_err(|e| eyre::eyre!("Failed to serialize MultisigVoteOnProposalArgs: {}", e))
+    }
+}
+
+impl InstructionData for MultisigRejectProposalData {
+    const DISCRIMINATOR: &'static [u8] = PROPOSAL_REJECT_DISCRIMINATOR;
+
+    fn serialize_args(&self) -> Result<Vec<u8>> {
+        borsh::to_vec(&self.args)
+            .map_err(|e| eyre::eyre!("Failed to serialize MultisigVoteOnProposalArgs: {}", e))
     }
 }
 
@@ -470,9 +527,7 @@ pub enum ProposalStatus {
     /// Proposal has been approved and is pending execution.
     Approved { timestamp: i64 },
     /// Proposal is being executed. This is a transient state that always transitions to `Executed` in the span of a single transaction.
-    #[deprecated(
-        note = "This status used to be used to prevent reentrancy attacks. It is no longer needed."
-    )]
+    /// Note: This status is no longer used for reentrancy protection but kept for on-chain data compatibility.
     Executing,
     /// Proposal has been executed.
     Executed { timestamp: i64 },
