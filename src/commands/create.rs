@@ -1,12 +1,16 @@
 use crate::output::Output;
-use crate::provision::create_multisig;
+use crate::provision::{
+    create_multisig, create_rpc_client, create_transaction_and_proposal_message,
+};
 use crate::squads::{get_proposal_pda, get_vault_pda, Member, Permissions};
 use crate::utils::*;
 use colored::*;
 use eyre::Result;
 use solana_clap_v3_utils::keypair::signer_from_path;
 use solana_keypair::Keypair;
+use solana_message::VersionedMessage;
 use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 
 pub async fn create_command(
     config: &mut Config,
@@ -145,25 +149,28 @@ async fn deploy_to_single_network(
 
     let vault_address = get_vault_pda(&multisig_address, 0, None).0;
 
-    // Create paired proposals for activation flow (Indices 1 + 2 in ONE transaction)
-    // Index 1: Activation vault transaction
-    // Index 2: Lower threshold to 1 config transaction
-    // NOTE: Index 3 (Revocation) and Index 4 (Restore Threshold) are NOT created here
-    // because they would become stale after Index 2 executes (config change).
-    // They must be created dynamically via `create_feature_gate_proposal` command.
+    // Create the initial activation vault proposal at index 1.
     let activation_message = create_feature_activation_transaction_message(vault_address)?;
-    crate::utils::create_and_send_paired_proposals(
-        rpc_url,
-        fee_payer_signer,
-        setup_keypair as &dyn solana_signer::Signer,
+    let rpc_client = create_rpc_client(rpc_url);
+    let blockhash = rpc_client.get_latest_blockhash()?;
+    let (message, _tx_pda, _proposal_pda) = create_transaction_and_proposal_message(
+        None,
+        &fee_payer_signer.pubkey(),
+        &setup_keypair.pubkey(),
         &multisig_address,
-        1, // Vault transaction index (activation)
-        2, // Config transaction index (lower threshold)
+        1,
+        0,
         activation_message,
-        vec![crate::squads::ConfigAction::ChangeThreshold { new_threshold: 1 }],
-        Some("Lower threshold to 1 for safe revocation".to_string()),
-    )
-    .await?;
+        Some(crate::constants::DEFAULT_PRIORITY_FEE as u32),
+        Some(crate::constants::DEFAULT_COMPUTE_UNITS),
+        blockhash,
+    )?;
+    let transaction = VersionedTransaction::try_new(
+        VersionedMessage::V0(message),
+        &[fee_payer_signer.as_ref(), setup_keypair],
+    )?;
+    crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
+        .map_err(|e| eyre::eyre!("Failed to create activation proposal: {}", e))?;
 
     // Fund the vault address (feature gate account) with rent-exempt lamports
     create_and_send_funding_transaction(rpc_url, fee_payer_signer, &vault_address).await?;
@@ -305,9 +312,8 @@ fn print_deployment_summary(
     // Feature Gate ID is the vault address (index 0)
     let feature_gate_id = deployment.vault_address;
 
-    // Calculate proposal PDAs for the 2 pre-created proposals
+    // Calculate proposal PDA for the pre-created activation proposal.
     let activation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 1, None).0;
-    let lower_threshold_proposal_pda = get_proposal_pda(&deployment.multisig_address, 2, None).0;
 
     println!("\n{}", "⚙️ General Info".bright_white().bold());
     println!();
@@ -363,22 +369,5 @@ fn print_deployment_summary(
     );
     println!("     Type: Vault Transaction");
     println!("     Requires: {}/{} approvals", threshold, threshold);
-    println!();
-
-    println!(
-        "  {} Index 2: {}",
-        "🔹".bright_cyan(),
-        "Lower Threshold".bright_white().bold()
-    );
-    println!(
-        "     Address: {}",
-        lower_threshold_proposal_pda.to_string().bright_green()
-    );
-    println!("     Type: Config Transaction");
-    println!("     Requires: {}/{} approvals", threshold, threshold);
-    println!(
-        "     {}: Execute BEFORE revocation to enable 1-approval emergency revocation",
-        "Note".yellow()
-    );
     println!();
 }

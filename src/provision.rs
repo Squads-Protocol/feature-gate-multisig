@@ -14,9 +14,9 @@ use crate::squads::{
 use crate::utils::{decode_permissions, get_network_display};
 use borsh::BorshDeserialize;
 use colored::Colorize;
-use inquire::Confirm;
 use eyre::eyre;
 use indicatif::ProgressBar;
+use inquire::Confirm;
 use solana_client::client_error::ClientErrorKind;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
@@ -143,15 +143,15 @@ pub fn build_squads_transaction_message(
             let program_id_index = *index_map
                 .get(&ix.program_id)
                 .ok_or_else(|| eyre::eyre!("program_id {} not in account_keys", ix.program_id))?;
-            let account_indexes: Vec<u8> = ix
-                .accounts
-                .iter()
-                .map(|meta| {
-                    index_map.get(&meta.pubkey).copied().ok_or_else(|| {
-                        eyre::eyre!("account {} not in account_keys", meta.pubkey)
+            let account_indexes: Vec<u8> =
+                ix.accounts
+                    .iter()
+                    .map(|meta| {
+                        index_map.get(&meta.pubkey).copied().ok_or_else(|| {
+                            eyre::eyre!("account {} not in account_keys", meta.pubkey)
+                        })
                     })
-                })
-                .collect::<eyre::Result<Vec<u8>>>()?;
+                    .collect::<eyre::Result<Vec<u8>>>()?;
 
             Ok(CompiledInstruction {
                 program_id_index,
@@ -267,7 +267,11 @@ pub fn send_and_confirm_transaction(
 
                 println!(
                     "Retryable error occurred: {}",
-                    last_error.as_ref().map(|e| e.to_string()).unwrap_or_default().bright_yellow()
+                    last_error
+                        .as_ref()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default()
+                        .bright_yellow()
                 );
                 continue;
             }
@@ -395,7 +399,9 @@ pub fn get_account_data_with_retry(
     Err(eyre!(
         "Failed to get account data after {} attempts: {}",
         MAX_RETRIES,
-        last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
+        last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "Unknown error".to_string())
     ))
 }
 pub async fn create_multisig(
@@ -708,12 +714,8 @@ pub fn create_vote_proposal_message(
         account_keys.to_account_metas(),
     );
 
-    let message = Message::try_compile(
-        fee_payer_pubkey,
-        &[vote_instruction],
-        &[],
-        recent_blockhash,
-    )?;
+    let message =
+        Message::try_compile(fee_payer_pubkey, &[vote_instruction], &[], recent_blockhash)?;
 
     Ok(message)
 }
@@ -938,194 +940,6 @@ pub fn create_child_create_config_transaction_and_proposal_message(
     })
 }
 
-/// Build a TransactionMessage for a parent multisig to APPROVE both a vault proposal and its paired
-/// config proposal in a single parent transaction.
-/// The parent vault PDA acts as the member approving both proposals.
-/// Caller must ensure the parent vault is a member of the child multisig with Vote permissions.
-pub fn create_child_approve_paired_proposals_message(
-    child_multisig: Pubkey,
-    vault_proposal_index: u64,
-    config_proposal_index: u64,
-    parent_member_pubkey: Pubkey,
-) -> eyre::Result<TransactionMessage> {
-    use crate::squads::{
-        get_proposal_pda, InstructionData, MultisigApproveProposalData,
-        MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs, SmallVec,
-        SQUADS_MULTISIG_PROGRAM_ID,
-    };
-
-    // Get PDAs for both proposals
-    let (vault_proposal_pda, _) = get_proposal_pda(
-        &child_multisig,
-        vault_proposal_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-    let (config_proposal_pda, _) = get_proposal_pda(
-        &child_multisig,
-        config_proposal_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-
-    // Instruction 1: Approve vault proposal
-    let vault_approve_accounts = MultisigVoteOnProposalAccounts {
-        multisig: child_multisig,
-        member: parent_member_pubkey,
-        proposal: vault_proposal_pda,
-    };
-    let vault_approve_data = MultisigApproveProposalData {
-        args: MultisigVoteOnProposalArgs { memo: None },
-    }
-    .data()?;
-
-    // Instruction 2: Approve config proposal
-    let config_approve_accounts = MultisigVoteOnProposalAccounts {
-        multisig: child_multisig,
-        member: parent_member_pubkey,
-        proposal: config_proposal_pda,
-    };
-    let config_approve_data = MultisigApproveProposalData {
-        args: MultisigVoteOnProposalArgs { memo: None },
-    }
-    .data()?;
-
-    // Build unified account_keys list
-    // Must follow Solana order: writable signers, readonly signers, writable non-signers, readonly non-signers
-    let account_keys = vec![
-        parent_member_pubkey,       // writable signer
-        vault_proposal_pda,         // writable non-signer
-        config_proposal_pda,        // writable non-signer
-        child_multisig,             // readonly non-signer
-        SQUADS_MULTISIG_PROGRAM_ID, // program id (readonly non-signer)
-    ];
-
-    let program_id_index = 4u8;
-
-    let vault_approve_ix = crate::squads::CompiledInstruction {
-        program_id_index,
-        account_indexes: map_metas_to_indexes(&vault_approve_accounts.to_account_metas(), &account_keys)?,
-        data: SmallVec::from(vault_approve_data),
-    };
-
-    let config_approve_ix = crate::squads::CompiledInstruction {
-        program_id_index,
-        account_indexes: map_metas_to_indexes(&config_approve_accounts.to_account_metas(), &account_keys)?,
-        data: SmallVec::from(config_approve_data),
-    };
-
-    Ok(TransactionMessage {
-        num_signers: 1,
-        num_writable_signers: 1, // parent_member_pubkey is writable signer
-        num_writable_non_signers: 2, // vault_proposal, config_proposal (multisig is readonly)
-        account_keys: SmallVec::from(account_keys),
-        instructions: SmallVec::from(vec![vault_approve_ix, config_approve_ix]),
-        address_table_lookups: SmallVec::from(vec![]),
-    })
-}
-
-/// Build a TransactionMessage for a parent multisig to EXECUTE both a vault proposal and its paired
-/// config proposal in a single parent transaction.
-/// The vault execution requires account metas from the stored vault transaction.
-/// The config execution is simpler and doesn't require extra accounts.
-/// This function merges all accounts and returns a TransactionMessage with both execute instructions.
-pub fn create_child_execute_paired_proposals_message(
-    child_multisig: Pubkey,
-    vault_proposal_index: u64,
-    vault_transaction: crate::squads::VaultTransaction,
-    config_proposal_index: u64,
-    parent_member_pubkey: Pubkey,
-) -> eyre::Result<TransactionMessage> {
-    use crate::squads::{
-        get_proposal_pda, get_transaction_pda, MultisigExecuteTransactionAccounts,
-        MultisigExecuteTransactionArgs, CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR,
-        EXECUTE_TRANSACTION_DISCRIMINATOR, SQUADS_MULTISIG_PROGRAM_ID,
-    };
-
-    // Get PDAs for both proposals and transactions
-    let (vault_proposal_pda, _) = get_proposal_pda(
-        &child_multisig,
-        vault_proposal_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-    let (vault_transaction_pda, _) = get_transaction_pda(
-        &child_multisig,
-        vault_proposal_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-    let (config_proposal_pda, _) = get_proposal_pda(
-        &child_multisig,
-        config_proposal_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-    let (config_transaction_pda, _) = get_transaction_pda(
-        &child_multisig,
-        config_proposal_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-
-    // === Build Vault Execute Instruction ===
-    let vault_execute_accounts = MultisigExecuteTransactionAccounts {
-        multisig: child_multisig,
-        proposal: vault_proposal_pda,
-        transaction: vault_transaction_pda,
-        member: parent_member_pubkey,
-    };
-
-    let vault_execute_args = MultisigExecuteTransactionArgs { memo: None };
-    let mut vault_execute_data = Vec::new();
-    vault_execute_data.extend_from_slice(EXECUTE_TRANSACTION_DISCRIMINATOR);
-    vault_execute_data.extend_from_slice(
-        &borsh::to_vec(&vault_execute_args)
-            .map_err(|e| eyre::eyre!("Failed to serialize vault execute args: {}", e))?,
-    );
-
-    // Extract execution accounts from vault transaction
-    // IMPORTANT: Do NOT mark any accounts as signers. The Squads program will derive
-    // the required signer PDA(s) from the stored transaction message. Marking them as
-    // signers in the outer Execute instruction confuses the account grouping.
-    let vault_execution_account_metas: Vec<solana_instruction::AccountMeta> = vault_transaction
-        .message
-        .account_keys
-        .iter()
-        .enumerate()
-        .map(|(idx, key)| {
-            let is_signer = false; // Never mark as signer
-            let is_writable = vault_transaction.message.is_static_writable_index(idx);
-            solana_instruction::AccountMeta {
-                pubkey: *key,
-                is_signer,
-                is_writable,
-            }
-        })
-        .collect();
-
-    let vault_all_metas = vault_execute_accounts.to_account_metas(vault_execution_account_metas);
-
-    let vault_ix = Instruction {
-        program_id: SQUADS_MULTISIG_PROGRAM_ID,
-        accounts: vault_all_metas,
-        data: vault_execute_data,
-    };
-
-    // === Build Config Execute Instruction ===
-    let config_execute_metas = vec![
-        AccountMeta::new(child_multisig, false),
-        AccountMeta::new_readonly(parent_member_pubkey, true),
-        AccountMeta::new(config_proposal_pda, false),
-        AccountMeta::new_readonly(config_transaction_pda, false),
-        AccountMeta::new_readonly(SQUADS_MULTISIG_PROGRAM_ID, false), // rent_payer placeholder
-        AccountMeta::new_readonly(solana_system_interface::program::ID, false),
-    ];
-
-    let config_ix = Instruction {
-        program_id: SQUADS_MULTISIG_PROGRAM_ID,
-        accounts: config_execute_metas,
-        data: CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR.to_vec(),
-    };
-
-    // Use centralized helper with both instructions - parent_member_pubkey is the signer
-    build_squads_transaction_message(&[vault_ix, config_ix], &parent_member_pubkey)
-}
-
 /// Build a TransactionMessage for a parent multisig to CREATE a child's vault transaction
 /// (using an already-built `TransactionMessage`) and its proposal in a single parent transaction.
 /// The parent vault PDA acts as creator; the provided rent payer funds the account creations.
@@ -1206,13 +1020,19 @@ pub fn create_child_create_vault_transaction_and_proposal_message(
 
     let create_tx_ix = crate::squads::CompiledInstruction {
         program_id_index,
-        account_indexes: map_metas_to_indexes(&create_transaction_accounts.to_account_metas(), &account_keys)?,
+        account_indexes: map_metas_to_indexes(
+            &create_transaction_accounts.to_account_metas(),
+            &account_keys,
+        )?,
         data: SmallVec::from(create_transaction_data),
     };
 
     let create_prop_ix = crate::squads::CompiledInstruction {
         program_id_index,
-        account_indexes: map_metas_to_indexes(&create_proposal_accounts.to_account_metas(), &account_keys)?,
+        account_indexes: map_metas_to_indexes(
+            &create_proposal_accounts.to_account_metas(),
+            &account_keys,
+        )?,
         data: SmallVec::from(create_proposal_data),
     };
 
@@ -1276,9 +1096,14 @@ pub fn create_execute_transaction_message(
     let _vault_pda = get_vault_pda(multisig_address, 0, Some(program_id));
 
     let transaction_account_data = rpc_client.get_account_data(&transaction_pda)?;
-    let transaction_contents =
-        VaultTransaction::try_from_slice(&transaction_account_data[8..])
-            .map_err(|e| eyre::eyre!("Failed to deserialize vault transaction at {}: {}", transaction_pda, e))?;
+    let transaction_contents = VaultTransaction::try_from_slice(&transaction_account_data[8..])
+        .map_err(|e| {
+            eyre::eyre!(
+                "Failed to deserialize vault transaction at {}: {}",
+                transaction_pda,
+                e
+            )
+        })?;
     let transaction_message = transaction_contents.message;
 
     let mut execution_account_metas = Vec::new();
@@ -1371,80 +1196,6 @@ pub fn create_execute_config_transaction_message(
     let message = Message::try_compile(
         fee_payer_pubkey,
         &[execute_instruction],
-        &[],
-        recent_blockhash,
-    )?;
-
-    Ok(message)
-}
-
-/// Create a combined vote message for EOA paired proposals (vault + config in one transaction).
-/// This allows atomic approval or rejection of both the vault and config proposals in a single Solana tx.
-/// The `discriminator` should be either `PROPOSAL_APPROVE_DISCRIMINATOR` or `PROPOSAL_REJECT_DISCRIMINATOR`.
-pub fn create_vote_paired_proposals_message_eoa(
-    program_id: &Pubkey,
-    multisig_address: &Pubkey,
-    member_pubkey: &Pubkey,
-    fee_payer_pubkey: &Pubkey,
-    vault_index: u64,
-    config_index: u64,
-    recent_blockhash: Hash,
-    discriminator: &[u8],
-) -> eyre::Result<Message> {
-    use crate::squads::{get_proposal_pda, MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs};
-
-    // Get PDAs for both proposals
-    let (vault_proposal_pda, _) =
-        get_proposal_pda(multisig_address, vault_index, Some(program_id));
-    let (config_proposal_pda, _) =
-        get_proposal_pda(multisig_address, config_index, Some(program_id));
-
-    // Build vault vote instruction
-    let vault_vote_accounts = MultisigVoteOnProposalAccounts {
-        multisig: *multisig_address,
-        member: *member_pubkey,
-        proposal: vault_proposal_pda,
-    };
-
-    let vault_vote_args = MultisigVoteOnProposalArgs { memo: None };
-    let mut vault_vote_data = Vec::new();
-    vault_vote_data.extend_from_slice(discriminator);
-    vault_vote_data.extend_from_slice(
-        &borsh::to_vec(&vault_vote_args)
-            .map_err(|e| eyre::eyre!("Failed to serialize vault vote args: {}", e))?,
-    );
-
-    let vault_vote_ix = Instruction {
-        program_id: *program_id,
-        accounts: vault_vote_accounts.to_account_metas(),
-        data: vault_vote_data,
-    };
-
-    // Build config vote instruction
-    let config_vote_accounts = MultisigVoteOnProposalAccounts {
-        multisig: *multisig_address,
-        member: *member_pubkey,
-        proposal: config_proposal_pda,
-    };
-
-    let config_vote_args = MultisigVoteOnProposalArgs { memo: None };
-    let mut config_vote_data = Vec::new();
-    config_vote_data.extend_from_slice(discriminator);
-    config_vote_data.extend_from_slice(
-        &borsh::to_vec(&config_vote_args)
-            .map_err(|e| eyre::eyre!("Failed to serialize config vote args: {}", e))?,
-    );
-
-    let config_vote_ix = Instruction {
-        program_id: *program_id,
-        accounts: config_vote_accounts.to_account_metas(),
-        data: config_vote_data,
-    };
-
-    // Compile both instructions into a single message
-    let message = Message::try_compile(
-        fee_payer_pubkey,
-        &[vault_vote_ix, config_vote_ix],
         &[],
         recent_blockhash,
     )?;
@@ -1629,8 +1380,7 @@ mod tests {
         let transaction_index = 1u64;
 
         // Test transaction PDA derivation
-        let (transaction_pda, _) =
-            get_transaction_pda(&multisig_address, transaction_index, None);
+        let (transaction_pda, _) = get_transaction_pda(&multisig_address, transaction_index, None);
 
         // Test proposal PDA derivation
         let (proposal_pda, _) = get_proposal_pda(&multisig_address, transaction_index, None);
