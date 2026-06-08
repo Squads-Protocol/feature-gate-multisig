@@ -8,6 +8,7 @@ use eyre::Result;
 use indicatif::ProgressBar;
 use inquire::{Confirm, Select, Text};
 use serde::{Deserialize, Serialize};
+use solana_message::v0::Message;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -291,37 +292,12 @@ pub fn create_child_vote_approve_transaction_message(
     child_tx_index: u64,
     parent_member_pubkey: Pubkey,
 ) -> Result<TransactionMessage> {
-    use crate::squads::{
-        get_proposal_pda, InstructionData, MultisigApproveProposalData,
-        MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs, SQUADS_MULTISIG_PROGRAM_ID,
-    };
-    use solana_instruction::Instruction;
-
-    // Derive child's proposal PDA
-    let (proposal_pda, _bump) = get_proposal_pda(
-        &child_multisig,
+    create_child_vote_transaction_message(
+        child_multisig,
         child_tx_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-
-    // Construct the vote (approve) instruction for the child multisig
-    let accounts = MultisigVoteOnProposalAccounts {
-        multisig: child_multisig,
-        member: parent_member_pubkey,
-        proposal: proposal_pda,
-    };
-    let data = MultisigApproveProposalData {
-        args: MultisigVoteOnProposalArgs { memo: None },
-    };
-
-    let ix = Instruction::new_with_bytes(
-        SQUADS_MULTISIG_PROGRAM_ID,
-        &data.data()?,
-        accounts.to_account_metas(),
-    );
-
-    // Use centralized helper - parent_member_pubkey is the signer (vault PDA)
-    build_squads_transaction_message(&[ix], &parent_member_pubkey)
+        parent_member_pubkey,
+        ChildVoteAction::Approve,
+    )
 }
 
 /// Build a TransactionMessage for a parent multisig to reject a child's proposal.
@@ -330,8 +306,27 @@ pub fn create_child_vote_reject_transaction_message(
     child_tx_index: u64,
     parent_member_pubkey: Pubkey,
 ) -> Result<TransactionMessage> {
+    create_child_vote_transaction_message(
+        child_multisig,
+        child_tx_index,
+        parent_member_pubkey,
+        ChildVoteAction::Reject,
+    )
+}
+
+enum ChildVoteAction {
+    Approve,
+    Reject,
+}
+
+fn create_child_vote_transaction_message(
+    child_multisig: Pubkey,
+    child_tx_index: u64,
+    parent_member_pubkey: Pubkey,
+    action: ChildVoteAction,
+) -> Result<TransactionMessage> {
     use crate::squads::{
-        get_proposal_pda, InstructionData, MultisigRejectProposalData,
+        get_proposal_pda, InstructionData, MultisigApproveProposalData, MultisigRejectProposalData,
         MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs, SQUADS_MULTISIG_PROGRAM_ID,
     };
     use solana_instruction::Instruction;
@@ -347,17 +342,18 @@ pub fn create_child_vote_reject_transaction_message(
         member: parent_member_pubkey,
         proposal: proposal_pda,
     };
-    let data = MultisigRejectProposalData {
-        args: MultisigVoteOnProposalArgs { memo: None },
+    let args = MultisigVoteOnProposalArgs { memo: None };
+    let data = match action {
+        ChildVoteAction::Approve => MultisigApproveProposalData { args }.data()?,
+        ChildVoteAction::Reject => MultisigRejectProposalData { args }.data()?,
     };
 
     let ix = Instruction::new_with_bytes(
         SQUADS_MULTISIG_PROGRAM_ID,
-        &data.data()?,
+        &data,
         accounts.to_account_metas(),
     );
 
-    // Use centralized helper - parent_member_pubkey is the signer (vault PDA)
     build_squads_transaction_message(&[ix], &parent_member_pubkey)
 }
 
@@ -407,16 +403,17 @@ pub async fn create_and_send_funding_transaction(
         .get_latest_blockhash()
         .map_err(|e| eyre::eyre!("Failed to get recent blockhash: {}", e))?;
 
-    // Create and sign transaction
-    let mut message =
-        solana_message::Message::new(&[transfer_ix], Some(&fee_payer_signer.pubkey()));
-    message.recent_blockhash = recent_blockhash;
-
-    let transaction = VersionedTransaction::try_new(
-        VersionedMessage::Legacy(message),
-        &[fee_payer_signer.as_ref()],
+    let message = Message::try_compile(
+        &fee_payer_signer.pubkey(),
+        &[transfer_ix],
+        &[],
+        recent_blockhash,
     )
-    .map_err(|e| eyre::eyre!("Failed to create funding transaction: {}", e))?;
+    .map_err(|e| eyre::eyre!("Failed to compile funding transaction message: {}", e))?;
+
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[fee_payer_signer.as_ref()])
+            .map_err(|e| eyre::eyre!("Failed to create funding transaction: {}", e))?;
 
     // Send and confirm transaction
     let progress = ProgressBar::new_spinner().with_message("Sending funding transaction...");

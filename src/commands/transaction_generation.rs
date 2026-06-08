@@ -6,8 +6,8 @@ use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::squads::{
-    get_vault_pda, InstructionData, Multisig as SquadsMultisig, TransactionMessage,
-    PERMISSION_EXECUTE, PERMISSION_INITIATE, PERMISSION_VOTE, PROPOSAL_APPROVE_DISCRIMINATOR,
+    get_vault_pda, Multisig as SquadsMultisig, TransactionMessage, PERMISSION_EXECUTE,
+    PERMISSION_INITIATE, PERMISSION_VOTE, PROPOSAL_APPROVE_DISCRIMINATOR,
     PROPOSAL_REJECT_DISCRIMINATOR,
 };
 use crate::{
@@ -15,8 +15,9 @@ use crate::{
     provision::{
         create_child_create_config_transaction_and_proposal_message,
         create_child_execute_config_transaction_message, create_child_execute_transaction_message,
-        create_execute_config_transaction_message, create_execute_transaction_message,
-        create_rpc_client, create_transaction_and_proposal_message, create_vote_proposal_message,
+        create_config_transaction_create_instruction, create_execute_config_transaction_message,
+        create_execute_transaction_message, create_proposal_create_instruction, create_rpc_client,
+        create_transaction_and_proposal_message, create_vote_proposal_message,
         get_proposal_status_and_threshold,
     },
     utils::{
@@ -1022,48 +1023,23 @@ pub async fn rekey_multisig_feature_gate(
         Some(&program_id),
     );
 
-    // Build create transaction instruction
-    let create_tx_data = crate::squads::ConfigTransactionCreateData {
-        args: crate::squads::ConfigTransactionCreateArgs {
-            actions: actions.clone(),
-            memo: Some("Rekey multisig - disable voting".to_string()),
-        },
-    };
-
-    let create_tx_instruction = solana_instruction::Instruction::new_with_bytes(
-        program_id,
-        &create_tx_data.data()?,
-        vec![
-            solana_instruction::AccountMeta::new(feature_gate_multisig_address, false),
-            solana_instruction::AccountMeta::new(tx_pda, false),
-            solana_instruction::AccountMeta::new_readonly(voting_key, true), // creator (signer)
-            solana_instruction::AccountMeta::new(fee_payer_signer.pubkey(), true), // rent_payer (signer, mutable)
-            solana_instruction::AccountMeta::new_readonly(
-                Pubkey::from_str_const("11111111111111111111111111111111"),
-                false,
-            ), // system_program
-        ],
-    );
-
-    // Build the proposal instruction for the config transaction.
-    let create_proposal_instruction = solana_instruction::Instruction::new_with_bytes(
-        program_id,
-        &crate::squads::MultisigCreateProposalData {
-            args: crate::squads::MultisigCreateProposalArgs {
-                transaction_index: next_tx_index,
-                is_draft: false,
-            },
-        }
-        .data()?,
-        crate::squads::MultisigCreateProposalAccounts {
-            multisig: feature_gate_multisig_address,
-            proposal: proposal_pda,
-            creator: voting_key,
-            rent_payer: fee_payer_signer.pubkey(),
-            system_program: Pubkey::from_str_const("11111111111111111111111111111111"),
-        }
-        .to_account_metas(),
-    );
+    let create_tx_instruction = create_config_transaction_create_instruction(
+        &program_id,
+        &feature_gate_multisig_address,
+        &tx_pda,
+        &voting_key,
+        &fee_payer_signer.pubkey(),
+        actions.clone(),
+        Some("Rekey multisig - disable voting".to_string()),
+    )?;
+    let create_proposal_instruction = create_proposal_create_instruction(
+        &program_id,
+        &feature_gate_multisig_address,
+        &proposal_pda,
+        &voting_key,
+        &fee_payer_signer.pubkey(),
+        next_tx_index,
+    )?;
 
     // Confirm before sending
     let should_send = Confirm::new("Send rekey proposal now?")
