@@ -158,7 +158,7 @@ async fn build_fixture() -> Fixture {
     .await
     .expect("create feature gate via create_command");
 
-    let deployment = deployments.get(0).expect("deployment result should exist");
+    let deployment = deployments.first().expect("deployment result should exist");
     let child_multisig_pda = deployment.multisig_address;
     let child_vault_pda = deployment.vault_address;
 
@@ -916,7 +916,7 @@ async fn rpc_e2e_7_eoa_activation_flow() {
     .await
     .expect("create feature gate via CLI");
 
-    let deployment = deployments.get(0).expect("deployment should exist");
+    let deployment = deployments.first().expect("deployment should exist");
     let child_multisig = deployment.multisig_address;
     let child_vault = deployment.vault_address;
 
@@ -1073,7 +1073,7 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
     .await
     .expect("create feature gate via CLI");
 
-    let deployment = deployments.get(0).expect("deployment should exist");
+    let deployment = deployments.first().expect("deployment should exist");
     let child_multisig = deployment.multisig_address;
     let child_vault = deployment.vault_address;
 

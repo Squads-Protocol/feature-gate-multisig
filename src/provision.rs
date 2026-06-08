@@ -412,7 +412,7 @@ pub async fn create_multisig(
             );
         }
     }
-    println!("");
+    println!();
     println!(
         "{}: {}",
         "Threshold".cyan(),
@@ -520,6 +520,9 @@ pub async fn create_multisig(
     Ok((multisig_key.0, signature))
 }
 
+// Builds a vault-transaction-plus-proposal message; the wide signature mirrors the
+// distinct on-chain inputs (keys, indices, compute budget, blockhash) with no natural grouping.
+#[allow(clippy::too_many_arguments)]
 pub fn create_transaction_and_proposal_message(
     program_id: Option<&Pubkey>,
     fee_payer_pubkey: &Pubkey,
@@ -1018,7 +1021,7 @@ pub fn create_execute_transaction_message(
 
     let execute_instruction = Instruction::new_with_bytes(
         *program_id,
-        &EXECUTE_TRANSACTION_DISCRIMINATOR,
+        EXECUTE_TRANSACTION_DISCRIMINATOR,
         account_metas,
     );
 
@@ -1072,7 +1075,7 @@ pub fn create_execute_config_transaction_message(
 
     let execute_instruction = Instruction::new_with_bytes(
         *program_id,
-        &CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR,
+        CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR,
         account_metas,
     );
 
@@ -1218,7 +1221,7 @@ mod tests {
         let deserialized_args = MultisigCreateProposalArgs::try_from_slice(args_data).unwrap();
 
         assert_eq!(deserialized_args.transaction_index, 1);
-        assert_eq!(deserialized_args.is_draft, false);
+        assert!(!deserialized_args.is_draft);
     }
 
     #[test]

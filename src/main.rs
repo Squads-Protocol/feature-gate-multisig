@@ -134,19 +134,17 @@ async fn handle_command(command: Commands) -> Result<()> {
             signers: _,
             keypair,
         } => {
-            let threshold_option = threshold
-                .map(|t| {
-                    if t == 0 {
-                        println!(
-                            "{} Threshold cannot be 0, will prompt later",
-                            "⚠️".bright_yellow()
-                        );
-                        None
-                    } else {
-                        Some(t as u16)
-                    }
-                })
-                .flatten();
+            let threshold_option = threshold.and_then(|t| {
+                if t == 0 {
+                    println!(
+                        "{} Threshold cannot be 0, will prompt later",
+                        "⚠️".bright_yellow()
+                    );
+                    None
+                } else {
+                    Some(t as u16)
+                }
+            });
 
             create_command(&mut config, threshold_option, vec![], keypair).await
         }

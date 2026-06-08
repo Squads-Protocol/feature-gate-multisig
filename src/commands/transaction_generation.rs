@@ -209,6 +209,9 @@ fn confirm_action(prompt: &str, default: bool) -> bool {
 /// - Creating parent transaction+proposal
 /// - Optionally approving the parent proposal
 /// - Optionally executing the parent proposal (if threshold met)
+// Orchestrates one parent-multisig action (create/approve/reject/execute); the parameters are
+// independent context (ids, signer, network, operation, payload) that don't form a cohesive group.
+#[allow(clippy::too_many_arguments)]
 async fn handle_parent_multisig_flow(
     program_id: &Pubkey,
     parent_multisig: Pubkey,
@@ -216,7 +219,7 @@ async fn handle_parent_multisig_flow(
     proposal_index: u64,
     kind: TransactionKind,
     child_flavor: ChildTransactionFlavor,
-    fee_payer_signer: &Box<dyn Signer>,
+    fee_payer_signer: &dyn Signer,
     rpc_url: &str,
     operation: ProposalAction,
     payload: ParentFlowPayload,
@@ -299,9 +302,7 @@ async fn handle_parent_multisig_flow(
     if !parent_vault_has_permission {
         let parent_multisig_is_member = child_ms.members.iter().any(|m| m.key == parent_multisig);
         if parent_multisig_is_member {
-            output::Output::error(&format!(
-                "Child multisig has the parent multisig address as a member, but not the parent vault PDA. The parent program cannot sign as the multisig address during CPI."
-            ));
+            output::Output::error("Child multisig has the parent multisig address as a member, but not the parent vault PDA. The parent program cannot sign as the multisig address during CPI.");
             output::Output::hint(&format!(
                 "Please add the parent vault PDA as a member with {} permission on the child: {}",
                 permission_name, parent_vault_member
@@ -429,7 +430,7 @@ async fn handle_parent_multisig_flow(
     output::Output::address("Parent proposal PDA:", &prop_pda.to_string());
 
     let transaction =
-        VersionedTransaction::try_new(VersionedMessage::V0(msg), &[fee_payer_signer.as_ref()])?;
+        VersionedTransaction::try_new(VersionedMessage::V0(msg), &[fee_payer_signer])?;
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to send parent transaction: {}", e))?;
 
@@ -451,10 +452,8 @@ async fn handle_parent_multisig_flow(
             blockhash,
             PROPOSAL_APPROVE_DISCRIMINATOR,
         )?;
-        let approve_tx = VersionedTransaction::try_new(
-            VersionedMessage::V0(approve_msg),
-            &[fee_payer_signer.as_ref()],
-        )?;
+        let approve_tx =
+            VersionedTransaction::try_new(VersionedMessage::V0(approve_msg), &[fee_payer_signer])?;
         let approve_sig = crate::provision::send_and_confirm_transaction(&approve_tx, &rpc_client)
             .map_err(|e| eyre::eyre!("Failed to approve parent proposal: {}", e))?;
         output::Output::field("Parent proposal approved (sig):", &approve_sig);
@@ -485,10 +484,8 @@ async fn handle_parent_multisig_flow(
                 &rpc_client,
                 fresh_blockhash,
             )?;
-            let exec_tx = VersionedTransaction::try_new(
-                VersionedMessage::V0(exec_msg),
-                &[fee_payer_signer.as_ref()],
-            )?;
+            let exec_tx =
+                VersionedTransaction::try_new(VersionedMessage::V0(exec_msg), &[fee_payer_signer])?;
             let exec_sig = crate::provision::send_and_confirm_transaction(&exec_tx, &rpc_client)
                 .map_err(|e| eyre::eyre!("Failed to execute parent proposal: {}", e))?;
             output::Output::field("Parent proposal executed (sig):", &exec_sig);

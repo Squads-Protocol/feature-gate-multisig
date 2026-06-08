@@ -3,7 +3,6 @@ use crate::feature_gate_program::activate_feature_funded;
 use crate::provision::{build_squads_transaction_message, create_rpc_client};
 use crate::squads::{Member, Permissions, TransactionMessage};
 use colored::*;
-use dirs;
 use eyre::Result;
 use indicatif::ProgressBar;
 use inquire::{Confirm, Select, Text};
@@ -211,9 +210,9 @@ pub fn review_and_collect_configuration(
 
 // Keypair management functions
 pub fn expand_tilde_path(path: &str) -> Result<String> {
-    if path.starts_with("~/") {
+    if let Some(rest) = path.strip_prefix("~/") {
         let home = dirs::home_dir().ok_or_else(|| eyre::eyre!("Could not find home directory"))?;
-        Ok(home.join(&path[2..]).to_string_lossy().to_string())
+        Ok(home.join(rest).to_string_lossy().to_string())
     } else {
         Ok(path.to_string())
     }
@@ -379,7 +378,7 @@ pub fn create_feature_activation_transaction_message(
 /// Result containing the transaction signature or an error
 pub async fn create_and_send_funding_transaction(
     rpc_url: &str,
-    fee_payer_signer: &Box<dyn Signer>,
+    fee_payer_signer: &dyn Signer,
     feature_gate_address: &Pubkey,
 ) -> Result<String> {
     use crate::feature_gate_program::FEATURE_ACCOUNT_SIZE;
@@ -412,7 +411,7 @@ pub async fn create_and_send_funding_transaction(
     .map_err(|e| eyre::eyre!("Failed to compile funding transaction message: {}", e))?;
 
     let transaction =
-        VersionedTransaction::try_new(VersionedMessage::V0(message), &[fee_payer_signer.as_ref()])
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[fee_payer_signer])
             .map_err(|e| eyre::eyre!("Failed to create funding transaction: {}", e))?;
 
     // Send and confirm transaction
@@ -434,7 +433,7 @@ pub async fn create_and_send_funding_transaction(
 pub fn validate_pubkey_with_retry(prompt: &str) -> Result<Pubkey> {
     loop {
         let input = Text::new(prompt).prompt()?;
-        match Pubkey::from_str(&input.trim()) {
+        match Pubkey::from_str(input.trim()) {
             Ok(pubkey) => {
                 println!(
                     "  {} Valid public key: {}",
@@ -468,7 +467,7 @@ pub fn validate_threshold(input: &str, max_members: usize, default: u16) -> Resu
     }
 
     match input.trim().parse::<u16>() {
-        Ok(threshold) if threshold == 0 => Err(eyre::eyre!("Threshold must be at least 1")),
+        Ok(0) => Err(eyre::eyre!("Threshold must be at least 1")),
         Ok(threshold) if threshold > max_members as u16 => Err(eyre::eyre!(
             "Threshold cannot exceed number of members ({})",
             max_members
@@ -566,9 +565,9 @@ pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(b
         return Ok((false, Vec::new()));
     }
 
-    println!("");
+    println!();
     println!("{}", "Saved Network Configuration".bold().bright_yellow(),);
-    println!("");
+    println!();
     println!(
         "  {}: {}",
         "Networks".cyan(),
@@ -604,7 +603,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
         "\n{}",
         "📋 Found existing configuration:".bright_yellow().bold()
     );
-    println!("");
+    println!();
     if !config.members.is_empty() {
         println!(
             "  {}: {}",
@@ -619,7 +618,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
             );
         }
     }
-    println!("");
+    println!();
     println!(
         "  {}: {}",
         "Threshold".cyan(),
@@ -627,7 +626,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
     );
 
     // Show fee payer path
-    println!("");
+    println!();
     if let Some(fee_payer_path) = &config.fee_payer_path {
         println!(
             "  {}: {}",
@@ -645,7 +644,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
     // Show networks
     let networks_to_show = &config.networks;
 
-    println!("");
+    println!();
     println!(
         "  {}: {}",
         "Saved networks".cyan(),

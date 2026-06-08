@@ -129,11 +129,11 @@ async fn deploy_to_single_network(
     rpc_url: &str,
     create_key: &Keypair,
     setup_keypair: &Keypair,
-    fee_payer_signer: &Box<dyn Signer>,
+    fee_payer_signer: &dyn Signer,
     members: &[Member],
     threshold: u16,
 ) -> Result<DeploymentResult> {
-    let signer_for_creation = fee_payer_signer.as_ref();
+    let signer_for_creation = fee_payer_signer;
 
     let (multisig_address, signature) = create_multisig(
         rpc_url.to_string(),
@@ -167,7 +167,7 @@ async fn deploy_to_single_network(
     )?;
     let transaction = VersionedTransaction::try_new(
         VersionedMessage::V0(message),
-        &[fee_payer_signer.as_ref(), setup_keypair],
+        &[fee_payer_signer, setup_keypair],
     )?;
     crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to create activation proposal: {}", e))?;
@@ -187,7 +187,7 @@ async fn deploy_to_saved_networks(
     networks: &[String],
     create_key: &Keypair,
     setup_keypair: &Keypair,
-    fee_payer_signer: &Box<dyn Signer>,
+    fee_payer_signer: &dyn Signer,
     members: &[Member],
     threshold: u16,
 ) -> Result<Vec<DeploymentResult>> {
@@ -230,7 +230,7 @@ async fn deploy_to_manual_networks(
     config: &Config,
     create_key: &Keypair,
     contributor_keypair: &Keypair,
-    fee_payer_signer: &Box<dyn Signer>,
+    fee_payer_signer: &dyn Signer,
     members: &[Member],
     threshold: u16,
 ) -> Result<Vec<DeploymentResult>> {
@@ -293,7 +293,7 @@ fn print_deployment_summary(
     // All deployments share the same multisig/vault addresses, so use the first one
     let deployment = &deployments[0];
 
-    println!("");
+    println!();
     Output::header("👀 Deployment Complete");
 
     // Show which networks were deployed to
@@ -335,12 +335,7 @@ fn print_deployment_summary(
         } else {
             ""
         };
-        let member_display = format!(
-            "{}{} ({})",
-            member.key.to_string(),
-            role_indicator,
-            perms.join(", ")
-        );
+        let member_display = format!("{}{} ({})", member.key, role_indicator, perms.join(", "));
         let member_label = if member.permissions.mask == 1 {
             "Temporary Setup Keypair".to_string()
         } else {
