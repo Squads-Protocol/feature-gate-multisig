@@ -1,7 +1,7 @@
 use crate::constants::*;
 use crate::squads::{
     get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
-    CompiledInstruction, InstructionData, Member, MultisigCreateArgsV2,
+    CompiledInstruction, InstructionData, Member, MessageAddressTableLookup, MultisigCreateArgsV2,
     MultisigCreateProposalAccounts, MultisigCreateProposalArgs, MultisigCreateProposalData,
     MultisigCreateTransaction, MultisigCreateV2Accounts, MultisigCreateV2Data,
     MultisigExecuteTransactionAccounts, MultisigExecuteTransactionArgs,
@@ -28,11 +28,10 @@ use solana_hash::Hash;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_message::v0::Message;
-use solana_message::VersionedMessage;
+use solana_message::{AddressLookupTableAccount, VersionedMessage};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -41,133 +40,66 @@ pub fn create_rpc_client(url: &str) -> RpcClient {
     RpcClient::new_with_commitment(url, CommitmentConfig::confirmed())
 }
 
-/// Helper function to map account metas to their indexes in the account_keys array.
-/// Returns an error if any pubkey is not found in account_keys.
-fn map_metas_to_indexes(
-    metas: &[solana_instruction::AccountMeta],
-    account_keys: &[Pubkey],
-) -> eyre::Result<crate::squads::SmallVec<u8, u8>> {
-    let idxs: Vec<u8> = metas
-        .iter()
-        .map(|m| {
-            account_keys
-                .iter()
-                .position(|k| *k == m.pubkey)
-                .map(|i| i as u8)
-                .ok_or_else(|| eyre::eyre!("Account {} not found in account_keys", m.pubkey))
-        })
-        .collect::<eyre::Result<Vec<u8>>>()?;
-    Ok(crate::squads::SmallVec::from(idxs))
-}
-
-/// Convert a list of Instructions into a Squads TransactionMessage by sorting and
-/// deduplicating accounts, then computing the header counts.
+/// Compile `instructions` into a Squads `TransactionMessage` using Solana's official v0
+/// message compiler, then translate the result into the Squads wire format.
 ///
-/// This approach:
-/// 1. Groups accounts by category: writable signers, readonly signers, writable non-signers, readonly non-signers
-/// 2. Deduplicates accounts (upgrading permissions for duplicates)
-/// 3. Builds an index map for O(1) lookups when compiling instructions
-/// 4. Computes header counts based on the final sorted list
+/// `payer` becomes `account_keys[0]` — the required fee-payer/signer — matching Solana's
+/// account-ordering invariant. For Squads inner messages this is the vault PDA that signs
+/// via CPI. `address_lookup_table_accounts` lets callers pull accounts from on-chain lookup
+/// tables; pass `&[]` to keep every account static.
 ///
-/// The `_payer` parameter is unused but kept for API compatibility - Squads uses the
-/// vault PDA as the actual signer which is derived from the instruction accounts.
+/// The Squads inner message carries no blockhash of its own (it lives inside the outer
+/// transaction), so a placeholder blockhash is supplied to the compiler and discarded.
 pub fn build_squads_transaction_message(
+    payer: &Pubkey,
     instructions: &[Instruction],
-    _payer: &Pubkey,
+    address_lookup_table_accounts: &[AddressLookupTableAccount],
 ) -> eyre::Result<TransactionMessage> {
-    // Collect all accounts with their merged permissions
-    let mut account_map: HashMap<Pubkey, (bool, bool)> = HashMap::new(); // (is_signer, is_writable)
+    let compiled = Message::try_compile(
+        payer,
+        instructions,
+        address_lookup_table_accounts,
+        Hash::default(),
+    )?;
 
-    for ix in instructions {
-        for meta in &ix.accounts {
-            account_map
-                .entry(meta.pubkey)
-                .and_modify(|(is_signer, is_writable)| {
-                    // Upgrade permissions (OR logic)
-                    *is_signer = *is_signer || meta.is_signer;
-                    *is_writable = *is_writable || meta.is_writable;
-                })
-                .or_insert((meta.is_signer, meta.is_writable));
-        }
-        // Program ID is always readonly non-signer
-        account_map.entry(ix.program_id).or_insert((false, false));
-    }
+    let num_signers = compiled.header.num_required_signatures;
+    let num_writable_signers = num_signers
+        .checked_sub(compiled.header.num_readonly_signed_accounts)
+        .ok_or_else(|| eyre!("compiled message has more readonly signers than signers"))?;
+    let num_writable_non_signers = (compiled.account_keys.len() as u8)
+        .checked_sub(num_signers)
+        .and_then(|non_signers| {
+            non_signers.checked_sub(compiled.header.num_readonly_unsigned_accounts)
+        })
+        .ok_or_else(|| eyre!("compiled message header counts exceed account_keys length"))?;
 
-    // Sort accounts into 4 groups (Solana order):
-    // 1. Writable signers
-    // 2. Readonly signers
-    // 3. Writable non-signers
-    // 4. Readonly non-signers
-    let mut writable_signers: Vec<Pubkey> = Vec::new();
-    let mut readonly_signers: Vec<Pubkey> = Vec::new();
-    let mut writable_non_signers: Vec<Pubkey> = Vec::new();
-    let mut readonly_non_signers: Vec<Pubkey> = Vec::new();
-
-    for (pubkey, (is_signer, is_writable)) in account_map {
-        match (is_signer, is_writable) {
-            (true, true) => writable_signers.push(pubkey),
-            (true, false) => readonly_signers.push(pubkey),
-            (false, true) => writable_non_signers.push(pubkey),
-            (false, false) => readonly_non_signers.push(pubkey),
-        }
-    }
-
-    // Compute counts
-    let num_writable_signers = writable_signers.len() as u8;
-    let num_signers = (writable_signers.len() + readonly_signers.len()) as u8;
-    let num_writable_non_signers = writable_non_signers.len() as u8;
-
-    // Build final account_keys list in sorted order
-    let mut account_keys: Vec<Pubkey> = Vec::with_capacity(
-        writable_signers.len()
-            + readonly_signers.len()
-            + writable_non_signers.len()
-            + readonly_non_signers.len(),
-    );
-    account_keys.extend(writable_signers);
-    account_keys.extend(readonly_signers);
-    account_keys.extend(writable_non_signers);
-    account_keys.extend(readonly_non_signers);
-
-    // Build index map for O(1) lookups
-    let index_map: HashMap<Pubkey, u8> = account_keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (*k, i as u8))
+    let instructions: Vec<CompiledInstruction> = compiled
+        .instructions
+        .into_iter()
+        .map(|ix| CompiledInstruction {
+            program_id_index: ix.program_id_index,
+            account_indexes: SmallVec::from(ix.accounts),
+            data: SmallVec::from(ix.data),
+        })
         .collect();
 
-    // Convert instructions to Squads CompiledInstruction format
-    let compiled_instructions: Vec<CompiledInstruction> = instructions
-        .iter()
-        .map(|ix| {
-            let program_id_index = *index_map
-                .get(&ix.program_id)
-                .ok_or_else(|| eyre::eyre!("program_id {} not in account_keys", ix.program_id))?;
-            let account_indexes: Vec<u8> =
-                ix.accounts
-                    .iter()
-                    .map(|meta| {
-                        index_map.get(&meta.pubkey).copied().ok_or_else(|| {
-                            eyre::eyre!("account {} not in account_keys", meta.pubkey)
-                        })
-                    })
-                    .collect::<eyre::Result<Vec<u8>>>()?;
-
-            Ok(CompiledInstruction {
-                program_id_index,
-                account_indexes: SmallVec::from(account_indexes),
-                data: SmallVec::from(ix.data.clone()),
-            })
+    let address_table_lookups: Vec<MessageAddressTableLookup> = compiled
+        .address_table_lookups
+        .into_iter()
+        .map(|lookup| MessageAddressTableLookup {
+            account_key: lookup.account_key,
+            writable_indexes: SmallVec::from(lookup.writable_indexes),
+            readonly_indexes: SmallVec::from(lookup.readonly_indexes),
         })
-        .collect::<eyre::Result<Vec<CompiledInstruction>>>()?;
+        .collect();
 
     Ok(TransactionMessage {
         num_signers,
         num_writable_signers,
         num_writable_non_signers,
-        account_keys: SmallVec::from(account_keys),
-        instructions: SmallVec::from(compiled_instructions),
-        address_table_lookups: SmallVec::from(vec![]),
+        account_keys: SmallVec::from(compiled.account_keys),
+        instructions: SmallVec::from(instructions),
+        address_table_lookups: SmallVec::from(address_table_lookups),
     })
 }
 
@@ -602,65 +534,13 @@ pub fn create_transaction_and_proposal_message(
 ) -> eyre::Result<(Message, Pubkey, Pubkey)> {
     let program_id = program_id.unwrap_or(&crate::squads::SQUADS_MULTISIG_PROGRAM_ID);
 
-    // Derive transaction and proposal PDAs
     let (transaction_pda, _transaction_bump) =
         get_transaction_pda(multisig_address, transaction_index, Some(program_id));
     let (proposal_pda, _proposal_bump) =
         get_proposal_pda(multisig_address, transaction_index, Some(program_id));
 
-    // Create transaction instruction
-    let create_transaction_accounts = MultisigCreateTransaction {
-        multisig: *multisig_address,
-        transaction: transaction_pda,
-        creator: *contributor_pubkey,
-        rent_payer: *fee_payer_pubkey,
-        system_program: solana_system_interface::program::ID,
-    };
-
-    // Serialize the TransactionMessage to bytes as expected by the on-chain program
-    let transaction_message_bytes = borsh::to_vec(&transaction_message)?;
-
-    let create_transaction_data = VaultTransactionCreateArgsData {
-        args: VaultTransactionCreateArgs {
-            vault_index,
-            ephemeral_signers: 0, // No ephemeral signers for basic transactions
-            transaction_message: transaction_message_bytes,
-            memo: None,
-        },
-    };
-
-    let create_transaction_instruction = Instruction::new_with_bytes(
-        *program_id,
-        &create_transaction_data.data()?,
-        create_transaction_accounts.to_account_metas(),
-    );
-
-    // Create proposal instruction
-    let create_proposal_accounts = MultisigCreateProposalAccounts {
-        multisig: *multisig_address,
-        proposal: proposal_pda,
-        creator: *contributor_pubkey,
-        rent_payer: *fee_payer_pubkey,
-        system_program: solana_system_interface::program::ID,
-    };
-
-    let create_proposal_data = MultisigCreateProposalData {
-        args: MultisigCreateProposalArgs {
-            transaction_index,
-            is_draft: false, // Not a draft, ready for voting
-        },
-    };
-
-    let create_proposal_instruction = Instruction::new_with_bytes(
-        *program_id,
-        &create_proposal_data.data()?,
-        create_proposal_accounts.to_account_metas(),
-    );
-
-    // Build instructions list
     let mut instructions = Vec::new();
 
-    // Add compute unit price if specified
     if let Some(microlamports) = priority_fee {
         instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
             microlamports as u64,
@@ -672,14 +552,90 @@ pub fn create_transaction_and_proposal_message(
         instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(units));
     }
 
-    // Add both create transaction and create proposal instructions
-    instructions.push(create_transaction_instruction);
-    instructions.push(create_proposal_instruction);
+    instructions.push(create_vault_transaction_create_instruction(
+        program_id,
+        multisig_address,
+        &transaction_pda,
+        contributor_pubkey,
+        fee_payer_pubkey,
+        vault_index,
+        transaction_message,
+    )?);
+    instructions.push(create_proposal_create_instruction(
+        program_id,
+        multisig_address,
+        &proposal_pda,
+        contributor_pubkey,
+        fee_payer_pubkey,
+        transaction_index,
+    )?);
 
-    // Create message with fee payer as the payer
     let message = Message::try_compile(fee_payer_pubkey, &instructions, &[], recent_blockhash)?;
 
     Ok((message, transaction_pda, proposal_pda))
+}
+
+fn create_vault_transaction_create_instruction(
+    program_id: &Pubkey,
+    multisig_address: &Pubkey,
+    transaction_pda: &Pubkey,
+    creator: &Pubkey,
+    rent_payer: &Pubkey,
+    vault_index: u8,
+    transaction_message: TransactionMessage,
+) -> eyre::Result<Instruction> {
+    let accounts = MultisigCreateTransaction {
+        multisig: *multisig_address,
+        transaction: *transaction_pda,
+        creator: *creator,
+        rent_payer: *rent_payer,
+        system_program: solana_system_interface::program::ID,
+    };
+
+    let data = VaultTransactionCreateArgsData {
+        args: VaultTransactionCreateArgs {
+            vault_index,
+            ephemeral_signers: 0,
+            transaction_message: borsh::to_vec(&transaction_message)?,
+            memo: None,
+        },
+    };
+
+    Ok(Instruction::new_with_bytes(
+        *program_id,
+        &data.data()?,
+        accounts.to_account_metas(),
+    ))
+}
+
+pub(crate) fn create_proposal_create_instruction(
+    program_id: &Pubkey,
+    multisig_address: &Pubkey,
+    proposal_pda: &Pubkey,
+    creator: &Pubkey,
+    rent_payer: &Pubkey,
+    transaction_index: u64,
+) -> eyre::Result<Instruction> {
+    let accounts = MultisigCreateProposalAccounts {
+        multisig: *multisig_address,
+        proposal: *proposal_pda,
+        creator: *creator,
+        rent_payer: *rent_payer,
+        system_program: solana_system_interface::program::ID,
+    };
+
+    let data = MultisigCreateProposalData {
+        args: MultisigCreateProposalArgs {
+            transaction_index,
+            is_draft: false,
+        },
+    };
+
+    Ok(Instruction::new_with_bytes(
+        *program_id,
+        &data.data()?,
+        accounts.to_account_metas(),
+    ))
 }
 
 /// Create a vote (approve or reject) message for a proposal.
@@ -806,7 +762,7 @@ pub fn create_child_execute_transaction_message(
     };
 
     // Use centralized helper - parent_member_pubkey is the signer (vault PDA)
-    build_squads_transaction_message(&[ix], &parent_member_pubkey)
+    build_squads_transaction_message(&parent_member_pubkey, &[ix], &[])
 }
 
 /// Build a TransactionMessage for a parent multisig to execute a child's config transaction.
@@ -841,7 +797,7 @@ pub fn create_child_execute_config_transaction_message(
     };
 
     // Use centralized helper - parent_member_pubkey is the signer (vault PDA)
-    build_squads_transaction_message(&[ix], &parent_member_pubkey)
+    build_squads_transaction_message(&parent_member_pubkey, &[ix], &[])
 }
 
 /// Build a TransactionMessage for a parent multisig to CREATE a child's config transaction
@@ -856,11 +812,7 @@ pub fn create_child_create_config_transaction_and_proposal_message(
     actions: Vec<crate::squads::ConfigAction>,
     memo: Option<String>,
 ) -> eyre::Result<TransactionMessage> {
-    use crate::squads::{
-        ConfigTransactionCreateArgs, ConfigTransactionCreateData, InstructionData,
-        MultisigCreateProposalAccounts, MultisigCreateProposalArgs, MultisigCreateProposalData,
-        SmallVec, SQUADS_MULTISIG_PROGRAM_ID,
-    };
+    use crate::squads::SQUADS_MULTISIG_PROGRAM_ID;
 
     let (transaction_pda, _) = get_transaction_pda(
         &child_multisig,
@@ -873,71 +825,59 @@ pub fn create_child_create_config_transaction_and_proposal_message(
         Some(&SQUADS_MULTISIG_PROGRAM_ID),
     );
 
-    // Instruction: ConfigTransactionCreate
-    let config_create_accounts = vec![
-        solana_instruction::AccountMeta::new(child_multisig, false),
-        solana_instruction::AccountMeta::new(transaction_pda, false),
-        solana_instruction::AccountMeta::new_readonly(parent_member_pubkey, true), // creator (signer via CPI seeds)
-        solana_instruction::AccountMeta::new(rent_payer_pubkey, true), // rent payer (lamports)
-        solana_instruction::AccountMeta::new_readonly(solana_system_interface::program::ID, false),
+    let config_create_instruction = create_config_transaction_create_instruction(
+        &SQUADS_MULTISIG_PROGRAM_ID,
+        &child_multisig,
+        &transaction_pda,
+        &parent_member_pubkey,
+        &rent_payer_pubkey,
+        actions,
+        memo,
+    )?;
+    let create_proposal_instruction = create_proposal_create_instruction(
+        &SQUADS_MULTISIG_PROGRAM_ID,
+        &child_multisig,
+        &proposal_pda,
+        &parent_member_pubkey,
+        &rent_payer_pubkey,
+        child_tx_index,
+    )?;
+
+    build_squads_transaction_message(
+        &parent_member_pubkey,
+        &[config_create_instruction, create_proposal_instruction],
+        &[],
+    )
+}
+
+pub(crate) fn create_config_transaction_create_instruction(
+    program_id: &Pubkey,
+    multisig_address: &Pubkey,
+    transaction_pda: &Pubkey,
+    creator: &Pubkey,
+    rent_payer: &Pubkey,
+    actions: Vec<crate::squads::ConfigAction>,
+    memo: Option<String>,
+) -> eyre::Result<Instruction> {
+    use crate::squads::{ConfigTransactionCreateArgs, ConfigTransactionCreateData};
+
+    let accounts = vec![
+        AccountMeta::new(*multisig_address, false),
+        AccountMeta::new(*transaction_pda, false),
+        AccountMeta::new_readonly(*creator, true),
+        AccountMeta::new(*rent_payer, true),
+        AccountMeta::new_readonly(solana_system_interface::program::ID, false),
     ];
 
-    let config_create_data = ConfigTransactionCreateData {
+    let data = ConfigTransactionCreateData {
         args: ConfigTransactionCreateArgs { actions, memo },
-    }
-    .data()?;
-
-    // Instruction: ProposalCreate
-    let proposal_accounts = MultisigCreateProposalAccounts {
-        multisig: child_multisig,
-        proposal: proposal_pda,
-        creator: parent_member_pubkey,
-        rent_payer: rent_payer_pubkey,
-        system_program: solana_system_interface::program::ID,
-    }
-    .to_account_metas();
-
-    let proposal_data = MultisigCreateProposalData {
-        args: MultisigCreateProposalArgs {
-            transaction_index: child_tx_index,
-            is_draft: false,
-        },
-    }
-    .data()?;
-
-    // Union of all accounts + program id. Signers must be first in account_keys.
-    let account_keys: Vec<Pubkey> = vec![
-        rent_payer_pubkey,                    // signer (writable)
-        parent_member_pubkey,                 // signer (readonly)
-        child_multisig,                       // writable non-signer
-        transaction_pda,                      // writable non-signer
-        proposal_pda,                         // writable non-signer
-        solana_system_interface::program::ID, // readonly non-signer
-        SQUADS_MULTISIG_PROGRAM_ID,           // program id
-    ];
-
-    let program_id_index = 6u8;
-
-    let config_ix = crate::squads::CompiledInstruction {
-        program_id_index,
-        account_indexes: map_metas_to_indexes(&config_create_accounts, &account_keys)?,
-        data: SmallVec::from(config_create_data),
     };
 
-    let proposal_ix = crate::squads::CompiledInstruction {
-        program_id_index,
-        account_indexes: map_metas_to_indexes(&proposal_accounts, &account_keys)?,
-        data: SmallVec::from(proposal_data),
-    };
-
-    Ok(TransactionMessage {
-        num_signers: 2,
-        num_writable_signers: 1, // first signer (rent payer) writable; second signer (creator) readonly
-        num_writable_non_signers: 3, // multisig, transaction, proposal
-        account_keys: SmallVec::from(account_keys),
-        instructions: SmallVec::from(vec![config_ix, proposal_ix]),
-        address_table_lookups: SmallVec::from(vec![]),
-    })
+    Ok(Instruction::new_with_bytes(
+        *program_id,
+        &data.data()?,
+        accounts,
+    ))
 }
 
 /// Build a TransactionMessage for a parent multisig to CREATE a child's vault transaction
@@ -951,12 +891,7 @@ pub fn create_child_create_vault_transaction_and_proposal_message(
     rent_payer_pubkey: Pubkey,
     transaction_message: TransactionMessage,
 ) -> eyre::Result<TransactionMessage> {
-    use crate::squads::{
-        get_proposal_pda, get_transaction_pda, InstructionData, MultisigCreateProposalAccounts,
-        MultisigCreateProposalArgs, MultisigCreateProposalData, MultisigCreateTransaction,
-        SmallVec, VaultTransactionCreateArgs, VaultTransactionCreateArgsData,
-        SQUADS_MULTISIG_PROGRAM_ID,
-    };
+    use crate::squads::{get_proposal_pda, get_transaction_pda, SQUADS_MULTISIG_PROGRAM_ID};
 
     let (transaction_pda, _) = get_transaction_pda(
         &child_multisig,
@@ -969,81 +904,29 @@ pub fn create_child_create_vault_transaction_and_proposal_message(
         Some(&SQUADS_MULTISIG_PROGRAM_ID),
     );
 
-    // Instruction: VaultTransactionCreate
-    let create_transaction_accounts = MultisigCreateTransaction {
-        multisig: child_multisig,
-        transaction: transaction_pda,
-        creator: parent_member_pubkey,
-        rent_payer: rent_payer_pubkey,
-        system_program: solana_system_interface::program::ID,
-    };
+    let create_transaction_instruction = create_vault_transaction_create_instruction(
+        &SQUADS_MULTISIG_PROGRAM_ID,
+        &child_multisig,
+        &transaction_pda,
+        &parent_member_pubkey,
+        &rent_payer_pubkey,
+        0,
+        transaction_message,
+    )?;
+    let create_proposal_instruction = create_proposal_create_instruction(
+        &SQUADS_MULTISIG_PROGRAM_ID,
+        &child_multisig,
+        &proposal_pda,
+        &parent_member_pubkey,
+        &rent_payer_pubkey,
+        child_tx_index,
+    )?;
 
-    let create_transaction_data = VaultTransactionCreateArgsData {
-        args: VaultTransactionCreateArgs {
-            vault_index: 0,
-            ephemeral_signers: 0,
-            transaction_message: borsh::to_vec(&transaction_message)?,
-            memo: None,
-        },
-    }
-    .data()?;
-
-    // Instruction: ProposalCreate
-    let create_proposal_accounts = MultisigCreateProposalAccounts {
-        multisig: child_multisig,
-        proposal: proposal_pda,
-        creator: parent_member_pubkey,
-        rent_payer: rent_payer_pubkey,
-        system_program: solana_system_interface::program::ID,
-    };
-
-    let create_proposal_data = MultisigCreateProposalData {
-        args: MultisigCreateProposalArgs {
-            transaction_index: child_tx_index,
-            is_draft: false,
-        },
-    }
-    .data()?;
-
-    // Union of all accounts + program id. Signers must be first in account_keys.
-    let account_keys: Vec<Pubkey> = vec![
-        rent_payer_pubkey,                    // signer (writable)
-        parent_member_pubkey,                 // signer (readonly)
-        child_multisig,                       // writable non-signer
-        transaction_pda,                      // writable non-signer
-        proposal_pda,                         // writable non-signer
-        solana_system_interface::program::ID, // readonly non-signer
-        SQUADS_MULTISIG_PROGRAM_ID,           // program id
-    ];
-
-    let program_id_index = 6u8;
-
-    let create_tx_ix = crate::squads::CompiledInstruction {
-        program_id_index,
-        account_indexes: map_metas_to_indexes(
-            &create_transaction_accounts.to_account_metas(),
-            &account_keys,
-        )?,
-        data: SmallVec::from(create_transaction_data),
-    };
-
-    let create_prop_ix = crate::squads::CompiledInstruction {
-        program_id_index,
-        account_indexes: map_metas_to_indexes(
-            &create_proposal_accounts.to_account_metas(),
-            &account_keys,
-        )?,
-        data: SmallVec::from(create_proposal_data),
-    };
-
-    Ok(TransactionMessage {
-        num_signers: 2,
-        num_writable_signers: 1, // rent payer writable signer; creator readonly signer
-        num_writable_non_signers: 3, // multisig, transaction, proposal
-        account_keys: SmallVec::from(account_keys),
-        instructions: SmallVec::from(vec![create_tx_ix, create_prop_ix]),
-        address_table_lookups: SmallVec::from(vec![]),
-    })
+    build_squads_transaction_message(
+        &parent_member_pubkey,
+        &[create_transaction_instruction, create_proposal_instruction],
+        &[],
+    )
 }
 
 /// Build a TransactionMessage for feature gate activation or revocation.
@@ -1072,7 +955,7 @@ pub fn create_feature_gate_transaction_message(
 
     // Use the centralized helper to build the TransactionMessage
     // The feature_id is the signer (vault PDA), so we pass it as the payer
-    build_squads_transaction_message(&instructions, &feature_id)
+    build_squads_transaction_message(&feature_id, &instructions, &[])
 }
 
 /// Create an execute message for any Squads multisig proposal at `proposal_index`.
@@ -1439,6 +1322,81 @@ mod tests {
             proposal_metas[4].pubkey,
             solana_system_interface::program::ID
         );
+    }
+
+    #[test]
+    fn test_build_squads_transaction_message_is_stable_and_upgrades_permissions() {
+        let writable_signer_a = Pubkey::new_unique();
+        let writable_signer_b = Pubkey::new_unique();
+        let readonly_signer = Pubkey::new_unique();
+        let writable_non_signer = Pubkey::new_unique();
+        let readonly_non_signer = Pubkey::new_unique();
+        let program_a = Pubkey::new_unique();
+        let program_b = Pubkey::new_unique();
+
+        let instructions = vec![
+            Instruction {
+                program_id: program_a,
+                accounts: vec![
+                    AccountMeta::new_readonly(writable_signer_a, true),
+                    AccountMeta::new(writable_non_signer, false),
+                    AccountMeta::new_readonly(readonly_non_signer, false),
+                ],
+                data: vec![1],
+            },
+            Instruction {
+                program_id: program_b,
+                accounts: vec![
+                    AccountMeta::new(writable_signer_b, true),
+                    AccountMeta::new(writable_signer_a, true),
+                    AccountMeta::new_readonly(readonly_signer, true),
+                    AccountMeta::new_readonly(writable_non_signer, false),
+                ],
+                data: vec![2],
+            },
+        ];
+
+        let message =
+            build_squads_transaction_message(&writable_signer_a, &instructions, &[]).unwrap();
+
+        let account_keys: Vec<Pubkey> = message.account_keys.iter().copied().collect();
+
+        // The payer is the required fee-payer/signer and must come first.
+        assert_eq!(account_keys[0], writable_signer_a);
+
+        // Header counts reflect the four account classes.
+        assert_eq!(message.num_signers, 3);
+        assert_eq!(message.num_writable_signers, 2);
+        assert_eq!(message.num_writable_non_signers, 1);
+
+        // Every account appears exactly once (writable_signer_a and writable_non_signer
+        // are referenced by both instructions but deduplicated).
+        let mut unique = account_keys.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), account_keys.len());
+        assert_eq!(account_keys.len(), 7);
+
+        // Each instruction's compiled indices resolve back to the original program and accounts.
+        let resolve = |index: u8| account_keys[index as usize];
+        for (compiled, original) in message.instructions.iter().zip(instructions.iter()) {
+            assert_eq!(resolve(compiled.program_id_index), original.program_id);
+            let resolved: Vec<Pubkey> = compiled
+                .account_indexes
+                .iter()
+                .copied()
+                .map(resolve)
+                .collect();
+            let expected: Vec<Pubkey> = original.accounts.iter().map(|meta| meta.pubkey).collect();
+            assert_eq!(resolved, expected);
+        }
+
+        // Permissions are upgraded across instructions: writable_signer_a is a readonly
+        // signer in instruction 0 but writable in instruction 1, so it lands among the
+        // writable signers (the first `num_writable_signers` keys).
+        let writable_signer_slice = &account_keys[..usize::from(message.num_writable_signers)];
+        assert!(writable_signer_slice.contains(&writable_signer_a));
+        assert!(writable_signer_slice.contains(&writable_signer_b));
     }
 
     #[test]

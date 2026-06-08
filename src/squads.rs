@@ -92,7 +92,6 @@ pub enum ConfigAction {
     ChangeThreshold { new_threshold: u16 },
 }
 
-
 #[derive(BorshDeserialize)]
 pub struct ProgramConfig {
     #[allow(dead_code)]
