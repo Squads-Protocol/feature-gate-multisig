@@ -1,7 +1,7 @@
 use crate::constants::*;
 use crate::squads::{
     get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
-    CompiledInstruction, InstructionData, Member, MultisigCreateArgsV2,
+    CompiledInstruction, InstructionData, Member, MessageAddressTableLookup, MultisigCreateArgsV2,
     MultisigCreateProposalAccounts, MultisigCreateProposalArgs, MultisigCreateProposalData,
     MultisigCreateTransaction, MultisigCreateV2Accounts, MultisigCreateV2Data,
     MultisigExecuteTransactionAccounts, MultisigExecuteTransactionArgs,
@@ -28,7 +28,7 @@ use solana_hash::Hash;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_message::v0::Message;
-use solana_message::VersionedMessage;
+use solana_message::{AddressLookupTableAccount, VersionedMessage};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
@@ -40,130 +40,66 @@ pub fn create_rpc_client(url: &str) -> RpcClient {
     RpcClient::new_with_commitment(url, CommitmentConfig::confirmed())
 }
 
-#[derive(Clone, Copy)]
-struct MessageAccount {
-    pubkey: Pubkey,
-    is_signer: bool,
-    is_writable: bool,
-}
-
-impl MessageAccount {
-    fn matches_class(self, is_signer: bool, is_writable: bool) -> bool {
-        self.is_signer == is_signer && self.is_writable == is_writable
-    }
-}
-
-fn upsert_message_account(accounts: &mut Vec<MessageAccount>, meta: AccountMeta) {
-    if let Some(account) = accounts
-        .iter_mut()
-        .find(|account| account.pubkey == meta.pubkey)
-    {
-        account.is_signer |= meta.is_signer;
-        account.is_writable |= meta.is_writable;
-    } else {
-        accounts.push(MessageAccount {
-            pubkey: meta.pubkey,
-            is_signer: meta.is_signer,
-            is_writable: meta.is_writable,
-        });
-    }
-}
-
-/// Convert a list of Instructions into a Squads TransactionMessage by deterministically
-/// deduplicating accounts, then computing the header counts.
+/// Compile `instructions` into a Squads `TransactionMessage` using Solana's official v0
+/// message compiler, then translate the result into the Squads wire format.
 ///
-/// This approach:
-/// 1. Records accounts in first-seen order, including program IDs
-/// 2. Deduplicates accounts while upgrading permissions for duplicates
-/// 3. Stable-partitions accounts into Solana's static account classes
-/// 4. Computes header counts based on the final sorted list
+/// `payer` becomes `account_keys[0]` — the required fee-payer/signer — matching Solana's
+/// account-ordering invariant. For Squads inner messages this is the vault PDA that signs
+/// via CPI. `address_lookup_table_accounts` lets callers pull accounts from on-chain lookup
+/// tables; pass `&[]` to keep every account static.
 ///
-/// The `_payer` parameter is unused but kept for API compatibility - Squads uses the
-/// vault PDA as the actual signer which is derived from the instruction accounts.
+/// The Squads inner message carries no blockhash of its own (it lives inside the outer
+/// transaction), so a placeholder blockhash is supplied to the compiler and discarded.
 pub fn build_squads_transaction_message(
+    payer: &Pubkey,
     instructions: &[Instruction],
-    _payer: &Pubkey,
+    address_lookup_table_accounts: &[AddressLookupTableAccount],
 ) -> eyre::Result<TransactionMessage> {
-    let mut accounts = Vec::new();
-    for ix in instructions {
-        for meta in &ix.accounts {
-            upsert_message_account(&mut accounts, meta.clone());
-        }
-        upsert_message_account(
-            &mut accounts,
-            AccountMeta::new_readonly(ix.program_id, false),
-        );
-    }
+    let compiled = Message::try_compile(
+        payer,
+        instructions,
+        address_lookup_table_accounts,
+        Hash::default(),
+    )?;
 
-    let writable_signers: Vec<_> = accounts
-        .iter()
-        .copied()
-        .filter(|account| account.matches_class(true, true))
-        .collect();
-    let readonly_signers: Vec<_> = accounts
-        .iter()
-        .copied()
-        .filter(|account| account.matches_class(true, false))
-        .collect();
-    let writable_non_signers: Vec<_> = accounts
-        .iter()
-        .copied()
-        .filter(|account| account.matches_class(false, true))
-        .collect();
-    let readonly_non_signers: Vec<_> = accounts
-        .iter()
-        .copied()
-        .filter(|account| account.matches_class(false, false))
-        .collect();
-
-    let num_writable_signers = writable_signers.len() as u8;
-    let num_signers = (writable_signers.len() + readonly_signers.len()) as u8;
-    let num_writable_non_signers = writable_non_signers.len() as u8;
-
-    let account_keys: Vec<Pubkey> = writable_signers
-        .into_iter()
-        .chain(readonly_signers)
-        .chain(writable_non_signers)
-        .chain(readonly_non_signers)
-        .map(|account| account.pubkey)
-        .collect();
-
-    // Convert instructions to Squads CompiledInstruction format
-    let compiled_instructions: Vec<CompiledInstruction> = instructions
-        .iter()
-        .map(|ix| {
-            let program_id_index = account_keys
-                .iter()
-                .position(|key| *key == ix.program_id)
-                .map(|index| index as u8)
-                .ok_or_else(|| eyre::eyre!("program_id {} not in account_keys", ix.program_id))?;
-            let account_indexes: Vec<u8> = ix
-                .accounts
-                .iter()
-                .map(|meta| {
-                    account_keys
-                        .iter()
-                        .position(|key| *key == meta.pubkey)
-                        .map(|index| index as u8)
-                        .ok_or_else(|| eyre::eyre!("account {} not in account_keys", meta.pubkey))
-                })
-                .collect::<eyre::Result<Vec<u8>>>()?;
-
-            Ok(CompiledInstruction {
-                program_id_index,
-                account_indexes: SmallVec::from(account_indexes),
-                data: SmallVec::from(ix.data.clone()),
-            })
+    let num_signers = compiled.header.num_required_signatures;
+    let num_writable_signers = num_signers
+        .checked_sub(compiled.header.num_readonly_signed_accounts)
+        .ok_or_else(|| eyre!("compiled message has more readonly signers than signers"))?;
+    let num_writable_non_signers = (compiled.account_keys.len() as u8)
+        .checked_sub(num_signers)
+        .and_then(|non_signers| {
+            non_signers.checked_sub(compiled.header.num_readonly_unsigned_accounts)
         })
-        .collect::<eyre::Result<Vec<CompiledInstruction>>>()?;
+        .ok_or_else(|| eyre!("compiled message header counts exceed account_keys length"))?;
+
+    let instructions: Vec<CompiledInstruction> = compiled
+        .instructions
+        .into_iter()
+        .map(|ix| CompiledInstruction {
+            program_id_index: ix.program_id_index,
+            account_indexes: SmallVec::from(ix.accounts),
+            data: SmallVec::from(ix.data),
+        })
+        .collect();
+
+    let address_table_lookups: Vec<MessageAddressTableLookup> = compiled
+        .address_table_lookups
+        .into_iter()
+        .map(|lookup| MessageAddressTableLookup {
+            account_key: lookup.account_key,
+            writable_indexes: SmallVec::from(lookup.writable_indexes),
+            readonly_indexes: SmallVec::from(lookup.readonly_indexes),
+        })
+        .collect();
 
     Ok(TransactionMessage {
         num_signers,
         num_writable_signers,
         num_writable_non_signers,
-        account_keys: SmallVec::from(account_keys),
-        instructions: SmallVec::from(compiled_instructions),
-        address_table_lookups: SmallVec::from(vec![]),
+        account_keys: SmallVec::from(compiled.account_keys),
+        instructions: SmallVec::from(instructions),
+        address_table_lookups: SmallVec::from(address_table_lookups),
     })
 }
 
@@ -826,7 +762,7 @@ pub fn create_child_execute_transaction_message(
     };
 
     // Use centralized helper - parent_member_pubkey is the signer (vault PDA)
-    build_squads_transaction_message(&[ix], &parent_member_pubkey)
+    build_squads_transaction_message(&parent_member_pubkey, &[ix], &[])
 }
 
 /// Build a TransactionMessage for a parent multisig to execute a child's config transaction.
@@ -861,7 +797,7 @@ pub fn create_child_execute_config_transaction_message(
     };
 
     // Use centralized helper - parent_member_pubkey is the signer (vault PDA)
-    build_squads_transaction_message(&[ix], &parent_member_pubkey)
+    build_squads_transaction_message(&parent_member_pubkey, &[ix], &[])
 }
 
 /// Build a TransactionMessage for a parent multisig to CREATE a child's config transaction
@@ -908,8 +844,9 @@ pub fn create_child_create_config_transaction_and_proposal_message(
     )?;
 
     build_squads_transaction_message(
-        &[config_create_instruction, create_proposal_instruction],
         &parent_member_pubkey,
+        &[config_create_instruction, create_proposal_instruction],
+        &[],
     )
 }
 
@@ -986,8 +923,9 @@ pub fn create_child_create_vault_transaction_and_proposal_message(
     )?;
 
     build_squads_transaction_message(
-        &[create_transaction_instruction, create_proposal_instruction],
         &parent_member_pubkey,
+        &[create_transaction_instruction, create_proposal_instruction],
+        &[],
     )
 }
 
@@ -1017,7 +955,7 @@ pub fn create_feature_gate_transaction_message(
 
     // Use the centralized helper to build the TransactionMessage
     // The feature_id is the signer (vault PDA), so we pass it as the payer
-    build_squads_transaction_message(&instructions, &feature_id)
+    build_squads_transaction_message(&feature_id, &instructions, &[])
 }
 
 /// Create an execute message for any Squads multisig proposal at `proposal_index`.
@@ -1418,38 +1356,47 @@ mod tests {
             },
         ];
 
-        let message = build_squads_transaction_message(&instructions, &writable_signer_a).unwrap();
+        let message =
+            build_squads_transaction_message(&writable_signer_a, &instructions, &[]).unwrap();
 
+        let account_keys: Vec<Pubkey> = message.account_keys.iter().copied().collect();
+
+        // The payer is the required fee-payer/signer and must come first.
+        assert_eq!(account_keys[0], writable_signer_a);
+
+        // Header counts reflect the four account classes.
         assert_eq!(message.num_signers, 3);
         assert_eq!(message.num_writable_signers, 2);
         assert_eq!(message.num_writable_non_signers, 1);
-        let account_keys: Vec<_> = message.account_keys.iter().copied().collect();
-        assert_eq!(
-            account_keys,
-            vec![
-                writable_signer_a,
-                writable_signer_b,
-                readonly_signer,
-                writable_non_signer,
-                readonly_non_signer,
-                program_a,
-                program_b,
-            ]
-        );
-        assert_eq!(message.instructions[0].program_id_index, 5);
-        let first_instruction_accounts: Vec<_> = message.instructions[0]
-            .account_indexes
-            .iter()
-            .copied()
-            .collect();
-        assert_eq!(first_instruction_accounts, vec![0, 3, 4]);
-        assert_eq!(message.instructions[1].program_id_index, 6);
-        let second_instruction_accounts: Vec<_> = message.instructions[1]
-            .account_indexes
-            .iter()
-            .copied()
-            .collect();
-        assert_eq!(second_instruction_accounts, vec![1, 0, 2, 3]);
+
+        // Every account appears exactly once (writable_signer_a and writable_non_signer
+        // are referenced by both instructions but deduplicated).
+        let mut unique = account_keys.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), account_keys.len());
+        assert_eq!(account_keys.len(), 7);
+
+        // Each instruction's compiled indices resolve back to the original program and accounts.
+        let resolve = |index: u8| account_keys[index as usize];
+        for (compiled, original) in message.instructions.iter().zip(instructions.iter()) {
+            assert_eq!(resolve(compiled.program_id_index), original.program_id);
+            let resolved: Vec<Pubkey> = compiled
+                .account_indexes
+                .iter()
+                .copied()
+                .map(resolve)
+                .collect();
+            let expected: Vec<Pubkey> = original.accounts.iter().map(|meta| meta.pubkey).collect();
+            assert_eq!(resolved, expected);
+        }
+
+        // Permissions are upgraded across instructions: writable_signer_a is a readonly
+        // signer in instruction 0 but writable in instruction 1, so it lands among the
+        // writable signers (the first `num_writable_signers` keys).
+        let writable_signer_slice = &account_keys[..usize::from(message.num_writable_signers)];
+        assert!(writable_signer_slice.contains(&writable_signer_a));
+        assert!(writable_signer_slice.contains(&writable_signer_b));
     }
 
     #[test]

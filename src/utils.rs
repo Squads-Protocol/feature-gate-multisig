@@ -354,7 +354,7 @@ fn create_child_vote_transaction_message(
         accounts.to_account_metas(),
     );
 
-    build_squads_transaction_message(&[ix], &parent_member_pubkey)
+    build_squads_transaction_message(&parent_member_pubkey, &[ix], &[])
 }
 
 // Transaction creation functions
@@ -365,7 +365,7 @@ pub fn create_feature_activation_transaction_message(
     let instructions = activate_feature_funded(&feature_id);
 
     // Use centralized helper - feature_id is the signer (vault PDA)
-    build_squads_transaction_message(&instructions, &feature_id)
+    build_squads_transaction_message(&feature_id, &instructions, &[])
 }
 
 /// Create and send a transaction to fund the feature gate account with rent-exempt lamports

@@ -316,7 +316,6 @@ async fn fetch_and_display_transactions_and_proposals(
 
     // Fetch data for all transactions
     for tx_index in 1..=multisig.transaction_index {
-
         println!(
             "{}",
             format!("📋 TRANSACTION INDEX {}", tx_index)
