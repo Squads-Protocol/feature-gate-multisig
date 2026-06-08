@@ -28,7 +28,7 @@ feature-gate-multisig-tool config
 
 | Command | Description |
 |---------|-------------|
-| `create` | Create a new feature gate multisig with paired proposals |
+| `create` | Create a new feature gate multisig with an activation proposal |
 | `show <address>` | Display multisig details, members, and proposal status |
 | `config` | Show saved configuration |
 | `interactive` | Launch interactive menu (default) |
@@ -54,14 +54,13 @@ Each supports: Create, Approve, Reject, Execute
 
 ## Proposal Structure
 
-When a multisig is created, two proposals are automatically generated:
+When a multisig is created, one proposal is automatically generated:
 
 | Index | Type | Purpose |
 |-------|------|---------|
 | 1 | Vault Transaction | Feature Activation |
-| 2 | Config Transaction | Lower threshold to 1 |
 
-**Note**: Interacting with feature gate activation will auto handle Vault + Config transaction.
+**Note**: Activating or revoking a feature gate does not change the multisig threshold.
 
 Revocation proposals are **not** pre-created. If you need to revoke a feature, create a new revocation proposal using "Proposal Actions" → "Revoke Feature Gate" → "Create". See [Emergency Revocation workflow](docs/WORKFLOWS.md#4-emergency-revocation) for details.
 

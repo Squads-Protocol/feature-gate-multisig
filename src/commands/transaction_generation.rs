@@ -1,6 +1,5 @@
 use eyre::Result;
 use solana_clap_v3_utils::keypair::signer_from_path;
-use solana_client::rpc_client::RpcClient;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -17,8 +16,8 @@ use crate::{
         create_child_create_config_transaction_and_proposal_message,
         create_child_execute_config_transaction_message, create_child_execute_transaction_message,
         create_execute_config_transaction_message, create_execute_transaction_message,
-        create_rpc_client, create_transaction_and_proposal_message,
-        create_vote_proposal_message, get_proposal_status_and_threshold,
+        create_rpc_client, create_transaction_and_proposal_message, create_vote_proposal_message,
+        get_proposal_status_and_threshold,
     },
     utils::{
         choose_network_from_config, create_child_vote_approve_transaction_message,
@@ -60,8 +59,6 @@ enum ParentFlowPayload {
     None,
     Execute(Vec<solana_instruction::AccountMeta>),
     Create(TransactionMessage),
-    ApprovePaired { vault_index: u64, config_index: u64 },
-    ExecutePaired { vault_index: u64, config_index: u64 },
 }
 
 impl TransactionKind {
@@ -166,7 +163,10 @@ fn verify_member_permission(
 ) -> Result<()> {
     let (is_member, has_permission) = check_member_permission(ms, key, permission);
     if !is_member {
-        output::Output::error(&format!("{} key is not a member of the multisig.", role_name));
+        output::Output::error(&format!(
+            "{} key is not a member of the multisig.",
+            role_name
+        ));
         return Err(eyre::eyre!("{} must be a multisig member", role_name));
     }
     if !has_permission {
@@ -360,19 +360,6 @@ async fn handle_parent_multisig_flow(
                 parent_vault_member,
             )?
         }
-        (
-            ProposalAction::Approve,
-            ChildTransactionFlavor::Vault,
-            ParentFlowPayload::ApprovePaired {
-                vault_index,
-                config_index,
-            },
-        ) => crate::provision::create_child_approve_paired_proposals_message(
-            feature_gate_multisig_address,
-            vault_index,
-            config_index,
-            parent_vault_member,
-        )?,
         (ProposalAction::Reject, _, ParentFlowPayload::None) => {
             create_child_vote_reject_transaction_message(
                 feature_gate_multisig_address,
@@ -394,36 +381,6 @@ async fn handle_parent_multisig_flow(
             create_child_execute_config_transaction_message(
                 feature_gate_multisig_address,
                 proposal_index,
-                parent_vault_member,
-            )?
-        }
-        (
-            ProposalAction::Execute,
-            ChildTransactionFlavor::Vault,
-            ParentFlowPayload::ExecutePaired {
-                vault_index,
-                config_index,
-            },
-        ) => {
-            // Fetch the vault transaction from chain to get execution accounts
-            use crate::squads::{get_transaction_pda, VaultTransaction};
-            let (vault_transaction_pda, _) = get_transaction_pda(
-                &feature_gate_multisig_address,
-                vault_index,
-                Some(&program_id),
-            );
-            let vault_transaction_account_data = rpc_client
-                .get_account_data(&vault_transaction_pda)
-                .map_err(|e| eyre::eyre!("Failed to fetch vault transaction account: {}", e))?;
-            let vault_tx =
-                VaultTransaction::try_from_slice(&vault_transaction_account_data[8..])
-                    .map_err(|e| eyre::eyre!("Failed to deserialize vault transaction: {}", e))?;
-
-            crate::provision::create_child_execute_paired_proposals_message(
-                feature_gate_multisig_address,
-                vault_index,
-                vault_tx,
-                config_index,
                 parent_vault_member,
             )?
         }
@@ -516,49 +473,46 @@ async fn handle_parent_multisig_flow(
             && has_execute_permission
             && confirm_action("Execute this parent proposal now?", true)
         {
-                let fresh_blockhash = rpc_client.get_latest_blockhash()?;
-                // Parent multisig always stores vault transactions, even when creating config on child
-                let exec_msg = create_execute_transaction_message(
-                    program_id,
-                    &parent_multisig,
-                    &fee_payer_signer.pubkey(),
-                    &fee_payer_signer.pubkey(),
-                    parent_proposal_index,
-                    &rpc_client,
-                    fresh_blockhash,
-                )?;
-                let exec_tx = VersionedTransaction::try_new(
-                    VersionedMessage::V0(exec_msg),
-                    &[fee_payer_signer.as_ref()],
-                )?;
-                let exec_sig =
-                    crate::provision::send_and_confirm_transaction(&exec_tx, &rpc_client)
-                        .map_err(|e| eyre::eyre!("Failed to execute parent proposal: {}", e))?;
-                output::Output::field("Parent proposal executed (sig):", &exec_sig);
+            let fresh_blockhash = rpc_client.get_latest_blockhash()?;
+            // Parent multisig always stores vault transactions, even when creating config on child
+            let exec_msg = create_execute_transaction_message(
+                program_id,
+                &parent_multisig,
+                &fee_payer_signer.pubkey(),
+                &fee_payer_signer.pubkey(),
+                parent_proposal_index,
+                &rpc_client,
+                fresh_blockhash,
+            )?;
+            let exec_tx = VersionedTransaction::try_new(
+                VersionedMessage::V0(exec_msg),
+                &[fee_payer_signer.as_ref()],
+            )?;
+            let exec_sig = crate::provision::send_and_confirm_transaction(&exec_tx, &rpc_client)
+                .map_err(|e| eyre::eyre!("Failed to execute parent proposal: {}", e))?;
+            output::Output::field("Parent proposal executed (sig):", &exec_sig);
 
-                // Display success message based on operation type
-                match operation {
-                    ProposalAction::Approve => {
-                        output::Output::success(
-                            "Child proposal has been approved via parent multisig!",
-                        );
-                    }
-                    ProposalAction::Reject => {
-                        output::Output::success(
-                            "Child proposal has been rejected via parent multisig!",
-                        );
-                    }
-                    ProposalAction::Execute => {
-                        output::Output::success(
-                            "Child transaction has been executed via parent multisig!",
-                        );
-                    }
-                    ProposalAction::Create => {
-                        output::Output::success(
-                            "Child proposal has been created via parent multisig!",
-                        );
-                    }
+            // Display success message based on operation type
+            match operation {
+                ProposalAction::Approve => {
+                    output::Output::success(
+                        "Child proposal has been approved via parent multisig!",
+                    );
                 }
+                ProposalAction::Reject => {
+                    output::Output::success(
+                        "Child proposal has been rejected via parent multisig!",
+                    );
+                }
+                ProposalAction::Execute => {
+                    output::Output::success(
+                        "Child transaction has been executed via parent multisig!",
+                    );
+                }
+                ProposalAction::Create => {
+                    output::Output::success("Child proposal has been created via parent multisig!");
+                }
+            }
         } else if !is_fee_payer_member {
             output::Output::hint(
                 "Fee payer is not a member of the parent multisig; cannot auto-execute.",
@@ -586,73 +540,16 @@ pub async fn approve_common_feature_gate_proposal(
     proposal_index: u64,
     kind: TransactionKind,
 ) -> Result<()> {
-    // Auto-detect if this is Activate or Revoke and use paired approval logic
-    if matches!(kind, TransactionKind::Activate | TransactionKind::Revoke) {
-        let program_id = program_id.unwrap_or_else(|| {
-            Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf")
-        });
-
-        let fee_payer_signer =
-            signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
-                .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
-
-        let rpc_url = choose_network_from_config(config)?;
-        let rpc_client = create_rpc_client(&rpc_url);
-
-        // Detect if voting_key is itself a Squads multisig (parent)
-        let is_parent_multisig = load_multisig_if_any(&rpc_client, &voting_key)?.is_some();
-
-        let vault_index = proposal_index;
-        let config_index = proposal_index + 1;
-
-        if is_parent_multisig {
-            // Parent multisig flow - use paired approval
-            return handle_parent_multisig_flow(
-                &program_id,
-                voting_key,
-                feature_gate_multisig_address,
-                proposal_index,
-                kind,
-                ChildTransactionFlavor::Vault,
-                &fee_payer_signer,
-                &rpc_url,
-                ProposalAction::Approve,
-                ParentFlowPayload::ApprovePaired {
-                    vault_index,
-                    config_index,
-                },
-            )
-            .await;
-        }
-
-        // EOA flow - approve both proposals atomically in a single transaction
-        vote_paired_proposals_eoa(
-            &program_id,
-            &feature_gate_multisig_address,
-            &voting_key,
-            &fee_payer_signer,
-            vault_index,
-            config_index,
-            &rpc_client,
-            crate::squads::PROPOSAL_APPROVE_DISCRIMINATOR,
-            "approve",
-        )
-        .await?;
-
-        Ok(())
-    } else {
-        // Rekey or other kinds - use single proposal approval
-        approve_common_proposal(
-            config,
-            feature_gate_multisig_address,
-            voting_key,
-            fee_payer_path,
-            program_id,
-            proposal_index,
-            ProposalFlavor::Vault(kind),
-        )
-        .await
-    }
+    approve_common_proposal(
+        config,
+        feature_gate_multisig_address,
+        voting_key,
+        fee_payer_path,
+        program_id,
+        proposal_index,
+        ProposalFlavor::Vault(kind),
+    )
+    .await
 }
 
 pub async fn reject_common_feature_gate_proposal(
@@ -676,45 +573,6 @@ pub async fn reject_common_feature_gate_proposal(
 
     let is_parent_multisig = load_multisig_if_any(&rpc_client, &voting_key)?.is_some();
 
-    // For Activate/Revoke, we need to reject both vault and config proposals
-    if matches!(kind, TransactionKind::Activate | TransactionKind::Revoke) {
-        let vault_index = proposal_index;
-        let config_index = proposal_index + 1;
-
-        if is_parent_multisig {
-            // Parent multisig flow - reject vault proposal only
-            // (config proposal rejection would need a separate parent transaction)
-            return handle_parent_multisig_flow(
-                &program_id,
-                voting_key,
-                feature_gate_multisig_address,
-                proposal_index,
-                kind,
-                ChildTransactionFlavor::Vault,
-                &fee_payer_signer,
-                &rpc_url,
-                ProposalAction::Reject,
-                ParentFlowPayload::None,
-            )
-            .await;
-        }
-
-        // EOA flow - reject both proposals atomically in a single transaction
-        return vote_paired_proposals_eoa(
-            &program_id,
-            &feature_gate_multisig_address,
-            &voting_key,
-            &fee_payer_signer,
-            vault_index,
-            config_index,
-            &rpc_client,
-            crate::squads::PROPOSAL_REJECT_DISCRIMINATOR,
-            "reject",
-        )
-        .await;
-    }
-
-    // For Rekey and other kinds - use single proposal rejection
     if is_parent_multisig {
         let child_flavor = if kind == TransactionKind::Rekey {
             ChildTransactionFlavor::Config
@@ -771,111 +629,6 @@ pub async fn reject_common_feature_gate_proposal(
     Ok(())
 }
 
-/// Helper function to execute a single proposal via EOA (direct execution)
-async fn execute_single_proposal_eoa(
-    program_id: &Pubkey,
-    multisig_address: &Pubkey,
-    voting_key: &Pubkey,
-    fee_payer_signer: &Box<dyn Signer>,
-    proposal_index: u64,
-    rpc_client: &RpcClient,
-) -> Result<()> {
-    // Permission check: voting_key must be a member with Execute permission
-    let child_acc = rpc_client
-        .get_account(multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch multisig account: {}", e))?;
-    let child_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &child_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
-
-    verify_member_permission(&child_ms, voting_key, PERMISSION_EXECUTE, "Executor")?;
-
-    // Build and send execute transaction
-    let blockhash = rpc_client.get_latest_blockhash()?;
-    let exec_msg = create_execute_transaction_message(
-        program_id,
-        multisig_address,
-        voting_key,
-        &fee_payer_signer.pubkey(),
-        proposal_index,
-        rpc_client,
-        blockhash,
-    )?;
-
-    let transaction = VersionedTransaction::try_new(
-        VersionedMessage::V0(exec_msg),
-        &[fee_payer_signer.as_ref()],
-    )?;
-
-    if !confirm_action(&format!("Execute proposal {} now?", proposal_index), true) {
-        output::Output::hint("Skipped sending execute transaction.");
-        return Ok(());
-    }
-
-    let signature = crate::provision::send_and_confirm_transaction(&transaction, rpc_client)
-        .map_err(|e| {
-            eyre::eyre!(
-                "Failed to send execute transaction for index {}: {}",
-                proposal_index,
-                e
-            )
-        })?;
-    output::Output::field(
-        &format!("Execute transaction {} sent successfully:", proposal_index),
-        &signature,
-    );
-    Ok(())
-}
-
-/// Helper function to vote on paired proposals (vault + config) via EOA in a single transaction
-async fn vote_paired_proposals_eoa(
-    program_id: &Pubkey,
-    multisig_address: &Pubkey,
-    voting_key: &Pubkey,
-    fee_payer_signer: &Box<dyn Signer>,
-    vault_index: u64,
-    config_index: u64,
-    rpc_client: &RpcClient,
-    discriminator: &[u8],
-    action_name: &str,
-) -> Result<()> {
-    // Permission check: voting_key must be a member with Vote permission
-    let child_acc = rpc_client
-        .get_account(multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch multisig account: {}", e))?;
-    let child_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &child_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
-
-    verify_member_permission(&child_ms, voting_key, PERMISSION_VOTE, "Voter")?;
-
-    // Build and send paired vote transaction
-    let blockhash = rpc_client.get_latest_blockhash()?;
-    let vote_msg = crate::provision::create_vote_paired_proposals_message_eoa(
-        program_id,
-        multisig_address,
-        voting_key,
-        &fee_payer_signer.pubkey(),
-        vault_index,
-        config_index,
-        blockhash,
-        discriminator,
-    )?;
-
-    let transaction = VersionedTransaction::try_new(
-        VersionedMessage::V0(vote_msg),
-        &[fee_payer_signer.as_ref()],
-    )?;
-
-    if !confirm_action(&format!("Send this {} transaction now?", action_name), true) {
-        output::Output::hint(&format!("Skipped sending {} transaction.", action_name));
-        return Ok(());
-    }
-
-    let signature = crate::provision::send_and_confirm_transaction(&transaction, rpc_client)
-        .map_err(|e| eyre::eyre!("Failed to send {} transaction: {}", action_name, e))?;
-    output::Output::field(&format!("{} transaction sent successfully:", action_name), &signature);
-    Ok(())
-}
-
 pub async fn execute_common_feature_gate_proposal(
     config: &Config,
     feature_gate_multisig_address: Pubkey,
@@ -916,101 +669,6 @@ pub async fn execute_common_feature_gate_proposal(
 
     let is_parent_multisig = load_multisig_if_any(&rpc_client, &voting_key)?.is_some();
 
-    // Auto-detect if this is Activate or Revoke and use paired execution logic
-    if matches!(kind, TransactionKind::Activate | TransactionKind::Revoke) {
-        let vault_index = proposal_index;
-        let config_index = proposal_index + 1;
-
-        // For paired execution, also verify the config proposal is approved
-        let (config_approved, config_threshold, config_status) = get_proposal_status_and_threshold(
-            &program_id,
-            &feature_gate_multisig_address,
-            config_index,
-            &rpc_client,
-        )?;
-        if !matches!(config_status, crate::squads::ProposalStatus::Approved { .. }) {
-            output::Output::hint(&format!(
-                "Config proposal at index {} is not Approved (approvals: {}/{})",
-                config_index, config_approved, config_threshold
-            ));
-            return Err(eyre::eyre!(
-                "Config proposal at index {} must be Approved before paired execution",
-                config_index
-            ));
-        }
-
-        if is_parent_multisig {
-            // Parent multisig flow - use paired execution
-            return handle_parent_multisig_flow(
-                &program_id,
-                voting_key,
-                feature_gate_multisig_address,
-                proposal_index,
-                kind,
-                ChildTransactionFlavor::Vault,
-                &fee_payer_signer,
-                &rpc_url,
-                ProposalAction::Execute,
-                ParentFlowPayload::ExecutePaired {
-                    vault_index,
-                    config_index,
-                },
-            )
-            .await;
-        }
-
-        // EOA flow - execute both proposals sequentially
-        // Execute vault proposal first (uses VaultTransaction execute)
-        execute_single_proposal_eoa(
-            &program_id,
-            &feature_gate_multisig_address,
-            &voting_key,
-            &fee_payer_signer,
-            vault_index,
-            &rpc_client,
-        )
-        .await?;
-
-        // Execute config proposal second (uses ConfigTransaction execute)
-        // Note: Permission was already checked in execute_single_proposal_eoa above
-        let blockhash = rpc_client.get_latest_blockhash()?;
-        let exec_msg = crate::provision::create_execute_config_transaction_message(
-            &program_id,
-            &feature_gate_multisig_address,
-            &voting_key,
-            &fee_payer_signer.pubkey(),
-            Some(fee_payer_signer.pubkey()),
-            config_index,
-            blockhash,
-        )?;
-
-        let transaction = VersionedTransaction::try_new(
-            VersionedMessage::V0(exec_msg),
-            &[fee_payer_signer.as_ref()],
-        )?;
-
-        if !confirm_action(&format!("Execute config proposal {} now?", config_index), true) {
-            output::Output::hint("Skipped sending config execute transaction.");
-            return Ok(());
-        }
-
-        let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
-            .map_err(|e| {
-                eyre::eyre!(
-                    "Failed to send execute transaction for config index {}: {}",
-                    config_index,
-                    e
-                )
-            })?;
-        output::Output::field(
-            &format!("Execute config transaction {} sent:", config_index),
-            &signature,
-        );
-
-        return Ok(());
-    }
-
-    // Rekey or other kinds - use single proposal execution
     if is_parent_multisig {
         // If this is a config transaction (Rekey), use the config execute path without extra metas.
         if kind == TransactionKind::Rekey {
@@ -1160,28 +818,13 @@ pub async fn create_feature_gate_proposal(
     output::Output::field("Feature ID", &feature_id.to_string());
     output::Output::field("Multisig", &feature_gate_multisig_address.to_string());
     output::Output::field("Next Vault Transaction Index", &next_tx_index.to_string());
-    output::Output::field(
-        "Next Config Transaction Index",
-        &(next_tx_index + 1).to_string(),
-    );
 
-    // Determine config action based on kind
-    let (config_actions, config_memo) = match kind {
-        TransactionKind::Activate => (
-            vec![crate::squads::ConfigAction::ChangeThreshold { new_threshold: 1 }],
-            None, // Remove memo to reduce tx size
-        ),
-        TransactionKind::Revoke => (
-            vec![crate::squads::ConfigAction::ChangeThreshold {
-                new_threshold: config.threshold, // Use original threshold from config
-            }],
-            None, // Remove memo to reduce tx size
-        ),
-        _ => return Err(eyre::eyre!("Unsupported kind for feature gate proposal")),
-    };
+    if !matches!(kind, TransactionKind::Activate | TransactionKind::Revoke) {
+        return Err(eyre::eyre!("Unsupported kind for feature gate proposal"));
+    }
 
     if is_parent_multisig {
-        output::Output::info("Parent multisig detected - creating paired proposals sequentially");
+        output::Output::info("Parent multisig detected - creating child vault proposal");
 
         // voting_key is the parent multisig address, derive the vault PDA from it
         let parent_vault_pda = crate::squads::get_vault_pda(&voting_key, 0, Some(&program_id)).0;
@@ -1190,8 +833,9 @@ pub async fn create_feature_gate_proposal(
             &parent_vault_pda.to_string(),
         );
 
-        let vault_tx_message =
-            crate::provision::create_feature_gate_transaction_message(feature_id, feature_id, kind)?;
+        let vault_tx_message = crate::provision::create_feature_gate_transaction_message(
+            feature_id, feature_id, kind,
+        )?;
 
         // Pass the raw vault transaction message - handle_parent_multisig_flow will wrap it
         // in create_child_create_vault_transaction_and_proposal_message
@@ -1214,58 +858,19 @@ pub async fn create_feature_gate_proposal(
             &next_tx_index.to_string(),
         );
 
-        // Fetch the current transaction_index after vault creation to get the correct index for config
-        let updated_ms_acc = rpc_client
-            .get_account(&feature_gate_multisig_address)
-            .map_err(|e| eyre::eyre!("Failed to fetch multisig after vault creation: {}", e))?;
-        let updated_ms: SquadsMultisig =
-            BorshDeserialize::deserialize(&mut &updated_ms_acc.data[8..])
-                .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
-        let config_index = updated_ms.transaction_index + 1;
-
-        output::Output::field("Config index (from chain):", &config_index.to_string());
-
-        let config_message =
-            crate::provision::create_child_create_config_transaction_and_proposal_message(
-                feature_gate_multisig_address,
-                config_index,
-                parent_vault_pda, // parent vault PDA acts as creator (signed via CPI)
-                parent_vault_pda, // parent vault PDA provides rent (funded with SOL, signed via CPI)
-                config_actions,
-                None, // No memo
-            );
-
-        handle_parent_multisig_flow(
-            &program_id,
-            voting_key,
-            feature_gate_multisig_address,
-            config_index,
-            kind,
-            ChildTransactionFlavor::Config,
-            &fee_payer_signer,
-            &rpc_url,
-            ProposalAction::Create,
-            ParentFlowPayload::Create(config_message?),
-        )
-        .await?;
-
-        output::Output::field(
-            "Config proposal created at index:",
-            &config_index.to_string(),
-        );
-        output::Output::info("Both proposals created successfully");
-
         return Ok(());
     }
 
-    // EOA voting path - create paired proposals (vault + config)
-    output::Output::info(&format!(
-        "Creating paired {} proposals (vault + config)...",
-        kind.label()
-    ));
+    // EOA voting path - create vault proposal.
+    output::Output::info(&format!("Creating {} proposal...", kind.label()));
 
     // Verify voting_key has Initiate permission
-    verify_member_permission(&feature_gate_ms, &voting_key, PERMISSION_INITIATE, "Creator")?;
+    verify_member_permission(
+        &feature_gate_ms,
+        &voting_key,
+        PERMISSION_INITIATE,
+        "Creator",
+    )?;
 
     // Verify voting_key is the same as fee_payer in EOA mode
     if voting_key != fee_payer_signer.pubkey() {
@@ -1279,29 +884,29 @@ pub async fn create_feature_gate_proposal(
     let vault_message =
         crate::provision::create_feature_gate_transaction_message(feature_id, feature_id, kind)?;
 
-    // Create BOTH proposals in ONE transaction using bundled creation
-    let config_index = next_tx_index + 1;
-
-    // In EOA mode, voting_key == fee_payer, so we can use fee_payer_signer as contributor
-    crate::utils::create_and_send_paired_proposals(
-        &rpc_url,
-        &fee_payer_signer,
-        fee_payer_signer.as_ref(),
+    let blockhash = rpc_client.get_latest_blockhash()?;
+    let (message, _tx_pda, _proposal_pda) = create_transaction_and_proposal_message(
+        Some(&program_id),
+        &fee_payer_signer.pubkey(),
+        &voting_key,
         &feature_gate_multisig_address,
-        next_tx_index, // Vault proposal index
-        config_index,  // Config proposal index
+        next_tx_index,
+        0,
         vault_message,
-        config_actions.clone(),
-        config_memo.clone(),
-    )
-    .await?;
+        Some(crate::constants::DEFAULT_PRIORITY_FEE as u32),
+        Some(crate::constants::DEFAULT_COMPUTE_UNITS),
+        blockhash,
+    )?;
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[fee_payer_signer.as_ref()])?;
+    let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
+        .map_err(|e| eyre::eyre!("Failed to create {} proposal: {}", kind.label(), e))?;
 
     output::Output::field("Vault proposal index:", &next_tx_index.to_string());
-    output::Output::field("Config proposal index:", &config_index.to_string());
-    output::Output::info("Both proposals created in a single transaction");
+    output::Output::field("Create proposal signature:", &signature);
 
     output::Output::info(
-        "Next step: Gather approvals from other members, then execute the proposals.",
+        "Next step: Gather approvals from other members, then execute the proposal.",
     );
     Ok(())
 }
@@ -1440,7 +1045,7 @@ pub async fn rekey_multisig_feature_gate(
         ],
     );
 
-    // Build create proposal instruction paired with the config transaction
+    // Build the proposal instruction for the config transaction.
     let create_proposal_instruction = solana_instruction::Instruction::new_with_bytes(
         program_id,
         &crate::squads::MultisigCreateProposalData {

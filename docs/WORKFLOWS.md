@@ -76,7 +76,6 @@ feature-gate-multisig-tool
 3. Prompts for networks to deploy to
 4. Creates the multisig with:
    - **Index 1**: Feature Activation proposal (Vault Transaction)
-   - **Index 2**: Lower Threshold to 1 proposal (Config Transaction)
 
 ### Output:
 ```
@@ -116,7 +115,7 @@ feature-gate-multisig-tool
 # Enter: Proposal index (1)
 ```
 
-**Note**: Executing the activation also automatically executes Index 2 (threshold change to 1), making future revocations easier with single-approval.
+**Note**: Executing the activation does not change the multisig threshold.
 
 ---
 
@@ -150,8 +149,8 @@ This creates a proposal on the parent multisig. When executed, it approves the c
 ### Step 2: Approve parent proposal 
 Members of the parent multisig approve the parent proposal. 
 
-### Step 3: Execute parent proposal (if not 1/n)
-Executes the parent proposal, which triggers the child approval. If its 1/n parent multisig, the approval is auto executed.
+### Step 3: Execute parent proposal if needed
+Executes the parent proposal, which triggers the child approval. Some parent multisig configurations can auto-execute once enough approvals are present.
 
 ### Step 4: Repeat until child threshold is met
 
@@ -166,13 +165,13 @@ Executes the parent proposal, which triggers the child approval. If its 1/n pare
 # Enter: Proposal index (1)
 ```
 
-**Note**: Executing the activation also automatically executes Index 2 (threshold change to 1), making future revocations easier with single-approval.
+**Note**: Executing the activation does not change the multisig threshold.
 
 ---
 
 ## 4. Emergency Revocation
 
-To revoke a pending feature activation (threshold is already 1 after activation):
+To revoke a pending feature activation:
 
 ### Step 1: Create revocation proposal
 ```bash
@@ -209,9 +208,7 @@ feature-gate-multisig-tool
 # Enter: Proposal index
 ```
 
-With threshold at 1, only a single member needs to approve before execution.
-
-**Note**: Once the revocation is executed, the threshold is restored to its original value.
+Revocation uses the current multisig threshold. Activation does not downgrade the threshold.
 
 ---
 
@@ -263,18 +260,13 @@ Then approve and execute with required threshold.
 ```
 Create Multisig
       │
-      ├─► Index 1: Activation Proposal
-      │         │
-      │         ├─► Approve (threshold times)
-      │         └─► Execute ─► Feature Activated
-      │
-      └─► Index 2: Lower Threshold Proposal
+      └─► Index 1: Activation Proposal
                 │
                 ├─► Approve (threshold times)
-                └─► Execute ─► Threshold = 1
+                └─► Execute ─► Feature Activated
                               │
                               └─► Create Revoke Proposal
                                         │
-                                        ├─► Approve (1 time)
+                                        ├─► Approve (threshold times)
                                         └─► Execute ─► Feature Revoked
 ```

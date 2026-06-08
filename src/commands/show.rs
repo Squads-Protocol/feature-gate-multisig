@@ -125,7 +125,7 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
     // Display the multisig details
     display_multisig_details(&multisig, &multisig_pubkey)?;
 
-    // Fetch and display transaction and proposal details for indices 1 and 2
+    // Fetch and display transaction and proposal details for all live indices.
     let rpc_client = create_rpc_client(&rpc_url);
     fetch_and_display_transactions_and_proposals(&rpc_client, &multisig_pubkey, &multisig).await?;
 
