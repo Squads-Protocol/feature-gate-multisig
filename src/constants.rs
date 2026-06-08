@@ -1,4 +1,4 @@
-/// Application constants for consistent configuration across modules
+//! Application constants for consistent configuration across modules
 
 // Compute budget constants
 pub const DEFAULT_COMPUTE_UNITS: u32 = 300_000;
