@@ -1,6 +1,7 @@
 target
 .idea
-target
 secret
 .surfpool/
 artifacts/
+config.json
+multisig-seed.json
