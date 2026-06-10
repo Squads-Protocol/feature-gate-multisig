@@ -834,9 +834,8 @@ pub async fn create_feature_gate_proposal(
             &parent_vault_pda.to_string(),
         );
 
-        let vault_tx_message = crate::provision::create_feature_gate_transaction_message(
-            feature_id, feature_id, kind,
-        )?;
+        let vault_tx_message =
+            crate::provision::create_feature_gate_transaction_message(feature_id, kind)?;
 
         // Pass the raw vault transaction message - handle_parent_multisig_flow will wrap it
         // in create_child_create_vault_transaction_and_proposal_message
@@ -882,8 +881,7 @@ pub async fn create_feature_gate_proposal(
         ));
     }
 
-    let vault_message =
-        crate::provision::create_feature_gate_transaction_message(feature_id, feature_id, kind)?;
+    let vault_message = crate::provision::create_feature_gate_transaction_message(feature_id, kind)?;
 
     let blockhash = rpc_client.get_latest_blockhash()?;
     let (message, _tx_pda, _proposal_pda) = create_transaction_and_proposal_message(

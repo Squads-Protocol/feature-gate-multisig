@@ -1,5 +1,4 @@
 use crate::constants::*;
-use crate::feature_gate_program::activate_feature_funded;
 use crate::provision::{build_squads_transaction_message, create_rpc_client};
 use crate::squads::{Member, Permissions, TransactionMessage};
 use colored::*;
@@ -372,17 +371,6 @@ fn create_child_vote_transaction_message(
     );
 
     build_squads_transaction_message(&parent_member_pubkey, &[ix], &[])
-}
-
-// Transaction creation functions
-pub fn create_feature_activation_transaction_message(
-    feature_id: Pubkey,
-) -> Result<TransactionMessage> {
-    // Build activation flow without any funding transfer: allocate + assign only.
-    let instructions = activate_feature_funded(&feature_id);
-
-    // Use centralized helper - feature_id is the signer (vault PDA)
-    build_squads_transaction_message(&feature_id, &instructions, &[])
 }
 
 /// Create and send a transaction to fund the feature gate account with rent-exempt lamports

@@ -26,7 +26,7 @@ pub async fn interactive_mode() -> Result<()> {
         match choice {
             "Create new feature gate multisig" => {
                 let feepayer_path = prompt_for_fee_payer_path(&config)?;
-                create_command(&mut config, None, vec![], Some(feepayer_path)).await?;
+                create_command(&mut config, None, Some(feepayer_path)).await?;
             }
             "Proposal Actions (Approve/Reject/Execute)" => {
                 handle_proposal_action(&config).await?;

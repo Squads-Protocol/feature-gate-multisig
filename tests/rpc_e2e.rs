@@ -152,7 +152,6 @@ async fn build_fixture() -> Fixture {
     let deployments = create_command_with_deployments(
         &mut config,
         Some(3),
-        vec![],
         Some(fee_payer_path.to_string_lossy().to_string()),
     )
     .await
@@ -910,7 +909,6 @@ async fn rpc_e2e_7_eoa_activation_flow() {
     let deployments = create_command_with_deployments(
         &mut config,
         Some(2), // threshold
-        vec![],
         Some(eoa_keypaths[0].clone()),
     )
     .await
@@ -1067,7 +1065,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
     let deployments = create_command_with_deployments(
         &mut config,
         Some(2), // threshold
-        vec![],
         Some(eoa_keypaths[0].clone()),
     )
     .await
