@@ -1,18 +1,19 @@
 use crate::constants::*;
 use crate::squads::{
-    get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
-    CompiledInstruction, InstructionData, Member, MessageAddressTableLookup, MultisigCreateArgsV2,
-    MultisigCreateProposalAccounts, MultisigCreateProposalArgs, MultisigCreateProposalData,
-    MultisigCreateTransaction, MultisigCreateV2Accounts, MultisigCreateV2Data,
-    MultisigExecuteTransactionAccounts, MultisigExecuteTransactionArgs,
-    MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs, ProgramConfig, SmallVec,
-    TransactionMessage, VaultTransactionCreateArgs, VaultTransactionCreateArgsData,
-    CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR, EXECUTE_TRANSACTION_DISCRIMINATOR,
-    SQUADS_MULTISIG_PROGRAM_ID,
+    deserialize_squads_account, get_multisig_pda, get_program_config_pda, get_proposal_pda,
+    get_transaction_pda, get_vault_pda, CompiledInstruction, InstructionData, Member,
+    MessageAddressTableLookup, MultisigCreateArgsV2, MultisigCreateProposalAccounts,
+    MultisigCreateProposalArgs, MultisigCreateProposalData, MultisigCreateTransaction,
+    MultisigCreateV2Accounts, MultisigCreateV2Data, MultisigExecuteTransactionAccounts,
+    MultisigExecuteTransactionArgs, MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs,
+    ProgramConfig, SmallVec, TransactionMessage, VaultTransactionCreateArgs,
+    VaultTransactionCreateArgsData, CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR,
+    EXECUTE_TRANSACTION_DISCRIMINATOR, MULTISIG_ACCOUNT_DISCRIMINATOR,
+    PROGRAM_CONFIG_ACCOUNT_DISCRIMINATOR, PROPOSAL_ACCOUNT_DISCRIMINATOR,
+    SQUADS_MULTISIG_PROGRAM_ID, VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
 };
 
 use crate::utils::{decode_permissions, get_network_display};
-use borsh::BorshDeserialize;
 use colored::Colorize;
 use eyre::eyre;
 use indicatif::ProgressBar;
@@ -38,6 +39,27 @@ use std::time::Duration;
 /// Creates an RPC client with consistent commitment configuration
 pub fn create_rpc_client(url: &str) -> RpcClient {
     RpcClient::new_with_commitment(url, CommitmentConfig::confirmed())
+}
+
+/// Fetch a multisig account and validate owner + Anchor discriminator before deserializing.
+/// Use for any multisig address that originates from user input.
+pub fn fetch_squads_multisig(
+    rpc_client: &RpcClient,
+    address: &Pubkey,
+    account_kind: &str,
+) -> eyre::Result<crate::squads::Multisig> {
+    let acc = rpc_client
+        .get_account(address)
+        .map_err(|e| eyre!("Failed to fetch {} {}: {}", account_kind, address, e))?;
+    if acc.owner != SQUADS_MULTISIG_PROGRAM_ID {
+        return Err(eyre!(
+            "{} {} is not owned by the Squads program (owner: {})",
+            account_kind,
+            address,
+            acc.owner
+        ));
+    }
+    deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, account_kind)
 }
 
 /// Compile `instructions` into a Squads `TransactionMessage` using Solana's official v0
@@ -450,20 +472,12 @@ pub async fn create_multisig(
         .get_account(&program_config_pda.0)
         .map_err(|e| eyre::eyre!("Failed to fetch program config account: {}", e))?;
 
-    let program_config_data = program_config.data.as_slice();
-
-    // Skip the first 8 bytes (discriminator) before deserializing
-    if program_config_data.len() < 8 {
-        return Err(eyre::eyre!(
-            "Program config account data too small: {} bytes (expected at least 8)",
-            program_config_data.len()
-        ));
-    }
-    let config_data_without_discriminator = &program_config_data[8..];
-
-    let treasury = borsh::from_slice::<ProgramConfig>(config_data_without_discriminator)
-        .map_err(|e| eyre::eyre!("Failed to deserialize program config: {}", e))?
-        .treasury;
+    let treasury = deserialize_squads_account::<ProgramConfig>(
+        &program_config.data,
+        PROGRAM_CONFIG_ACCOUNT_DISCRIMINATOR,
+        "program config",
+    )?
+    .treasury;
 
     let message = Message::try_compile(
         &transaction_creator,
@@ -686,18 +700,16 @@ pub fn get_proposal_status_and_threshold(
     proposal_index: u64,
     rpc_client: &RpcClient,
 ) -> eyre::Result<(usize, u16, crate::squads::ProposalStatus)> {
-    use crate::squads::{get_proposal_pda, Multisig as SquadsMultisig, Proposal};
+    use crate::squads::Proposal;
 
     // Multisig threshold
-    let ms_acc = rpc_client.get_account(multisig_address)?;
-    let ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &ms_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
+    let ms = fetch_squads_multisig(rpc_client, multisig_address, "multisig")?;
 
     // Proposal approved count and status
     let (proposal_pda, _) = get_proposal_pda(multisig_address, proposal_index, Some(program_id));
     let prop_acc = rpc_client.get_account(&proposal_pda)?;
-    let prop: Proposal = BorshDeserialize::deserialize(&mut &prop_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize proposal: {}", e))?;
+    let prop: Proposal =
+        deserialize_squads_account(&prop_acc.data, PROPOSAL_ACCOUNT_DISCRIMINATOR, "proposal")?;
 
     Ok((prop.approved.len(), ms.threshold, prop.status))
 }
@@ -982,14 +994,12 @@ pub fn create_execute_transaction_message(
     let _vault_pda = get_vault_pda(multisig_address, 0, Some(program_id));
 
     let transaction_account_data = rpc_client.get_account_data(&transaction_pda)?;
-    let transaction_contents = VaultTransaction::try_from_slice(&transaction_account_data[8..])
-        .map_err(|e| {
-            eyre::eyre!(
-                "Failed to deserialize vault transaction at {}: {}",
-                transaction_pda,
-                e
-            )
-        })?;
+    let transaction_contents: VaultTransaction = deserialize_squads_account(
+        &transaction_account_data,
+        VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+        "vault transaction",
+    )
+    .map_err(|e| eyre::eyre!("at {}: {}", transaction_pda, e))?;
     let transaction_message = transaction_contents.message;
 
     let mut execution_account_metas = Vec::new();

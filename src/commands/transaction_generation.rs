@@ -6,9 +6,10 @@ use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::squads::{
-    get_vault_pda, Multisig as SquadsMultisig, TransactionMessage, PERMISSION_EXECUTE,
-    PERMISSION_INITIATE, PERMISSION_VOTE, PROPOSAL_APPROVE_DISCRIMINATOR,
-    PROPOSAL_REJECT_DISCRIMINATOR,
+    deserialize_squads_account, get_vault_pda, Multisig as SquadsMultisig, TransactionMessage,
+    MULTISIG_ACCOUNT_DISCRIMINATOR, PERMISSION_EXECUTE, PERMISSION_INITIATE, PERMISSION_VOTE,
+    PROPOSAL_APPROVE_DISCRIMINATOR, PROPOSAL_REJECT_DISCRIMINATOR, SQUADS_MULTISIG_PROGRAM_ID,
+    VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
 };
 use crate::{
     output,
@@ -18,14 +19,13 @@ use crate::{
         create_config_transaction_create_instruction, create_execute_config_transaction_message,
         create_execute_transaction_message, create_proposal_create_instruction, create_rpc_client,
         create_transaction_and_proposal_message, create_vote_proposal_message,
-        get_proposal_status_and_threshold,
+        fetch_squads_multisig, get_proposal_status_and_threshold,
     },
     utils::{
         choose_network_from_config, create_child_vote_approve_transaction_message,
         create_child_vote_reject_transaction_message, Config,
     },
 };
-use borsh::BorshDeserialize;
 use inquire::Confirm;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,7 +118,10 @@ fn build_config_actions_for_kind(
     }
 }
 
-/// Attempt to load an account as a Squads multisig; returns Ok(None) if not found or not deserializable.
+/// Attempt to load an account as a Squads multisig. Returns Ok(None) if the account
+/// doesn't exist, isn't owned by the Squads program, or doesn't carry the Multisig
+/// account discriminator — this gates the EOA-vs-parent-multisig flow, so spoofable
+/// lookalike data must not pass.
 fn load_multisig_if_any(
     rpc_client: &solana_client::rpc_client::RpcClient,
     key: &Pubkey,
@@ -134,14 +137,11 @@ fn load_multisig_if_any(
         }
     };
 
-    if acc.data.len() < 8 {
+    if acc.owner != SQUADS_MULTISIG_PROGRAM_ID {
         return Ok(None);
     }
 
-    match SquadsMultisig::deserialize(&mut &acc.data[8..]) {
-        Ok(ms) => Ok(Some(ms)),
-        Err(_) => Ok(None),
-    }
+    Ok(deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, "multisig").ok())
 }
 
 /// Check if a key is a member of the multisig with the required permission mask.
@@ -227,11 +227,7 @@ async fn handle_parent_multisig_flow(
     let rpc_client = create_rpc_client(rpc_url);
 
     // Fetch parent's next transaction index
-    let parent_acc = rpc_client
-        .get_account(&parent_multisig)
-        .map_err(|e| eyre::eyre!("Failed to fetch parent multisig account: {}", e))?;
-    let parent_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &parent_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize parent multisig: {}", e))?;
+    let parent_ms = fetch_squads_multisig(&rpc_client, &parent_multisig, "parent multisig")?;
     let parent_next_index = parent_ms.transaction_index + 1;
 
     // The fee payer must be a member of the parent multisig with Initiate permission
@@ -260,11 +256,11 @@ async fn handle_parent_multisig_flow(
     let parent_vault_member = get_vault_pda(&parent_multisig, 0, None).0;
 
     // Validate the child multisig includes the parent vault PDA with required permission
-    let child_acc = rpc_client
-        .get_account(&feature_gate_multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch child multisig: {}", e))?;
-    let child_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &child_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize child multisig: {}", e))?;
+    let child_ms = fetch_squads_multisig(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        "child multisig",
+    )?;
 
     // Check required permission based on operation type
     let (required_permission_mask, permission_name, action_description) = match &operation {
@@ -413,6 +409,14 @@ async fn handle_parent_multisig_flow(
         }
     };
 
+    if matches!(operation, ProposalAction::Create) {
+        output::Output::warning(&format!(
+            "The child transaction embeds the fee payer ({}) as a required signer (rent payer). \
+             The parent proposal must be executed with this same fee payer.",
+            fee_payer_signer.pubkey()
+        ));
+    }
+
     let blockhash = rpc_client.get_latest_blockhash()?;
     let (msg, tx_pda, prop_pda) = create_transaction_and_proposal_message(
         None,
@@ -443,13 +447,16 @@ async fn handle_parent_multisig_flow(
     // Offer to approve the parent proposal immediately
     if confirm_action("Approve this parent proposal now?", true) {
         let parent_proposal_index = parent_next_index;
+        // Fetch a fresh blockhash: confirming the create transaction above can take
+        // long enough for the previous one to expire.
+        let approve_blockhash = rpc_client.get_latest_blockhash()?;
         let approve_msg = create_vote_proposal_message(
             program_id,
             &parent_multisig,
             &fee_payer_signer.pubkey(),
             &fee_payer_signer.pubkey(),
             parent_proposal_index,
-            blockhash,
+            approve_blockhash,
             PROPOSAL_APPROVE_DISCRIMINATOR,
         )?;
         let approve_tx =
@@ -695,9 +702,11 @@ pub async fn execute_common_feature_gate_proposal(
         let child_transaction_account_data = rpc_client
             .get_account_data(&child_transaction_pda)
             .map_err(|e| eyre::eyre!("Failed to fetch child transaction account: {}", e))?;
-        let child_transaction_contents =
-            VaultTransaction::try_from_slice(&child_transaction_account_data[8..])
-                .map_err(|e| eyre::eyre!("Failed to deserialize child transaction: {}", e))?;
+        let child_transaction_contents: VaultTransaction = deserialize_squads_account(
+            &child_transaction_account_data,
+            VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+            "child vault transaction",
+        )?;
         let child_transaction_message = child_transaction_contents.message;
 
         // Build execution account metas from the child transaction
@@ -739,11 +748,7 @@ pub async fn execute_common_feature_gate_proposal(
     }
 
     // Permission check: voting_key must be a member with Execute permission on the child multisig
-    let child_acc = rpc_client
-        .get_account(&feature_gate_multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch multisig account: {}", e))?;
-    let child_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &child_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
+    let child_ms = fetch_squads_multisig(&rpc_client, &feature_gate_multisig_address, "multisig")?;
 
     verify_member_permission(&child_ms, &voting_key, PERMISSION_EXECUTE, "Executor")?;
 
@@ -796,13 +801,11 @@ pub async fn create_feature_gate_proposal(
     let rpc_client = create_rpc_client(&rpc_url);
 
     // Fetch the feature gate multisig to get transaction index
-    let feature_gate_acc = rpc_client
-        .get_account(&feature_gate_multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch feature gate multisig: {}", e))?;
-
-    let feature_gate_ms: SquadsMultisig =
-        BorshDeserialize::deserialize(&mut &feature_gate_acc.data[8..])
-            .map_err(|e| eyre::eyre!("Failed to deserialize feature gate multisig: {}", e))?;
+    let feature_gate_ms = fetch_squads_multisig(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        "feature gate multisig",
+    )?;
 
     let next_tx_index = feature_gate_ms.transaction_index + 1;
 
@@ -927,13 +930,11 @@ pub async fn rekey_multisig_feature_gate(
     let rpc_client = create_rpc_client(&rpc_url);
 
     // Fetch the feature gate multisig to get its members
-    let feature_gate_acc = rpc_client
-        .get_account(&feature_gate_multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch feature gate multisig: {}", e))?;
-
-    let feature_gate_ms: SquadsMultisig =
-        BorshDeserialize::deserialize(&mut &feature_gate_acc.data[8..])
-            .map_err(|e| eyre::eyre!("Failed to deserialize feature gate multisig: {}", e))?;
+    let feature_gate_ms = fetch_squads_multisig(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        "feature gate multisig",
+    )?;
 
     // Build config actions for rekey
     let actions = build_config_actions_for_kind(TransactionKind::Rekey, &feature_gate_ms.members)?;
@@ -1170,11 +1171,7 @@ async fn approve_common_proposal(
 
     // EOA voting path - approve proposal
     // Validate voter membership and Vote permission on the child multisig
-    let child_acc = rpc_client
-        .get_account(&multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch multisig: {}", e))?;
-    let child_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &child_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
+    let child_ms = fetch_squads_multisig(&rpc_client, &multisig_address, "multisig")?;
 
     verify_member_permission(&child_ms, &voting_key, PERMISSION_VOTE, "Approver")?;
 
@@ -1270,11 +1267,7 @@ pub async fn execute_common_config_change(
     }
 
     // Permission check: voting_key must be a member with Execute permission on the multisig
-    let multisig_acc = rpc_client
-        .get_account(&multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch multisig account: {}", e))?;
-    let multisig: SquadsMultisig = BorshDeserialize::deserialize(&mut &multisig_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
+    let multisig = fetch_squads_multisig(&rpc_client, &multisig_address, "multisig")?;
 
     verify_member_permission(&multisig, &voting_key, PERMISSION_EXECUTE, "Executor")?;
 
