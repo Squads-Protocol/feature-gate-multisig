@@ -107,7 +107,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
             .parse()
             .map_err(|_| eyre::eyre!("Invalid proposal index"))?;
 
-        Confirm::new(&format!(
+        let confirmed = Confirm::new(&format!(
             "You're {}ing the {} of feature gate {} at proposal index {}. Continue?",
             action_choice.to_lowercase(),
             type_choice.to_lowercase(),
@@ -116,6 +116,9 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
         ))
         .with_default(true)
         .prompt()?;
+        if !confirmed {
+            return Ok(());
+        }
 
         match action_choice {
             "Approve" => {
@@ -177,12 +180,15 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
 
         match action_choice {
             "Approve" => {
-                Confirm::new(&format!(
+                let confirmed = Confirm::new(&format!(
                     "You're approving the rekey proposal at index {}. Continue?",
                     proposal_index
                 ))
                 .with_default(true)
                 .prompt()?;
+                if !confirmed {
+                    return Ok(());
+                }
 
                 approve_common_config_change(
                     config,
@@ -195,12 +201,15 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                 .await?;
             }
             "Reject" => {
-                Confirm::new(&format!(
+                let confirmed = Confirm::new(&format!(
                     "You're rejecting the rekey proposal at index {}. Continue?",
                     proposal_index
                 ))
                 .with_default(true)
                 .prompt()?;
+                if !confirmed {
+                    return Ok(());
+                }
 
                 reject_common_feature_gate_proposal(
                     config,
@@ -214,12 +223,15 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                 .await?;
             }
             "Execute" => {
-                Confirm::new(&format!(
+                let confirmed = Confirm::new(&format!(
                     "You're executing the rekey proposal at index {}. Continue?",
                     proposal_index
                 ))
                 .with_default(true)
                 .prompt()?;
+                if !confirmed {
+                    return Ok(());
+                }
 
                 execute_common_config_change(
                     config,
