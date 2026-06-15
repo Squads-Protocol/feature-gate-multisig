@@ -54,7 +54,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
     // Collect common inputs
     let feature_gate_multisig_address =
         prompt_for_pubkey("Enter the feature gate multisig address:")?;
-    let feature_gate_id = get_vault_pda(&feature_gate_multisig_address, 0, None).0;
+    let feature_gate_id = get_vault_pda(&feature_gate_multisig_address, 0).0;
     let fee_payer_path = prompt_for_fee_payer_path(config)?;
     let voting_key =
         prompt_for_pubkey("Enter the voting key: (Can be either EOA or parent multisig)")?;
@@ -96,7 +96,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                 feature_gate_multisig_address,
                 voting_key,
                 fee_payer_path,
-                None,
                 kind,
             )
             .await;
@@ -127,7 +126,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                     kind,
                 )
@@ -139,7 +137,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                     kind,
                 )
@@ -151,7 +148,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                     kind,
                 )
@@ -168,7 +164,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                 feature_gate_multisig_address,
                 voting_key,
                 fee_payer_path,
-                None,
             )
             .await;
         }
@@ -195,7 +190,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                 )
                 .await?;
@@ -216,7 +210,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                     TransactionKind::Rekey,
                 )
@@ -238,7 +231,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                 )
                 .await?;

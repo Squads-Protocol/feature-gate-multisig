@@ -347,11 +347,7 @@ fn create_child_vote_transaction_message(
     };
     use solana_instruction::Instruction;
 
-    let (proposal_pda, _bump) = get_proposal_pda(
-        &child_multisig,
-        child_tx_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
+    let (proposal_pda, _bump) = get_proposal_pda(&child_multisig, child_tx_index);
 
     let accounts = MultisigVoteOnProposalAccounts {
         multisig: child_multisig,

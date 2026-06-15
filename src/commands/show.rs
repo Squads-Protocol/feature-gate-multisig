@@ -106,9 +106,7 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
 
     let multisig: Multisig =
         deserialize_squads_account(&account_data, MULTISIG_ACCOUNT_DISCRIMINATOR, "multisig")
-            .map_err(|e| {
-                eyre::eyre!("{}. This account may not be a valid Squads multisig.", e)
-            })?;
+            .map_err(|e| eyre::eyre!("{}. This account may not be a valid Squads multisig.", e))?;
 
     println!("✅ Multisig deserialized successfully!");
 
@@ -254,17 +252,17 @@ fn display_multisig_details(multisig: &Multisig, address: &Pubkey) -> Result<()>
     let vault_data = vec![
         VaultInfo {
             index: 0,
-            address: get_vault_pda(address, 0, None).0.to_string(),
+            address: get_vault_pda(address, 0).0.to_string(),
             description: "Default vault (commonly used for feature gates)".to_string(),
         },
         VaultInfo {
             index: 1,
-            address: get_vault_pda(address, 1, None).0.to_string(),
+            address: get_vault_pda(address, 1).0.to_string(),
             description: "Vault #1".to_string(),
         },
         VaultInfo {
             index: 2,
-            address: get_vault_pda(address, 2, None).0.to_string(),
+            address: get_vault_pda(address, 2).0.to_string(),
             description: "Vault #2".to_string(),
         },
     ];
@@ -315,8 +313,8 @@ async fn fetch_and_display_transactions_and_proposals(
         println!("{}", "─".repeat(50).bright_cyan());
 
         // Generate PDAs for transaction and proposal
-        let (transaction_pda, _) = get_transaction_pda(multisig_pubkey, tx_index, None);
-        let (proposal_pda, _) = get_proposal_pda(multisig_pubkey, tx_index, None);
+        let (transaction_pda, _) = get_transaction_pda(multisig_pubkey, tx_index);
+        let (proposal_pda, _) = get_proposal_pda(multisig_pubkey, tx_index);
 
         println!(
             "🎯 Transaction PDA: {}",
@@ -756,17 +754,15 @@ async fn fetch_and_display_proposal(
     }
 
     // Deserialize the Proposal
-    let proposal: Proposal = match deserialize_squads_account(
-        &account_data,
-        PROPOSAL_ACCOUNT_DISCRIMINATOR,
-        "proposal",
-    ) {
-        Ok(prop) => prop,
-        Err(e) => {
-            println!("  ❌ {}", e);
-            return Ok(());
-        }
-    };
+    let proposal: Proposal =
+        match deserialize_squads_account(&account_data, PROPOSAL_ACCOUNT_DISCRIMINATOR, "proposal")
+        {
+            Ok(prop) => prop,
+            Err(e) => {
+                println!("  ❌ {}", e);
+                return Ok(());
+            }
+        };
 
     // Display proposal details in a table
     #[derive(Tabled)]
