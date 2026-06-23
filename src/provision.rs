@@ -1,18 +1,19 @@
 use crate::constants::*;
 use crate::squads::{
-    get_multisig_pda, get_program_config_pda, get_proposal_pda, get_transaction_pda, get_vault_pda,
-    CompiledInstruction, InstructionData, Member, MessageAddressTableLookup, MultisigCreateArgsV2,
-    MultisigCreateProposalAccounts, MultisigCreateProposalArgs, MultisigCreateProposalData,
-    MultisigCreateTransaction, MultisigCreateV2Accounts, MultisigCreateV2Data,
-    MultisigExecuteTransactionAccounts, MultisigExecuteTransactionArgs,
-    MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs, ProgramConfig, SmallVec,
-    TransactionMessage, VaultTransactionCreateArgs, VaultTransactionCreateArgsData,
-    CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR, EXECUTE_TRANSACTION_DISCRIMINATOR,
-    SQUADS_MULTISIG_PROGRAM_ID,
+    deserialize_squads_account, get_multisig_pda, get_program_config_pda, get_proposal_pda,
+    get_transaction_pda, get_vault_pda, CompiledInstruction, InstructionData, Member,
+    MessageAddressTableLookup, MultisigCreateArgsV2, MultisigCreateProposalAccounts,
+    MultisigCreateProposalArgs, MultisigCreateProposalData, MultisigCreateTransaction,
+    MultisigCreateV2Accounts, MultisigCreateV2Data, MultisigExecuteTransactionAccounts,
+    MultisigExecuteTransactionArgs, MultisigVoteOnProposalAccounts, MultisigVoteOnProposalArgs,
+    ProgramConfig, SmallVec, TransactionMessage, VaultTransactionCreateArgs,
+    VaultTransactionCreateArgsData, CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR,
+    EXECUTE_TRANSACTION_DISCRIMINATOR, MULTISIG_ACCOUNT_DISCRIMINATOR,
+    PROGRAM_CONFIG_ACCOUNT_DISCRIMINATOR, PROPOSAL_ACCOUNT_DISCRIMINATOR,
+    SQUADS_MULTISIG_PROGRAM_ID, VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
 };
 
 use crate::utils::{decode_permissions, get_network_display};
-use borsh::BorshDeserialize;
 use colored::Colorize;
 use eyre::eyre;
 use indicatif::ProgressBar;
@@ -32,12 +33,32 @@ use solana_message::{AddressLookupTableAccount, VersionedMessage};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
-use std::str::FromStr;
 use std::time::Duration;
 
 /// Creates an RPC client with consistent commitment configuration
 pub fn create_rpc_client(url: &str) -> RpcClient {
     RpcClient::new_with_commitment(url, CommitmentConfig::confirmed())
+}
+
+/// Fetch a multisig account and validate owner + Anchor discriminator before deserializing.
+/// Use for any multisig address that originates from user input.
+pub fn fetch_squads_multisig(
+    rpc_client: &RpcClient,
+    address: &Pubkey,
+    account_kind: &str,
+) -> eyre::Result<crate::squads::Multisig> {
+    let acc = rpc_client
+        .get_account(address)
+        .map_err(|e| eyre!("Failed to fetch {} {}: {}", account_kind, address, e))?;
+    if acc.owner != SQUADS_MULTISIG_PROGRAM_ID {
+        return Err(eyre!(
+            "{} {} is not owned by the Squads program (owner: {})",
+            account_kind,
+            address,
+            acc.owner
+        ));
+    }
+    deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, account_kind)
 }
 
 /// Compile `instructions` into a Squads `TransactionMessage` using Solana's official v0
@@ -338,18 +359,14 @@ pub fn get_account_data_with_retry(
 }
 pub async fn create_multisig(
     rpc_url: String,
-    program_id: Option<String>,
     fee_payer_keypair: &dyn Signer,
     create_key: &Keypair,
     members: Vec<Member>,
     threshold: u16,
     priority_fee_lamports: Option<u64>,
 ) -> eyre::Result<(Pubkey, String)> {
-    let program_id = program_id.unwrap_or_else(|| SQUADS_PROGRAM_ID_STR.to_string());
-    let program_id = Pubkey::from_str(&program_id)
-        .map_err(|e| eyre::eyre!("Invalid program ID '{}': {}", program_id, e))?;
-    let multisig_address = crate::squads::get_multisig_pda(&create_key.pubkey(), None).0;
-    let vault_address = get_vault_pda(&multisig_address, 0, None).0;
+    let multisig_address = crate::squads::get_multisig_pda(&create_key.pubkey()).0;
+    let vault_address = get_vault_pda(&multisig_address, 0).0;
 
     let transaction_creator = fee_payer_keypair.pubkey();
 
@@ -365,7 +382,7 @@ pub async fn create_multisig(
     println!(
         "{}: {}",
         "Program ID".cyan(),
-        program_id.to_string().bright_white()
+        SQUADS_MULTISIG_PROGRAM_ID.to_string().bright_white()
     );
     println!(
         "{}: {}",
@@ -442,28 +459,20 @@ pub async fn create_multisig(
         .get_latest_blockhash()
         .map_err(|e| eyre::eyre!("Failed to get blockhash: {}", e))?;
 
-    let multisig_key = get_multisig_pda(&create_key.pubkey(), Some(&program_id));
+    let multisig_key = get_multisig_pda(&create_key.pubkey());
 
-    let program_config_pda = get_program_config_pda(Some(&program_id));
+    let program_config_pda = get_program_config_pda();
 
     let program_config = rpc_client
         .get_account(&program_config_pda.0)
         .map_err(|e| eyre::eyre!("Failed to fetch program config account: {}", e))?;
 
-    let program_config_data = program_config.data.as_slice();
-
-    // Skip the first 8 bytes (discriminator) before deserializing
-    if program_config_data.len() < 8 {
-        return Err(eyre::eyre!(
-            "Program config account data too small: {} bytes (expected at least 8)",
-            program_config_data.len()
-        ));
-    }
-    let config_data_without_discriminator = &program_config_data[8..];
-
-    let treasury = borsh::from_slice::<ProgramConfig>(config_data_without_discriminator)
-        .map_err(|e| eyre::eyre!("Failed to deserialize program config: {}", e))?
-        .treasury;
+    let treasury = deserialize_squads_account::<ProgramConfig>(
+        &program_config.data,
+        PROGRAM_CONFIG_ACCOUNT_DISCRIMINATOR,
+        "program config",
+    )?
+    .treasury;
 
     let message = Message::try_compile(
         &transaction_creator,
@@ -493,7 +502,7 @@ pub async fn create_multisig(
                     },
                 }
                 .data()?,
-                program_id,
+                program_id: SQUADS_MULTISIG_PROGRAM_ID,
             },
         ],
         &[],
@@ -524,7 +533,6 @@ pub async fn create_multisig(
 // distinct on-chain inputs (keys, indices, compute budget, blockhash) with no natural grouping.
 #[allow(clippy::too_many_arguments)]
 pub fn create_transaction_and_proposal_message(
-    program_id: Option<&Pubkey>,
     fee_payer_pubkey: &Pubkey,
     contributor_pubkey: &Pubkey,
     multisig_address: &Pubkey,
@@ -535,12 +543,9 @@ pub fn create_transaction_and_proposal_message(
     compute_unit_limit: Option<u32>,
     recent_blockhash: Hash,
 ) -> eyre::Result<(Message, Pubkey, Pubkey)> {
-    let program_id = program_id.unwrap_or(&crate::squads::SQUADS_MULTISIG_PROGRAM_ID);
-
     let (transaction_pda, _transaction_bump) =
-        get_transaction_pda(multisig_address, transaction_index, Some(program_id));
-    let (proposal_pda, _proposal_bump) =
-        get_proposal_pda(multisig_address, transaction_index, Some(program_id));
+        get_transaction_pda(multisig_address, transaction_index);
+    let (proposal_pda, _proposal_bump) = get_proposal_pda(multisig_address, transaction_index);
 
     let mut instructions = Vec::new();
 
@@ -556,7 +561,6 @@ pub fn create_transaction_and_proposal_message(
     }
 
     instructions.push(create_vault_transaction_create_instruction(
-        program_id,
         multisig_address,
         &transaction_pda,
         contributor_pubkey,
@@ -565,7 +569,6 @@ pub fn create_transaction_and_proposal_message(
         transaction_message,
     )?);
     instructions.push(create_proposal_create_instruction(
-        program_id,
         multisig_address,
         &proposal_pda,
         contributor_pubkey,
@@ -579,7 +582,6 @@ pub fn create_transaction_and_proposal_message(
 }
 
 fn create_vault_transaction_create_instruction(
-    program_id: &Pubkey,
     multisig_address: &Pubkey,
     transaction_pda: &Pubkey,
     creator: &Pubkey,
@@ -605,14 +607,13 @@ fn create_vault_transaction_create_instruction(
     };
 
     Ok(Instruction::new_with_bytes(
-        *program_id,
+        SQUADS_MULTISIG_PROGRAM_ID,
         &data.data()?,
         accounts.to_account_metas(),
     ))
 }
 
 pub(crate) fn create_proposal_create_instruction(
-    program_id: &Pubkey,
     multisig_address: &Pubkey,
     proposal_pda: &Pubkey,
     creator: &Pubkey,
@@ -635,7 +636,7 @@ pub(crate) fn create_proposal_create_instruction(
     };
 
     Ok(Instruction::new_with_bytes(
-        *program_id,
+        SQUADS_MULTISIG_PROGRAM_ID,
         &data.data()?,
         accounts.to_account_metas(),
     ))
@@ -644,7 +645,6 @@ pub(crate) fn create_proposal_create_instruction(
 /// Create a vote (approve or reject) message for a proposal.
 /// Pass `PROPOSAL_APPROVE_DISCRIMINATOR` for approval or `PROPOSAL_REJECT_DISCRIMINATOR` for rejection.
 pub fn create_vote_proposal_message(
-    program_id: &Pubkey,
     multisig_address: &Pubkey,
     member_pubkey: &Pubkey,
     fee_payer_pubkey: &Pubkey,
@@ -652,8 +652,7 @@ pub fn create_vote_proposal_message(
     recent_blockhash: Hash,
     discriminator: &[u8],
 ) -> eyre::Result<Message> {
-    let (proposal_pda, _proposal_bump) =
-        get_proposal_pda(multisig_address, proposal_index, Some(program_id));
+    let (proposal_pda, _proposal_bump) = get_proposal_pda(multisig_address, proposal_index);
 
     let account_keys = MultisigVoteOnProposalAccounts {
         multisig: *multisig_address,
@@ -668,7 +667,7 @@ pub fn create_vote_proposal_message(
     instruction_data.extend_from_slice(&borsh::to_vec(&instruction_args)?);
 
     let vote_instruction = Instruction::new_with_bytes(
-        *program_id,
+        SQUADS_MULTISIG_PROGRAM_ID,
         &instruction_data,
         account_keys.to_account_metas(),
     );
@@ -681,23 +680,20 @@ pub fn create_vote_proposal_message(
 
 /// Fetch proposal approvals count, parent threshold, and proposal status for a given proposal index.
 pub fn get_proposal_status_and_threshold(
-    program_id: &Pubkey,
     multisig_address: &Pubkey,
     proposal_index: u64,
     rpc_client: &RpcClient,
 ) -> eyre::Result<(usize, u16, crate::squads::ProposalStatus)> {
-    use crate::squads::{get_proposal_pda, Multisig as SquadsMultisig, Proposal};
+    use crate::squads::Proposal;
 
     // Multisig threshold
-    let ms_acc = rpc_client.get_account(multisig_address)?;
-    let ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &ms_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
+    let ms = fetch_squads_multisig(rpc_client, multisig_address, "multisig")?;
 
     // Proposal approved count and status
-    let (proposal_pda, _) = get_proposal_pda(multisig_address, proposal_index, Some(program_id));
+    let (proposal_pda, _) = get_proposal_pda(multisig_address, proposal_index);
     let prop_acc = rpc_client.get_account(&proposal_pda)?;
-    let prop: Proposal = BorshDeserialize::deserialize(&mut &prop_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize proposal: {}", e))?;
+    let prop: Proposal =
+        deserialize_squads_account(&prop_acc.data, PROPOSAL_ACCOUNT_DISCRIMINATOR, "proposal")?;
 
     Ok((prop.approved.len(), ms.threshold, prop.status))
 }
@@ -713,16 +709,8 @@ pub fn create_child_execute_transaction_message(
     child_transaction_accounts: Vec<solana_instruction::AccountMeta>,
 ) -> eyre::Result<TransactionMessage> {
     // Derive child's proposal and transaction PDAs
-    let (proposal_pda, _) = get_proposal_pda(
-        &child_multisig,
-        child_tx_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-    let (transaction_pda, _) = get_transaction_pda(
-        &child_multisig,
-        child_tx_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
+    let (proposal_pda, _) = get_proposal_pda(&child_multisig, child_tx_index);
+    let (transaction_pda, _) = get_transaction_pda(&child_multisig, child_tx_index);
 
     // Construct the execute instruction for the child multisig
     let accounts = MultisigExecuteTransactionAccounts {
@@ -776,8 +764,8 @@ pub fn create_child_execute_config_transaction_message(
     parent_member_pubkey: Pubkey,
 ) -> eyre::Result<TransactionMessage> {
     // Derive child's proposal and transaction PDAs
-    let (proposal_pda, _) = get_proposal_pda(&child_multisig, child_tx_index, None);
-    let (transaction_pda, _) = get_transaction_pda(&child_multisig, child_tx_index, None);
+    let (proposal_pda, _) = get_proposal_pda(&child_multisig, child_tx_index);
+    let (transaction_pda, _) = get_transaction_pda(&child_multisig, child_tx_index);
 
     // Build the account metas for ConfigTransactionExecute:
     // multisig (writable), member (signer), proposal (writable), transaction (readonly),
@@ -815,21 +803,10 @@ pub fn create_child_create_config_transaction_and_proposal_message(
     actions: Vec<crate::squads::ConfigAction>,
     memo: Option<String>,
 ) -> eyre::Result<TransactionMessage> {
-    use crate::squads::SQUADS_MULTISIG_PROGRAM_ID;
-
-    let (transaction_pda, _) = get_transaction_pda(
-        &child_multisig,
-        child_tx_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-    let (proposal_pda, _) = get_proposal_pda(
-        &child_multisig,
-        child_tx_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
+    let (transaction_pda, _) = get_transaction_pda(&child_multisig, child_tx_index);
+    let (proposal_pda, _) = get_proposal_pda(&child_multisig, child_tx_index);
 
     let config_create_instruction = create_config_transaction_create_instruction(
-        &SQUADS_MULTISIG_PROGRAM_ID,
         &child_multisig,
         &transaction_pda,
         &parent_member_pubkey,
@@ -838,7 +815,6 @@ pub fn create_child_create_config_transaction_and_proposal_message(
         memo,
     )?;
     let create_proposal_instruction = create_proposal_create_instruction(
-        &SQUADS_MULTISIG_PROGRAM_ID,
         &child_multisig,
         &proposal_pda,
         &parent_member_pubkey,
@@ -854,7 +830,6 @@ pub fn create_child_create_config_transaction_and_proposal_message(
 }
 
 pub(crate) fn create_config_transaction_create_instruction(
-    program_id: &Pubkey,
     multisig_address: &Pubkey,
     transaction_pda: &Pubkey,
     creator: &Pubkey,
@@ -877,7 +852,7 @@ pub(crate) fn create_config_transaction_create_instruction(
     };
 
     Ok(Instruction::new_with_bytes(
-        *program_id,
+        SQUADS_MULTISIG_PROGRAM_ID,
         &data.data()?,
         accounts,
     ))
@@ -894,21 +869,12 @@ pub fn create_child_create_vault_transaction_and_proposal_message(
     rent_payer_pubkey: Pubkey,
     transaction_message: TransactionMessage,
 ) -> eyre::Result<TransactionMessage> {
-    use crate::squads::{get_proposal_pda, get_transaction_pda, SQUADS_MULTISIG_PROGRAM_ID};
+    use crate::squads::{get_proposal_pda, get_transaction_pda};
 
-    let (transaction_pda, _) = get_transaction_pda(
-        &child_multisig,
-        child_tx_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
-    let (proposal_pda, _) = get_proposal_pda(
-        &child_multisig,
-        child_tx_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
+    let (transaction_pda, _) = get_transaction_pda(&child_multisig, child_tx_index);
+    let (proposal_pda, _) = get_proposal_pda(&child_multisig, child_tx_index);
 
     let create_transaction_instruction = create_vault_transaction_create_instruction(
-        &SQUADS_MULTISIG_PROGRAM_ID,
         &child_multisig,
         &transaction_pda,
         &parent_member_pubkey,
@@ -917,7 +883,6 @@ pub fn create_child_create_vault_transaction_and_proposal_message(
         transaction_message,
     )?;
     let create_proposal_instruction = create_proposal_create_instruction(
-        &SQUADS_MULTISIG_PROGRAM_ID,
         &child_multisig,
         &proposal_pda,
         &parent_member_pubkey,
@@ -936,7 +901,6 @@ pub fn create_child_create_vault_transaction_and_proposal_message(
 /// This creates a vault transaction that calls the feature gate program to activate/revoke a feature.
 pub fn create_feature_gate_transaction_message(
     feature_id: Pubkey,
-    _vault_pda: Pubkey,
     operation: crate::commands::TransactionKind,
 ) -> eyre::Result<TransactionMessage> {
     use crate::feature_gate_program;
@@ -963,7 +927,6 @@ pub fn create_feature_gate_transaction_message(
 
 /// Create an execute message for any Squads multisig proposal at `proposal_index`.
 pub fn create_execute_transaction_message(
-    program_id: &Pubkey,
     multisig_address: &Pubkey,
     member_pubkey: &Pubkey,
     fee_payer_pubkey: &Pubkey,
@@ -975,21 +938,18 @@ pub fn create_execute_transaction_message(
         get_transaction_pda, get_vault_pda, MultisigExecuteTransactionAccounts, VaultTransaction,
     };
 
-    let (proposal_pda, _proposal_bump) =
-        get_proposal_pda(multisig_address, proposal_index, Some(program_id));
+    let (proposal_pda, _proposal_bump) = get_proposal_pda(multisig_address, proposal_index);
     let (transaction_pda, _transaction_bump) =
-        get_transaction_pda(multisig_address, proposal_index, Some(program_id));
-    let _vault_pda = get_vault_pda(multisig_address, 0, Some(program_id));
+        get_transaction_pda(multisig_address, proposal_index);
+    let _vault_pda = get_vault_pda(multisig_address, 0);
 
     let transaction_account_data = rpc_client.get_account_data(&transaction_pda)?;
-    let transaction_contents = VaultTransaction::try_from_slice(&transaction_account_data[8..])
-        .map_err(|e| {
-            eyre::eyre!(
-                "Failed to deserialize vault transaction at {}: {}",
-                transaction_pda,
-                e
-            )
-        })?;
+    let transaction_contents: VaultTransaction = deserialize_squads_account(
+        &transaction_account_data,
+        VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+        "vault transaction",
+    )
+    .map_err(|e| eyre::eyre!("at {}: {}", transaction_pda, e))?;
     let transaction_message = transaction_contents.message;
 
     let mut execution_account_metas = Vec::new();
@@ -1020,7 +980,7 @@ pub fn create_execute_transaction_message(
     let account_metas = account_keys.to_account_metas(execution_account_metas);
 
     let execute_instruction = Instruction::new_with_bytes(
-        *program_id,
+        SQUADS_MULTISIG_PROGRAM_ID,
         EXECUTE_TRANSACTION_DISCRIMINATOR,
         account_metas,
     );
@@ -1038,7 +998,6 @@ pub fn create_execute_transaction_message(
 /// Create an execute message for a Squads config transaction at `transaction_index`.
 /// Config transactions do not embed vault account metas, so the base accounts are sufficient.
 pub fn create_execute_config_transaction_message(
-    program_id: &Pubkey,
     multisig_address: &Pubkey,
     member_pubkey: &Pubkey,
     fee_payer_pubkey: &Pubkey,
@@ -1048,9 +1007,8 @@ pub fn create_execute_config_transaction_message(
 ) -> eyre::Result<Message> {
     use crate::squads::{get_proposal_pda, get_transaction_pda};
 
-    let (proposal_pda, _) = get_proposal_pda(multisig_address, transaction_index, Some(program_id));
-    let (transaction_pda, _) =
-        get_transaction_pda(multisig_address, transaction_index, Some(program_id));
+    let (proposal_pda, _) = get_proposal_pda(multisig_address, transaction_index);
+    let (transaction_pda, _) = get_transaction_pda(multisig_address, transaction_index);
 
     // Match SDK account layout/order: multisig (w), member (ro, signer), proposal (w),
     // transaction (ro), rent_payer?, system_program?.
@@ -1065,7 +1023,7 @@ pub fn create_execute_config_transaction_message(
     if let Some(rent) = rent_payer {
         account_metas.push(AccountMeta::new(rent, true));
     } else {
-        account_metas.push(AccountMeta::new_readonly(*program_id, false));
+        account_metas.push(AccountMeta::new_readonly(SQUADS_MULTISIG_PROGRAM_ID, false));
     }
 
     account_metas.push(AccountMeta::new_readonly(
@@ -1074,7 +1032,7 @@ pub fn create_execute_config_transaction_message(
     ));
 
     let execute_instruction = Instruction::new_with_bytes(
-        *program_id,
+        SQUADS_MULTISIG_PROGRAM_ID,
         CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR,
         account_metas,
     );
@@ -1266,17 +1224,17 @@ mod tests {
         let transaction_index = 1u64;
 
         // Test transaction PDA derivation
-        let (transaction_pda, _) = get_transaction_pda(&multisig_address, transaction_index, None);
+        let (transaction_pda, _) = get_transaction_pda(&multisig_address, transaction_index);
 
         // Test proposal PDA derivation
-        let (proposal_pda, _) = get_proposal_pda(&multisig_address, transaction_index, None);
+        let (proposal_pda, _) = get_proposal_pda(&multisig_address, transaction_index);
 
         // PDAs should be different
         assert_ne!(transaction_pda, proposal_pda);
 
         // Same inputs should produce same PDAs
-        let (transaction_pda2, _) = get_transaction_pda(&multisig_address, transaction_index, None);
-        let (proposal_pda2, _) = get_proposal_pda(&multisig_address, transaction_index, None);
+        let (transaction_pda2, _) = get_transaction_pda(&multisig_address, transaction_index);
+        let (proposal_pda2, _) = get_proposal_pda(&multisig_address, transaction_index);
         assert_eq!(transaction_pda, transaction_pda2);
         assert_eq!(proposal_pda, proposal_pda2);
     }
@@ -1416,7 +1374,6 @@ mod tests {
 
         // Test message creation
         let result = create_transaction_and_proposal_message(
-            None, // Use default program ID
             &fee_payer_pubkey,
             &contributor_pubkey,
             &multisig_address,
@@ -1432,9 +1389,8 @@ mod tests {
         let (message, transaction_pda, proposal_pda) = result.unwrap();
 
         // Verify PDAs are derived correctly
-        let expected_transaction_pda =
-            get_transaction_pda(&multisig_address, transaction_index, None).0;
-        let expected_proposal_pda = get_proposal_pda(&multisig_address, transaction_index, None).0;
+        let expected_transaction_pda = get_transaction_pda(&multisig_address, transaction_index).0;
+        let expected_proposal_pda = get_proposal_pda(&multisig_address, transaction_index).0;
         assert_eq!(transaction_pda, expected_transaction_pda);
         assert_eq!(proposal_pda, expected_proposal_pda);
 
@@ -1462,7 +1418,6 @@ mod tests {
 
         // Test message creation without priority fee
         let result = create_transaction_and_proposal_message(
-            None, // Use default program ID
             &fee_payer_pubkey,
             &contributor_pubkey,
             &multisig_address,
@@ -1479,127 +1434,6 @@ mod tests {
 
         // Should have 2 instructions: create transaction + create proposal (no priority fee)
         assert_eq!(message.instructions.len(), 2);
-    }
-
-    #[test]
-    fn test_debug_serialization() {
-        let transaction_message = create_test_transaction_message();
-
-        println!("Transaction message created with:");
-        println!("  num_signers: {}", transaction_message.num_signers);
-        println!(
-            "  num_writable_signers: {}",
-            transaction_message.num_writable_signers
-        );
-        println!(
-            "  num_writable_non_signers: {}",
-            transaction_message.num_writable_non_signers
-        );
-        println!(
-            "  account_keys.len(): {}",
-            transaction_message.account_keys.len()
-        );
-        println!(
-            "  instructions.len(): {}",
-            transaction_message.instructions.len()
-        );
-
-        // Try to serialize just the transaction message
-        let serialized = borsh::to_vec(&transaction_message).unwrap();
-        println!(
-            "  serialized transaction_message length: {}",
-            serialized.len()
-        );
-
-        // Show detailed hex breakdown
-        println!("  Detailed serialization breakdown:");
-        println!("    num_signers (u8): {:02x}", serialized[0]);
-        println!("    num_writable_signers (u8): {:02x}", serialized[1]);
-        println!("    num_writable_non_signers (u8): {:02x}", serialized[2]);
-
-        // Check account_keys serialization - should be length as u8 then pubkeys
-        println!("    account_keys length byte: {:02x}", serialized[3]);
-
-        // If it shows more than 1 byte for length, there's the issue
-        println!(
-            "    bytes 4-7: {:02x} {:02x} {:02x} {:02x}",
-            serialized[4], serialized[5], serialized[6], serialized[7]
-        );
-
-        // Create VaultTransactionCreateArgs and see its serialization
-        let transaction_message_bytes = borsh::to_vec(&transaction_message).unwrap();
-        let vault_args = VaultTransactionCreateArgs {
-            vault_index: 0,
-            ephemeral_signers: 0,
-            transaction_message: transaction_message_bytes.clone(),
-            memo: None,
-        };
-
-        let vault_args_serialized = borsh::to_vec(&vault_args).unwrap();
-        println!(
-            "  vault_args serialized length: {}",
-            vault_args_serialized.len()
-        );
-        println!("  vault_args hex breakdown:");
-        println!("    vault_index: {:02x}", vault_args_serialized[0]);
-        println!("    ephemeral_signers: {:02x}", vault_args_serialized[1]);
-
-        // Next should be the Vec<u8> length (u32) then the transaction_message bytes
-        let tm_vec_len = u32::from_le_bytes([
-            vault_args_serialized[2],
-            vault_args_serialized[3],
-            vault_args_serialized[4],
-            vault_args_serialized[5],
-        ]);
-        println!(
-            "    transaction_message Vec<u8> length: {} bytes",
-            tm_vec_len
-        );
-
-        // The actual transaction message bytes start at offset 6, then after memo option
-        let tm_offset = 6;
-
-        // memo is Option<String> which serializes as 1 byte (0 for None, 1 for Some) + content
-        let memo_len_byte = vault_args_serialized[tm_offset + tm_vec_len as usize];
-        println!(
-            "    memo option byte: {:02x} (0=None, 1=Some)",
-            memo_len_byte
-        );
-
-        // Transaction message data starts after the memo
-        let actual_tm_offset = tm_offset;
-        if vault_args_serialized.len() > actual_tm_offset + 5 {
-            println!("    tm bytes start at offset {}", actual_tm_offset);
-            println!(
-                "    tm.num_signers: {:02x}",
-                vault_args_serialized[actual_tm_offset]
-            );
-            println!(
-                "    tm.num_writable_signers: {:02x}",
-                vault_args_serialized[actual_tm_offset + 1]
-            );
-            println!(
-                "    tm.num_writable_non_signers: {:02x}",
-                vault_args_serialized[actual_tm_offset + 2]
-            );
-            println!(
-                "    tm.account_keys length: {:02x}",
-                vault_args_serialized[actual_tm_offset + 3]
-            );
-        }
-
-        // Create the full data structure
-        let create_transaction_data = VaultTransactionCreateArgsData { args: vault_args };
-
-        let full_data = create_transaction_data.data().unwrap();
-        println!("  full data length: {}", full_data.len());
-
-        // Convert to hex string like the blockchain data
-        let hex_string = full_data
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>();
-        println!("  full hex: {}", hex_string);
     }
 
     #[test]

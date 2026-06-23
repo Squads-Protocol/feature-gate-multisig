@@ -1,6 +1,8 @@
+use crate::commands::TransactionKind;
 use crate::output::Output;
 use crate::provision::{
-    create_multisig, create_rpc_client, create_transaction_and_proposal_message,
+    create_feature_gate_transaction_message, create_multisig, create_rpc_client,
+    create_transaction_and_proposal_message,
 };
 use crate::squads::{get_proposal_pda, get_vault_pda, Member, Permissions};
 use crate::utils::*;
@@ -15,12 +17,10 @@ use solana_transaction::versioned::VersionedTransaction;
 pub async fn create_command(
     config: &mut Config,
     threshold: Option<u16>,
-    _sub_multisigs: Vec<String>,
     keypair_path: Option<String>,
 ) -> Result<()> {
     // Keep existing behaviour, but discard returned deployments
-    let _ =
-        create_command_with_deployments(config, threshold, _sub_multisigs, keypair_path).await?;
+    let _ = create_command_with_deployments(config, threshold, keypair_path).await?;
     Ok(())
 }
 
@@ -28,7 +28,6 @@ pub async fn create_command(
 pub async fn create_command_with_deployments(
     config: &mut Config,
     threshold: Option<u16>,
-    _sub_multisigs: Vec<String>,
     keypair_path: Option<String>,
 ) -> Result<Vec<DeploymentResult>> {
     println!(
@@ -137,7 +136,6 @@ async fn deploy_to_single_network(
 
     let (multisig_address, signature) = create_multisig(
         rpc_url.to_string(),
-        None, // Use default program ID
         signer_for_creation,
         create_key,
         members.to_vec(),
@@ -147,14 +145,14 @@ async fn deploy_to_single_network(
     .await
     .map_err(|e| eyre::eyre!("Failed to create multisig: {}", e))?;
 
-    let vault_address = get_vault_pda(&multisig_address, 0, None).0;
+    let vault_address = get_vault_pda(&multisig_address, 0).0;
 
     // Create the initial activation vault proposal at index 1.
-    let activation_message = create_feature_activation_transaction_message(vault_address)?;
+    let activation_message =
+        create_feature_gate_transaction_message(vault_address, TransactionKind::Activate)?;
     let rpc_client = create_rpc_client(rpc_url);
     let blockhash = rpc_client.get_latest_blockhash()?;
     let (message, _tx_pda, _proposal_pda) = create_transaction_and_proposal_message(
-        None,
         &fee_payer_signer.pubkey(),
         &setup_keypair.pubkey(),
         &multisig_address,
@@ -313,7 +311,7 @@ fn print_deployment_summary(
     let feature_gate_id = deployment.vault_address;
 
     // Calculate proposal PDA for the pre-created activation proposal.
-    let activation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 1, None).0;
+    let activation_proposal_pda = get_proposal_pda(&deployment.multisig_address, 1).0;
 
     println!("\n{}", "⚙️ General Info".bright_white().bold());
     println!();

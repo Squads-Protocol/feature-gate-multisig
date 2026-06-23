@@ -1,5 +1,4 @@
 use crate::constants::*;
-use crate::feature_gate_program::activate_feature_funded;
 use crate::provision::{build_squads_transaction_message, create_rpc_client};
 use crate::squads::{Member, Permissions, TransactionMessage};
 use colored::*;
@@ -174,6 +173,21 @@ pub fn review_and_collect_configuration(
 
     if use_saved_config {
         let parsed_members = parse_saved_members(config);
+        if parsed_members.is_empty() {
+            return Err(eyre::eyre!(
+                "Saved config has no valid voting members; at least one is required"
+            ));
+        }
+        if config.threshold == 0 || usize::from(config.threshold) > parsed_members.len() {
+            println!(
+                "  {} Saved threshold ({}) is invalid for {} voting member(s), prompting for new value",
+                "⚠️".bright_yellow(),
+                config.threshold,
+                parsed_members.len()
+            );
+            let new_threshold = prompt_for_threshold_with_max(parsed_members.len())?;
+            return Ok((new_threshold, parsed_members));
+        }
         Ok((config.threshold, parsed_members))
     } else {
         println!(
@@ -183,26 +197,31 @@ pub fn review_and_collect_configuration(
 
         // First collect members
         let interactive_members = collect_members_interactively()?;
+        if interactive_members.is_empty() {
+            return Err(eyre::eyre!(
+                "At least one voting member is required to create a multisig"
+            ));
+        }
 
-        // Then get threshold based on member count
-        let final_threshold =
-            if let Some(t) = threshold {
-                // Validate CLI threshold against member count
-                let max_members = interactive_members.len() + 1; // +1 for contributor
-                if t as usize > max_members {
-                    println!(
-                    "  {} CLI threshold ({}) exceeds member count ({}), prompting for new value",
-                    "⚠️".bright_yellow(), t, max_members
+        // The setup keypair is added later with Initiate-only permissions and cannot vote,
+        // so the threshold is capped by the voting members collected here.
+        let max_voting_members = interactive_members.len();
+        let final_threshold = if let Some(t) = threshold {
+            if usize::from(t) > max_voting_members {
+                println!(
+                    "  {} CLI threshold ({}) exceeds voting member count ({}), prompting for new value",
+                    "⚠️".bright_yellow(),
+                    t,
+                    max_voting_members
                 );
-                    prompt_for_threshold_with_max(max_members)?
-                } else {
-                    println!("  {} Using threshold from CLI: {}", "✓".bright_green(), t);
-                    t
-                }
+                prompt_for_threshold_with_max(max_voting_members)?
             } else {
-                let max_members = interactive_members.len() + 1; // +1 for contributor
-                prompt_for_threshold_with_max(max_members)?
-            };
+                println!("  {} Using threshold from CLI: {}", "✓".bright_green(), t);
+                t
+            }
+        } else {
+            prompt_for_threshold_with_max(max_voting_members)?
+        };
 
         Ok((final_threshold, interactive_members))
     }
@@ -224,14 +243,12 @@ pub fn prompt_for_threshold_with_max(max_members: usize) -> Result<u16> {
             "Enter threshold (required signatures) [max: {}]:",
             max_members
         ))
-        .prompt()
-        .unwrap_or_default();
+        .prompt()?;
 
-        match validate_threshold(&input, max_members, 1) {
+        match validate_threshold(&input, max_members) {
             Ok(t) => return Ok(t),
             Err(e) => {
                 println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
-                continue;
             }
         }
     }
@@ -330,11 +347,7 @@ fn create_child_vote_transaction_message(
     };
     use solana_instruction::Instruction;
 
-    let (proposal_pda, _bump) = get_proposal_pda(
-        &child_multisig,
-        child_tx_index,
-        Some(&SQUADS_MULTISIG_PROGRAM_ID),
-    );
+    let (proposal_pda, _bump) = get_proposal_pda(&child_multisig, child_tx_index);
 
     let accounts = MultisigVoteOnProposalAccounts {
         multisig: child_multisig,
@@ -354,17 +367,6 @@ fn create_child_vote_transaction_message(
     );
 
     build_squads_transaction_message(&parent_member_pubkey, &[ix], &[])
-}
-
-// Transaction creation functions
-pub fn create_feature_activation_transaction_message(
-    feature_id: Pubkey,
-) -> Result<TransactionMessage> {
-    // Build activation flow without any funding transfer: allocate + assign only.
-    let instructions = activate_feature_funded(&feature_id);
-
-    // Use centralized helper - feature_id is the signer (vault PDA)
-    build_squads_transaction_message(&feature_id, &instructions, &[])
 }
 
 /// Create and send a transaction to fund the feature gate account with rent-exempt lamports
@@ -461,15 +463,15 @@ pub fn validate_pubkey_with_retry(prompt: &str) -> Result<Pubkey> {
     }
 }
 
-pub fn validate_threshold(input: &str, max_members: usize, default: u16) -> Result<u16> {
+pub fn validate_threshold(input: &str, max_members: usize) -> Result<u16> {
     if input.trim().is_empty() {
-        return Ok(default);
+        return Err(eyre::eyre!("Threshold is required"));
     }
 
     match input.trim().parse::<u16>() {
         Ok(0) => Err(eyre::eyre!("Threshold must be at least 1")),
-        Ok(threshold) if threshold > max_members as u16 => Err(eyre::eyre!(
-            "Threshold cannot exceed number of members ({})",
+        Ok(threshold) if usize::from(threshold) > max_members => Err(eyre::eyre!(
+            "Threshold cannot exceed number of voting members ({})",
             max_members
         )),
         Ok(threshold) => {

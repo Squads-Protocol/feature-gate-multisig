@@ -6,9 +6,10 @@ use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::squads::{
-    get_vault_pda, Multisig as SquadsMultisig, TransactionMessage, PERMISSION_EXECUTE,
-    PERMISSION_INITIATE, PERMISSION_VOTE, PROPOSAL_APPROVE_DISCRIMINATOR,
-    PROPOSAL_REJECT_DISCRIMINATOR,
+    deserialize_squads_account, get_vault_pda, Multisig as SquadsMultisig, TransactionMessage,
+    MULTISIG_ACCOUNT_DISCRIMINATOR, PERMISSION_EXECUTE, PERMISSION_INITIATE, PERMISSION_VOTE,
+    PROPOSAL_APPROVE_DISCRIMINATOR, PROPOSAL_REJECT_DISCRIMINATOR, SQUADS_MULTISIG_PROGRAM_ID,
+    VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
 };
 use crate::{
     output,
@@ -18,14 +19,13 @@ use crate::{
         create_config_transaction_create_instruction, create_execute_config_transaction_message,
         create_execute_transaction_message, create_proposal_create_instruction, create_rpc_client,
         create_transaction_and_proposal_message, create_vote_proposal_message,
-        get_proposal_status_and_threshold,
+        fetch_squads_multisig, get_proposal_status_and_threshold,
     },
     utils::{
         choose_network_from_config, create_child_vote_approve_transaction_message,
         create_child_vote_reject_transaction_message, Config,
     },
 };
-use borsh::BorshDeserialize;
 use inquire::Confirm;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,7 +118,10 @@ fn build_config_actions_for_kind(
     }
 }
 
-/// Attempt to load an account as a Squads multisig; returns Ok(None) if not found or not deserializable.
+/// Attempt to load an account as a Squads multisig. Returns Ok(None) if the account
+/// doesn't exist, isn't owned by the Squads program, or doesn't carry the Multisig
+/// account discriminator — this gates the EOA-vs-parent-multisig flow, so spoofable
+/// lookalike data must not pass.
 fn load_multisig_if_any(
     rpc_client: &solana_client::rpc_client::RpcClient,
     key: &Pubkey,
@@ -134,14 +137,11 @@ fn load_multisig_if_any(
         }
     };
 
-    if acc.data.len() < 8 {
+    if acc.owner != SQUADS_MULTISIG_PROGRAM_ID {
         return Ok(None);
     }
 
-    match SquadsMultisig::deserialize(&mut &acc.data[8..]) {
-        Ok(ms) => Ok(Some(ms)),
-        Err(_) => Ok(None),
-    }
+    Ok(deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, "multisig").ok())
 }
 
 /// Check if a key is a member of the multisig with the required permission mask.
@@ -213,7 +213,6 @@ fn confirm_action(prompt: &str, default: bool) -> bool {
 // independent context (ids, signer, network, operation, payload) that don't form a cohesive group.
 #[allow(clippy::too_many_arguments)]
 async fn handle_parent_multisig_flow(
-    program_id: &Pubkey,
     parent_multisig: Pubkey,
     feature_gate_multisig_address: Pubkey,
     proposal_index: u64,
@@ -227,11 +226,7 @@ async fn handle_parent_multisig_flow(
     let rpc_client = create_rpc_client(rpc_url);
 
     // Fetch parent's next transaction index
-    let parent_acc = rpc_client
-        .get_account(&parent_multisig)
-        .map_err(|e| eyre::eyre!("Failed to fetch parent multisig account: {}", e))?;
-    let parent_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &parent_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize parent multisig: {}", e))?;
+    let parent_ms = fetch_squads_multisig(&rpc_client, &parent_multisig, "parent multisig")?;
     let parent_next_index = parent_ms.transaction_index + 1;
 
     // The fee payer must be a member of the parent multisig with Initiate permission
@@ -257,14 +252,14 @@ async fn handle_parent_multisig_flow(
     }
 
     // Prefer using the parent vault PDA as the child member
-    let parent_vault_member = get_vault_pda(&parent_multisig, 0, None).0;
+    let parent_vault_member = get_vault_pda(&parent_multisig, 0).0;
 
     // Validate the child multisig includes the parent vault PDA with required permission
-    let child_acc = rpc_client
-        .get_account(&feature_gate_multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch child multisig: {}", e))?;
-    let child_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &child_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize child multisig: {}", e))?;
+    let child_ms = fetch_squads_multisig(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        "child multisig",
+    )?;
 
     // Check required permission based on operation type
     let (required_permission_mask, permission_name, action_description) = match &operation {
@@ -413,9 +408,16 @@ async fn handle_parent_multisig_flow(
         }
     };
 
+    if matches!(operation, ProposalAction::Create) {
+        output::Output::warning(&format!(
+            "The child transaction embeds the fee payer ({}) as a required signer (rent payer). \
+             The parent proposal must be executed with this same fee payer.",
+            fee_payer_signer.pubkey()
+        ));
+    }
+
     let blockhash = rpc_client.get_latest_blockhash()?;
     let (msg, tx_pda, prop_pda) = create_transaction_and_proposal_message(
-        None,
         &fee_payer_signer.pubkey(),
         &fee_payer_signer.pubkey(),
         &parent_multisig,
@@ -443,13 +445,15 @@ async fn handle_parent_multisig_flow(
     // Offer to approve the parent proposal immediately
     if confirm_action("Approve this parent proposal now?", true) {
         let parent_proposal_index = parent_next_index;
+        // Fetch a fresh blockhash: confirming the create transaction above can take
+        // long enough for the previous one to expire.
+        let approve_blockhash = rpc_client.get_latest_blockhash()?;
         let approve_msg = create_vote_proposal_message(
-            program_id,
             &parent_multisig,
             &fee_payer_signer.pubkey(),
             &fee_payer_signer.pubkey(),
             parent_proposal_index,
-            blockhash,
+            approve_blockhash,
             PROPOSAL_APPROVE_DISCRIMINATOR,
         )?;
         let approve_tx =
@@ -460,7 +464,6 @@ async fn handle_parent_multisig_flow(
 
         // If approvals meet threshold, offer to execute the parent proposal now
         let (approved, threshold, _status) = get_proposal_status_and_threshold(
-            program_id,
             &parent_multisig,
             parent_proposal_index,
             &rpc_client,
@@ -476,7 +479,6 @@ async fn handle_parent_multisig_flow(
             let fresh_blockhash = rpc_client.get_latest_blockhash()?;
             // Parent multisig always stores vault transactions, even when creating config on child
             let exec_msg = create_execute_transaction_message(
-                program_id,
                 &parent_multisig,
                 &fee_payer_signer.pubkey(),
                 &fee_payer_signer.pubkey(),
@@ -534,7 +536,6 @@ pub async fn approve_common_feature_gate_proposal(
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
     fee_payer_path: String,
-    program_id: Option<Pubkey>,
     proposal_index: u64,
     kind: TransactionKind,
 ) -> Result<()> {
@@ -543,7 +544,6 @@ pub async fn approve_common_feature_gate_proposal(
         feature_gate_multisig_address,
         voting_key,
         fee_payer_path,
-        program_id,
         proposal_index,
         ProposalFlavor::Vault(kind),
     )
@@ -555,13 +555,9 @@ pub async fn reject_common_feature_gate_proposal(
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
     fee_payer_path: String,
-    program_id: Option<Pubkey>,
     proposal_index: u64,
     kind: TransactionKind,
 ) -> Result<()> {
-    let program_id = program_id
-        .unwrap_or_else(|| Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"));
-
     let fee_payer_signer =
         signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
             .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
@@ -579,7 +575,6 @@ pub async fn reject_common_feature_gate_proposal(
         };
 
         return handle_parent_multisig_flow(
-            &program_id,
             voting_key,
             feature_gate_multisig_address,
             proposal_index,
@@ -595,7 +590,6 @@ pub async fn reject_common_feature_gate_proposal(
 
     let blockhash = rpc_client.get_latest_blockhash()?;
     let transaction_message = create_vote_proposal_message(
-        &program_id,
         &feature_gate_multisig_address,
         &voting_key,
         &fee_payer_signer.pubkey(),
@@ -632,13 +626,9 @@ pub async fn execute_common_feature_gate_proposal(
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
     fee_payer_path: String,
-    program_id: Option<Pubkey>,
     proposal_index: u64,
     kind: TransactionKind,
 ) -> Result<()> {
-    let program_id = program_id
-        .unwrap_or_else(|| Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"));
-
     let fee_payer_signer = signer_from_path(
         &Default::default(), // matches
         &fee_payer_path,
@@ -652,7 +642,6 @@ pub async fn execute_common_feature_gate_proposal(
 
     // Readiness check: ensure approvals >= threshold on child proposal
     let (approved, threshold, _status) = get_proposal_status_and_threshold(
-        &program_id,
         &feature_gate_multisig_address,
         proposal_index,
         &rpc_client,
@@ -671,7 +660,6 @@ pub async fn execute_common_feature_gate_proposal(
         // If this is a config transaction (Rekey), use the config execute path without extra metas.
         if kind == TransactionKind::Rekey {
             return handle_parent_multisig_flow(
-                &program_id,
                 voting_key,
                 feature_gate_multisig_address,
                 proposal_index,
@@ -687,17 +675,16 @@ pub async fn execute_common_feature_gate_proposal(
 
         // Vault transaction execute path
         use crate::squads::{get_transaction_pda, VaultTransaction};
-        let (child_transaction_pda, _) = get_transaction_pda(
-            &feature_gate_multisig_address,
-            proposal_index,
-            Some(&program_id),
-        );
+        let (child_transaction_pda, _) =
+            get_transaction_pda(&feature_gate_multisig_address, proposal_index);
         let child_transaction_account_data = rpc_client
             .get_account_data(&child_transaction_pda)
             .map_err(|e| eyre::eyre!("Failed to fetch child transaction account: {}", e))?;
-        let child_transaction_contents =
-            VaultTransaction::try_from_slice(&child_transaction_account_data[8..])
-                .map_err(|e| eyre::eyre!("Failed to deserialize child transaction: {}", e))?;
+        let child_transaction_contents: VaultTransaction = deserialize_squads_account(
+            &child_transaction_account_data,
+            VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+            "child vault transaction",
+        )?;
         let child_transaction_message = child_transaction_contents.message;
 
         // Build execution account metas from the child transaction
@@ -724,7 +711,6 @@ pub async fn execute_common_feature_gate_proposal(
         }
 
         return handle_parent_multisig_flow(
-            &program_id,
             voting_key,
             feature_gate_multisig_address,
             proposal_index,
@@ -739,18 +725,13 @@ pub async fn execute_common_feature_gate_proposal(
     }
 
     // Permission check: voting_key must be a member with Execute permission on the child multisig
-    let child_acc = rpc_client
-        .get_account(&feature_gate_multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch multisig account: {}", e))?;
-    let child_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &child_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
+    let child_ms = fetch_squads_multisig(&rpc_client, &feature_gate_multisig_address, "multisig")?;
 
     verify_member_permission(&child_ms, &voting_key, PERMISSION_EXECUTE, "Executor")?;
 
     // Fresh blockhash and build execute message for the proposal
     let blockhash = rpc_client.get_latest_blockhash()?;
     let exec_msg = create_execute_transaction_message(
-        &program_id,
         &feature_gate_multisig_address,
         &voting_key,
         &fee_payer_signer.pubkey(),
@@ -782,12 +763,8 @@ pub async fn create_feature_gate_proposal(
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
     fee_payer_path: String,
-    program_id: Option<Pubkey>,
     kind: TransactionKind,
 ) -> Result<()> {
-    let program_id = program_id
-        .unwrap_or_else(|| Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"));
-
     let fee_payer_signer =
         signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
             .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
@@ -796,18 +773,16 @@ pub async fn create_feature_gate_proposal(
     let rpc_client = create_rpc_client(&rpc_url);
 
     // Fetch the feature gate multisig to get transaction index
-    let feature_gate_acc = rpc_client
-        .get_account(&feature_gate_multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch feature gate multisig: {}", e))?;
-
-    let feature_gate_ms: SquadsMultisig =
-        BorshDeserialize::deserialize(&mut &feature_gate_acc.data[8..])
-            .map_err(|e| eyre::eyre!("Failed to deserialize feature gate multisig: {}", e))?;
+    let feature_gate_ms = fetch_squads_multisig(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        "feature gate multisig",
+    )?;
 
     let next_tx_index = feature_gate_ms.transaction_index + 1;
 
     // Feature ID is the child vault address (vault 0)
-    let feature_id = get_vault_pda(&feature_gate_multisig_address, 0, None).0;
+    let feature_id = get_vault_pda(&feature_gate_multisig_address, 0).0;
 
     // Detect if voting_key is itself a Squads multisig (parent)
     let is_parent_multisig = load_multisig_if_any(&rpc_client, &voting_key)?.is_some();
@@ -825,20 +800,18 @@ pub async fn create_feature_gate_proposal(
         output::Output::info("Parent multisig detected - creating child vault proposal");
 
         // voting_key is the parent multisig address, derive the vault PDA from it
-        let parent_vault_pda = crate::squads::get_vault_pda(&voting_key, 0, Some(&program_id)).0;
+        let parent_vault_pda = crate::squads::get_vault_pda(&voting_key, 0).0;
         output::Output::field(
             "Parent vault PDA (creator/rent_payer):",
             &parent_vault_pda.to_string(),
         );
 
-        let vault_tx_message = crate::provision::create_feature_gate_transaction_message(
-            feature_id, feature_id, kind,
-        )?;
+        let vault_tx_message =
+            crate::provision::create_feature_gate_transaction_message(feature_id, kind)?;
 
         // Pass the raw vault transaction message - handle_parent_multisig_flow will wrap it
         // in create_child_create_vault_transaction_and_proposal_message
         handle_parent_multisig_flow(
-            &program_id,
             voting_key,
             feature_gate_multisig_address,
             next_tx_index,
@@ -880,11 +853,10 @@ pub async fn create_feature_gate_proposal(
     }
 
     let vault_message =
-        crate::provision::create_feature_gate_transaction_message(feature_id, feature_id, kind)?;
+        crate::provision::create_feature_gate_transaction_message(feature_id, kind)?;
 
     let blockhash = rpc_client.get_latest_blockhash()?;
     let (message, _tx_pda, _proposal_pda) = create_transaction_and_proposal_message(
-        Some(&program_id),
         &fee_payer_signer.pubkey(),
         &voting_key,
         &feature_gate_multisig_address,
@@ -914,11 +886,7 @@ pub async fn rekey_multisig_feature_gate(
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
     fee_payer_path: String,
-    program_id: Option<Pubkey>,
 ) -> Result<()> {
-    let program_id = program_id
-        .unwrap_or_else(|| Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"));
-
     let fee_payer_signer =
         signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
             .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
@@ -927,13 +895,11 @@ pub async fn rekey_multisig_feature_gate(
     let rpc_client = create_rpc_client(&rpc_url);
 
     // Fetch the feature gate multisig to get its members
-    let feature_gate_acc = rpc_client
-        .get_account(&feature_gate_multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch feature gate multisig: {}", e))?;
-
-    let feature_gate_ms: SquadsMultisig =
-        BorshDeserialize::deserialize(&mut &feature_gate_acc.data[8..])
-            .map_err(|e| eyre::eyre!("Failed to deserialize feature gate multisig: {}", e))?;
+    let feature_gate_ms = fetch_squads_multisig(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        "feature gate multisig",
+    )?;
 
     // Build config actions for rekey
     let actions = build_config_actions_for_kind(TransactionKind::Rekey, &feature_gate_ms.members)?;
@@ -979,7 +945,7 @@ pub async fn rekey_multisig_feature_gate(
 
     if is_parent_multisig {
         output::Output::info("Parent multisig voting detected - creating parent proposal on child");
-        let parent_vault_member = get_vault_pda(&voting_key, 0, None).0;
+        let parent_vault_member = get_vault_pda(&voting_key, 0).0;
 
         let child_tx_message = create_child_create_config_transaction_and_proposal_message(
             feature_gate_multisig_address,
@@ -991,7 +957,6 @@ pub async fn rekey_multisig_feature_gate(
         );
 
         return handle_parent_multisig_flow(
-            &program_id,
             voting_key,
             feature_gate_multisig_address,
             next_tx_index,
@@ -1009,19 +974,12 @@ pub async fn rekey_multisig_feature_gate(
     output::Output::info("Creating config transaction for rekey...");
 
     // Get transaction & proposal PDAs
-    let (tx_pda, _) = crate::squads::get_transaction_pda(
-        &feature_gate_multisig_address,
-        next_tx_index,
-        Some(&program_id),
-    );
-    let (proposal_pda, _) = crate::squads::get_proposal_pda(
-        &feature_gate_multisig_address,
-        next_tx_index,
-        Some(&program_id),
-    );
+    let (tx_pda, _) =
+        crate::squads::get_transaction_pda(&feature_gate_multisig_address, next_tx_index);
+    let (proposal_pda, _) =
+        crate::squads::get_proposal_pda(&feature_gate_multisig_address, next_tx_index);
 
     let create_tx_instruction = create_config_transaction_create_instruction(
-        &program_id,
         &feature_gate_multisig_address,
         &tx_pda,
         &voting_key,
@@ -1030,7 +988,6 @@ pub async fn rekey_multisig_feature_gate(
         Some("Rekey multisig - disable voting".to_string()),
     )?;
     let create_proposal_instruction = create_proposal_create_instruction(
-        &program_id,
         &feature_gate_multisig_address,
         &proposal_pda,
         &voting_key,
@@ -1091,7 +1048,6 @@ pub async fn rekey_multisig_feature_gate(
             feature_gate_multisig_address,
             voting_key,
             fee_payer_path,
-            Some(program_id),
             next_tx_index,
         )
         .await?;
@@ -1108,7 +1064,6 @@ pub async fn approve_common_config_change(
     multisig_address: Pubkey,
     voting_key: Pubkey,
     fee_payer_path: String,
-    program_id: Option<Pubkey>,
     transaction_index: u64,
 ) -> Result<()> {
     approve_common_proposal(
@@ -1116,7 +1071,6 @@ pub async fn approve_common_config_change(
         multisig_address,
         voting_key,
         fee_payer_path,
-        program_id,
         transaction_index,
         ProposalFlavor::Config,
     )
@@ -1128,13 +1082,9 @@ async fn approve_common_proposal(
     multisig_address: Pubkey,
     voting_key: Pubkey,
     fee_payer_path: String,
-    program_id: Option<Pubkey>,
     proposal_index: u64,
     flavor: ProposalFlavor,
 ) -> Result<()> {
-    let program_id = program_id
-        .unwrap_or_else(|| Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"));
-
     let fee_payer_signer =
         signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
             .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
@@ -1154,7 +1104,6 @@ async fn approve_common_proposal(
 
     if is_parent_multisig {
         return handle_parent_multisig_flow(
-            &program_id,
             voting_key,
             multisig_address,
             proposal_index,
@@ -1170,16 +1119,11 @@ async fn approve_common_proposal(
 
     // EOA voting path - approve proposal
     // Validate voter membership and Vote permission on the child multisig
-    let child_acc = rpc_client
-        .get_account(&multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch multisig: {}", e))?;
-    let child_ms: SquadsMultisig = BorshDeserialize::deserialize(&mut &child_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
+    let child_ms = fetch_squads_multisig(&rpc_client, &multisig_address, "multisig")?;
 
     verify_member_permission(&child_ms, &voting_key, PERMISSION_VOTE, "Approver")?;
 
     let approve_msg = create_vote_proposal_message(
-        &program_id,
         &multisig_address,
         &voting_key,
         &fee_payer_signer.pubkey(),
@@ -1223,12 +1167,8 @@ pub async fn execute_common_config_change(
     multisig_address: Pubkey,
     voting_key: Pubkey,
     fee_payer_path: String,
-    program_id: Option<Pubkey>,
     transaction_index: u64,
 ) -> Result<()> {
-    let program_id = program_id
-        .unwrap_or_else(|| Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"));
-
     let fee_payer_signer =
         signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
             .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
@@ -1237,12 +1177,8 @@ pub async fn execute_common_config_change(
     let rpc_client = create_rpc_client(&rpc_url);
 
     // Readiness check: ensure approvals >= threshold on config proposal
-    let (approved, threshold, _status) = get_proposal_status_and_threshold(
-        &program_id,
-        &multisig_address,
-        transaction_index,
-        &rpc_client,
-    )?;
+    let (approved, threshold, _status) =
+        get_proposal_status_and_threshold(&multisig_address, transaction_index, &rpc_client)?;
     if (approved as u16) < threshold {
         output::Output::hint(&format!(
             "Config proposal at index {} not ready to execute yet: approvals {}/{}",
@@ -1255,7 +1191,6 @@ pub async fn execute_common_config_change(
 
     if is_parent_multisig {
         return handle_parent_multisig_flow(
-            &program_id,
             voting_key,
             multisig_address,
             transaction_index,
@@ -1270,11 +1205,7 @@ pub async fn execute_common_config_change(
     }
 
     // Permission check: voting_key must be a member with Execute permission on the multisig
-    let multisig_acc = rpc_client
-        .get_account(&multisig_address)
-        .map_err(|e| eyre::eyre!("Failed to fetch multisig account: {}", e))?;
-    let multisig: SquadsMultisig = BorshDeserialize::deserialize(&mut &multisig_acc.data[8..])
-        .map_err(|e| eyre::eyre!("Failed to deserialize multisig: {}", e))?;
+    let multisig = fetch_squads_multisig(&rpc_client, &multisig_address, "multisig")?;
 
     verify_member_permission(&multisig, &voting_key, PERMISSION_EXECUTE, "Executor")?;
 
@@ -1285,7 +1216,6 @@ pub async fn execute_common_config_change(
     // Fresh blockhash and build execute message for the config transaction
     let blockhash = rpc_client.get_latest_blockhash()?;
     let exec_msg = create_execute_config_transaction_message(
-        &program_id,
         &multisig_address,
         &voting_key,
         &fee_payer_signer.pubkey(),

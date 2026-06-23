@@ -57,12 +57,6 @@ The contributor key receives Initiate-only permissions, while additional members
         )]
         threshold: Option<u32>,
         #[arg(
-            short,
-            long,
-            help = "Signers (currently unused - members are collected interactively)"
-        )]
-        signers: Option<Vec<String>>,
-        #[arg(
             short = 'k',
             long,
             help = "Keypair file path for paying transaction fees (e.g., ~/.config/solana/id.json)"
@@ -129,11 +123,7 @@ async fn handle_command(command: Commands) -> Result<()> {
     let mut config = load_config()?;
 
     match command {
-        Commands::Create {
-            threshold,
-            signers: _,
-            keypair,
-        } => {
+        Commands::Create { threshold, keypair } => {
             let threshold_option = threshold.and_then(|t| {
                 if t == 0 {
                     println!(
@@ -146,7 +136,7 @@ async fn handle_command(command: Commands) -> Result<()> {
                 }
             });
 
-            create_command(&mut config, threshold_option, vec![], keypair).await
+            create_command(&mut config, threshold_option, keypair).await
         }
         Commands::Show { address } => show_command(&config, address).await,
         Commands::Interactive => interactive_mode().await,

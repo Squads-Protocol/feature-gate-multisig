@@ -1,8 +1,10 @@
 use crate::constants::*;
 use crate::provision::{create_rpc_client, get_account_data_with_retry};
 use crate::squads::{
-    get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction, ConfigTransaction,
-    Multisig, Proposal, ProposalStatus, VaultTransaction,
+    deserialize_squads_account, get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction,
+    ConfigTransaction, Multisig, Proposal, ProposalStatus, VaultTransaction,
+    CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR, MULTISIG_ACCOUNT_DISCRIMINATOR,
+    PROPOSAL_ACCOUNT_DISCRIMINATOR, VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
 };
 use crate::utils::*;
 use colored::*;
@@ -100,25 +102,11 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
     );
     println!();
 
-    if account_data.len() < 8 {
-        return Err(eyre::eyre!("Account data too small to be a valid multisig"));
-    }
-
     println!("📊 Account data length: {} bytes", account_data.len());
 
-    // Strip the first 8 bytes (discriminator) and deserialize
-    let multisig: Multisig = match borsh::BorshDeserialize::deserialize(&mut &account_data[8..]) {
-        Ok(ms) => ms,
-        Err(e) if e.to_string().contains("Not all bytes read") => {
-            // This is expected for accounts with pre-allocated member slots (padding)
-            // Try to deserialize only the data we need, ignoring trailing bytes
-            use borsh::BorshDeserialize;
-            let mut slice = &account_data[8..];
-            Multisig::deserialize(&mut slice)
-                .map_err(|e2| eyre::eyre!("Failed to deserialize multisig data even with partial read: {}. This account may not be a valid Squads multisig.", e2))?
-        },
-        Err(e) => return Err(eyre::eyre!("Failed to deserialize multisig data: {}. This account may not be a valid Squads multisig.", e)),
-    };
+    let multisig: Multisig =
+        deserialize_squads_account(&account_data, MULTISIG_ACCOUNT_DISCRIMINATOR, "multisig")
+            .map_err(|e| eyre::eyre!("{}. This account may not be a valid Squads multisig.", e))?;
 
     println!("✅ Multisig deserialized successfully!");
 
@@ -264,17 +252,17 @@ fn display_multisig_details(multisig: &Multisig, address: &Pubkey) -> Result<()>
     let vault_data = vec![
         VaultInfo {
             index: 0,
-            address: get_vault_pda(address, 0, None).0.to_string(),
+            address: get_vault_pda(address, 0).0.to_string(),
             description: "Default vault (commonly used for feature gates)".to_string(),
         },
         VaultInfo {
             index: 1,
-            address: get_vault_pda(address, 1, None).0.to_string(),
+            address: get_vault_pda(address, 1).0.to_string(),
             description: "Vault #1".to_string(),
         },
         VaultInfo {
             index: 2,
-            address: get_vault_pda(address, 2, None).0.to_string(),
+            address: get_vault_pda(address, 2).0.to_string(),
             description: "Vault #2".to_string(),
         },
     ];
@@ -325,8 +313,8 @@ async fn fetch_and_display_transactions_and_proposals(
         println!("{}", "─".repeat(50).bright_cyan());
 
         // Generate PDAs for transaction and proposal
-        let (transaction_pda, _) = get_transaction_pda(multisig_pubkey, tx_index, None);
-        let (proposal_pda, _) = get_proposal_pda(multisig_pubkey, tx_index, None);
+        let (transaction_pda, _) = get_transaction_pda(multisig_pubkey, tx_index);
+        let (proposal_pda, _) = get_proposal_pda(multisig_pubkey, tx_index);
 
         println!(
             "🎯 Transaction PDA: {}",
@@ -398,16 +386,32 @@ async fn fetch_and_display_transaction(
         return Ok(());
     }
 
-    // Try to deserialize as VaultTransaction first, then ConfigTransaction
-    let transaction: TransactionType = if let Ok(vault_tx) =
-        borsh::BorshDeserialize::deserialize(&mut &account_data[8..])
-    {
-        TransactionType::Vault(vault_tx)
-    } else if let Ok(config_tx) = borsh::BorshDeserialize::deserialize(&mut &account_data[8..]) {
-        TransactionType::Config(config_tx)
+    // Identify the transaction type by its account discriminator
+    let result = if account_data[..8] == *VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR {
+        deserialize_squads_account::<VaultTransaction>(
+            &account_data,
+            VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+            "vault transaction",
+        )
+        .map(TransactionType::Vault)
+    } else if account_data[..8] == *CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR {
+        deserialize_squads_account::<ConfigTransaction>(
+            &account_data,
+            CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+            "config transaction",
+        )
+        .map(TransactionType::Config)
     } else {
-        println!("  ❌ Failed to deserialize transaction (neither Vault nor Config type)");
+        println!("  ❌ Account discriminator matches neither Vault nor Config transaction");
         return Ok(());
+    };
+
+    let transaction = match result {
+        Ok(tx) => tx,
+        Err(e) => {
+            println!("  ❌ {}", e);
+            return Ok(());
+        }
     };
 
     match transaction {
@@ -750,13 +754,15 @@ async fn fetch_and_display_proposal(
     }
 
     // Deserialize the Proposal
-    let proposal: Proposal = match borsh::BorshDeserialize::deserialize(&mut &account_data[8..]) {
-        Ok(prop) => prop,
-        Err(e) => {
-            println!("  ❌ Failed to deserialize proposal: {}", e);
-            return Ok(());
-        }
-    };
+    let proposal: Proposal =
+        match deserialize_squads_account(&account_data, PROPOSAL_ACCOUNT_DISCRIMINATOR, "proposal")
+        {
+            Ok(prop) => prop,
+            Err(e) => {
+                println!("  ❌ {}", e);
+                return Ok(());
+            }
+        };
 
     // Display proposal details in a table
     #[derive(Tabled)]

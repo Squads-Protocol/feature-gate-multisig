@@ -39,8 +39,46 @@ pub const CONFIG_TRANSACTION_CREATE_DISCRIMINATOR: &[u8] = &[155, 236, 87, 228, 
 
 pub const CONFIG_TRANSACTION_EXECUTE_DISCRIMINATOR: &[u8] = &[114, 146, 244, 189, 252, 140, 36, 40];
 
+// Anchor account discriminators: sha256("account:<StructName>")[0..8]
+pub const MULTISIG_ACCOUNT_DISCRIMINATOR: &[u8] = &[224, 116, 121, 186, 68, 161, 79, 236];
+
+pub const PROPOSAL_ACCOUNT_DISCRIMINATOR: &[u8] = &[26, 94, 189, 187, 116, 136, 53, 33];
+
+pub const VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR: &[u8] = &[168, 250, 162, 100, 81, 14, 162, 207];
+
+pub const CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR: &[u8] = &[94, 8, 4, 35, 113, 139, 139, 112];
+
+pub const PROGRAM_CONFIG_ACCOUNT_DISCRIMINATOR: &[u8] = &[196, 210, 90, 231, 144, 149, 140, 63];
+
 pub const SQUADS_MULTISIG_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
+
+/// Deserialize a Squads account's data after validating its Anchor discriminator.
+///
+/// Tolerates trailing bytes after the struct (Multisig accounts carry padding for
+/// pre-allocated member slots). Callers that fetched the full account should also
+/// verify `owner == SQUADS_MULTISIG_PROGRAM_ID` for addresses taken from user input.
+pub fn deserialize_squads_account<T: BorshDeserialize>(
+    data: &[u8],
+    expected_discriminator: &[u8],
+    account_kind: &str,
+) -> Result<T> {
+    if data.len() < 8 {
+        return Err(eyre::eyre!(
+            "{} account data too small: {} bytes (expected at least 8)",
+            account_kind,
+            data.len()
+        ));
+    }
+    if &data[..8] != expected_discriminator {
+        return Err(eyre::eyre!(
+            "Account discriminator does not match a Squads {} account",
+            account_kind
+        ));
+    }
+    T::deserialize(&mut &data[8..])
+        .map_err(|e| eyre::eyre!("Failed to deserialize {}: {}", account_kind, e))
+}
 
 pub const SEED_PREFIX: &[u8] = b"multisig";
 pub const SEED_PROGRAM_CONFIG: &[u8] = b"program_config";
@@ -186,25 +224,21 @@ pub struct MultisigMessageAddressTableLookup {
     pub readonly_indexes: Vec<u8>,
 }
 
-pub fn get_program_config_pda(program_id: Option<&Pubkey>) -> (Pubkey, u8) {
+pub fn get_program_config_pda() -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[SEED_PREFIX, SEED_PROGRAM_CONFIG],
-        program_id.unwrap_or(&SQUADS_MULTISIG_PROGRAM_ID),
+        &SQUADS_MULTISIG_PROGRAM_ID,
     )
 }
 
-pub fn get_multisig_pda(create_key: &Pubkey, program_id: Option<&Pubkey>) -> (Pubkey, u8) {
+pub fn get_multisig_pda(create_key: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[SEED_PREFIX, SEED_MULTISIG, create_key.to_bytes().as_ref()],
-        program_id.unwrap_or(&SQUADS_MULTISIG_PROGRAM_ID),
+        &SQUADS_MULTISIG_PROGRAM_ID,
     )
 }
 
-pub fn get_vault_pda(
-    multisig_pda: &Pubkey,
-    index: u8,
-    program_id: Option<&Pubkey>,
-) -> (Pubkey, u8) {
+pub fn get_vault_pda(multisig_pda: &Pubkey, index: u8) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[
             SEED_PREFIX,
@@ -212,15 +246,11 @@ pub fn get_vault_pda(
             SEED_VAULT,
             &[index],
         ],
-        program_id.unwrap_or(&SQUADS_MULTISIG_PROGRAM_ID),
+        &SQUADS_MULTISIG_PROGRAM_ID,
     )
 }
 
-pub fn get_transaction_pda(
-    multisig_pda: &Pubkey,
-    transaction_index: u64,
-    program_id: Option<&Pubkey>,
-) -> (Pubkey, u8) {
+pub fn get_transaction_pda(multisig_pda: &Pubkey, transaction_index: u64) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[
             SEED_PREFIX,
@@ -228,15 +258,11 @@ pub fn get_transaction_pda(
             SEED_TRANSACTION,
             transaction_index.to_le_bytes().as_ref(),
         ],
-        program_id.unwrap_or(&SQUADS_MULTISIG_PROGRAM_ID),
+        &SQUADS_MULTISIG_PROGRAM_ID,
     )
 }
 
-pub fn get_proposal_pda(
-    multisig_pda: &Pubkey,
-    transaction_index: u64,
-    program_id: Option<&Pubkey>,
-) -> (Pubkey, u8) {
+pub fn get_proposal_pda(multisig_pda: &Pubkey, transaction_index: u64) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[
             SEED_PREFIX,
@@ -245,7 +271,7 @@ pub fn get_proposal_pda(
             &transaction_index.to_le_bytes(),
             SEED_PROPOSAL,
         ],
-        program_id.unwrap_or(&SQUADS_MULTISIG_PROGRAM_ID),
+        &SQUADS_MULTISIG_PROGRAM_ID,
     )
 }
 

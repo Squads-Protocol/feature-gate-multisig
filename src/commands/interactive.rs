@@ -26,7 +26,7 @@ pub async fn interactive_mode() -> Result<()> {
         match choice {
             "Create new feature gate multisig" => {
                 let feepayer_path = prompt_for_fee_payer_path(&config)?;
-                create_command(&mut config, None, vec![], Some(feepayer_path)).await?;
+                create_command(&mut config, None, Some(feepayer_path)).await?;
             }
             "Proposal Actions (Approve/Reject/Execute)" => {
                 handle_proposal_action(&config).await?;
@@ -54,7 +54,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
     // Collect common inputs
     let feature_gate_multisig_address =
         prompt_for_pubkey("Enter the feature gate multisig address:")?;
-    let feature_gate_id = get_vault_pda(&feature_gate_multisig_address, 0, None).0;
+    let feature_gate_id = get_vault_pda(&feature_gate_multisig_address, 0).0;
     let fee_payer_path = prompt_for_fee_payer_path(config)?;
     let voting_key =
         prompt_for_pubkey("Enter the voting key: (Can be either EOA or parent multisig)")?;
@@ -96,7 +96,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                 feature_gate_multisig_address,
                 voting_key,
                 fee_payer_path,
-                None,
                 kind,
             )
             .await;
@@ -107,7 +106,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
             .parse()
             .map_err(|_| eyre::eyre!("Invalid proposal index"))?;
 
-        Confirm::new(&format!(
+        let confirmed = Confirm::new(&format!(
             "You're {}ing the {} of feature gate {} at proposal index {}. Continue?",
             action_choice.to_lowercase(),
             type_choice.to_lowercase(),
@@ -116,6 +115,9 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
         ))
         .with_default(true)
         .prompt()?;
+        if !confirmed {
+            return Ok(());
+        }
 
         match action_choice {
             "Approve" => {
@@ -124,7 +126,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                     kind,
                 )
@@ -136,7 +137,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                     kind,
                 )
@@ -148,7 +148,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                     kind,
                 )
@@ -165,7 +164,6 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                 feature_gate_multisig_address,
                 voting_key,
                 fee_payer_path,
-                None,
             )
             .await;
         }
@@ -177,56 +175,62 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
 
         match action_choice {
             "Approve" => {
-                Confirm::new(&format!(
+                let confirmed = Confirm::new(&format!(
                     "You're approving the rekey proposal at index {}. Continue?",
                     proposal_index
                 ))
                 .with_default(true)
                 .prompt()?;
+                if !confirmed {
+                    return Ok(());
+                }
 
                 approve_common_config_change(
                     config,
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                 )
                 .await?;
             }
             "Reject" => {
-                Confirm::new(&format!(
+                let confirmed = Confirm::new(&format!(
                     "You're rejecting the rekey proposal at index {}. Continue?",
                     proposal_index
                 ))
                 .with_default(true)
                 .prompt()?;
+                if !confirmed {
+                    return Ok(());
+                }
 
                 reject_common_feature_gate_proposal(
                     config,
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                     TransactionKind::Rekey,
                 )
                 .await?;
             }
             "Execute" => {
-                Confirm::new(&format!(
+                let confirmed = Confirm::new(&format!(
                     "You're executing the rekey proposal at index {}. Continue?",
                     proposal_index
                 ))
                 .with_default(true)
                 .prompt()?;
+                if !confirmed {
+                    return Ok(());
+                }
 
                 execute_common_config_change(
                     config,
                     feature_gate_multisig_address,
                     voting_key,
                     fee_payer_path,
-                    None,
                     proposal_index,
                 )
                 .await?;

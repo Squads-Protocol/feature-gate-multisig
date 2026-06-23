@@ -82,11 +82,11 @@ async fn build_fixture() -> Fixture {
 
         let create_key = Keypair::new();
         let (multisig_pda, _signature) =
-            create_multisig(rpc_url(), None, &creator, &create_key, members, 1, None)
+            create_multisig(rpc_url(), &creator, &create_key, members, 1, None)
                 .await
                 .expect("create parent multisig");
 
-        let vault_pda = get_vault_pda(&multisig_pda, 0, None).0;
+        let vault_pda = get_vault_pda(&multisig_pda, 0).0;
 
         // Fund the parent vault with SOL so it can pay rent when creating config transactions
         let fund_vault_ix = solana_system_interface::instruction::transfer(
@@ -152,7 +152,6 @@ async fn build_fixture() -> Fixture {
     let deployments = create_command_with_deployments(
         &mut config,
         Some(3),
-        vec![],
         Some(fee_payer_path.to_string_lossy().to_string()),
     )
     .await
@@ -214,7 +213,6 @@ async fn rpc_e2e_1_activate_feature_gate() {
             fixture.child_multisig,
             voter,
             keypair_path.clone(),
-            None,
             proposal_index,
             TransactionKind::Activate,
         )
@@ -232,7 +230,6 @@ async fn rpc_e2e_1_activate_feature_gate() {
         fixture.child_multisig,
         executor_multisig,
         fixture.executor_path.clone(),
-        None,
         proposal_index,
         TransactionKind::Activate,
     )
@@ -319,7 +316,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         fixture.child_multisig,
         fixture.parent_multisigs[0],
         fixture.parent_key_paths[0].clone(),
-        None,
         TransactionKind::Revoke,
     )
     .await
@@ -345,7 +341,7 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         child_ms_data.transaction_index
     );
 
-    let (vault_prop_pda, _) = get_proposal_pda(&fixture.child_multisig, revocation_index, None);
+    let (vault_prop_pda, _) = get_proposal_pda(&fixture.child_multisig, revocation_index);
 
     if client.get_account(&vault_prop_pda).is_ok() {
         println!("✅ Vault proposal (Index {}) exists", revocation_index);
@@ -364,7 +360,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         fixture.child_multisig,
         fixture.parent_multisigs[0],
         fixture.parent_key_paths[0].clone(),
-        None,
         revocation_index,
         TransactionKind::Revoke,
     )
@@ -376,7 +371,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         fixture.child_multisig,
         fixture.parent_multisigs[1],
         fixture.parent_key_paths[1].clone(),
-        None,
         revocation_index,
         TransactionKind::Revoke,
     )
@@ -388,7 +382,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         fixture.child_multisig,
         fixture.parent_multisigs[2],
         fixture.parent_key_paths[2].clone(),
-        None,
         revocation_index,
         TransactionKind::Revoke,
     )
@@ -398,7 +391,7 @@ async fn rpc_e2e_2_revoke_feature_gate() {
     println!("✅ Revocation approved with 3 approvals!");
 
     // Verify the proposal is approved with the original threshold.
-    let (proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, revocation_index, None);
+    let (proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, revocation_index);
     let proposal_account = client
         .get_account(&proposal_pda)
         .expect("proposal account should exist");
@@ -425,7 +418,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         fixture.child_multisig,
         fixture.parent_multisigs[0],
         fixture.parent_key_paths[0].clone(),
-        None,
         revocation_index,
         TransactionKind::Revoke,
     )
@@ -474,7 +466,6 @@ async fn rpc_e2e_3_reject_activation() {
         fixture.child_multisig,
         fixture.parent_multisigs[0],
         fixture.parent_key_paths[0].clone(),
-        None,
         TransactionKind::Activate,
     )
     .await
@@ -496,7 +487,6 @@ async fn rpc_e2e_3_reject_activation() {
         fixture.child_multisig,
         parent_multisig_pda,
         keypair_path.clone(),
-        None,
         proposal_index,
         TransactionKind::Activate,
     )
@@ -510,7 +500,6 @@ async fn rpc_e2e_3_reject_activation() {
         fixture.child_multisig,
         fixture.eoa_member,
         fixture.eoa_key_path.clone(),
-        None,
         proposal_index,
         TransactionKind::Activate,
     )
@@ -519,7 +508,7 @@ async fn rpc_e2e_3_reject_activation() {
     println!("✅ EOA member rejected proposal");
 
     // Fetch the proposal account and verify it's in Rejected status
-    let (proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, proposal_index, None);
+    let (proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, proposal_index);
     let proposal_account = client
         .get_account(&proposal_pda)
         .expect("proposal account should exist");
@@ -579,7 +568,6 @@ async fn rpc_e2e_4_reject_revocation() {
         fixture.child_multisig,
         fixture.parent_multisigs[2],
         fixture.parent_key_paths[2].clone(),
-        None,
         TransactionKind::Revoke,
     )
     .await
@@ -602,7 +590,6 @@ async fn rpc_e2e_4_reject_revocation() {
         fixture.child_multisig,
         parent_multisig_pda,
         keypair_path.clone(),
-        None,
         proposal_index,
         TransactionKind::Revoke,
     )
@@ -615,7 +602,6 @@ async fn rpc_e2e_4_reject_revocation() {
         fixture.child_multisig,
         fixture.eoa_member,
         fixture.eoa_key_path.clone(),
-        None,
         proposal_index,
         TransactionKind::Revoke,
     )
@@ -624,7 +610,7 @@ async fn rpc_e2e_4_reject_revocation() {
     println!("✅ EOA member rejected revocation proposal");
 
     // Fetch the proposal account and verify it's in Rejected status
-    let (proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, proposal_index, None);
+    let (proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, proposal_index);
     let proposal_account = client
         .get_account(&proposal_pda)
         .expect("proposal account should exist");
@@ -679,14 +665,13 @@ async fn rpc_e2e_5_reject_rekey() {
     let proposal_index = child_ms.transaction_index + 1;
 
     // Ensure the rekey proposal exists. Create via parent[0] if missing.
-    let (child_proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, proposal_index, None);
+    let (child_proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, proposal_index);
     if client.get_account(&child_proposal_pda).is_err() {
         rekey_multisig_feature_gate(
             &fixture.config,
             fixture.child_multisig,
             fixture.parent_multisigs[0],
             fixture.parent_key_paths[0].clone(),
-            None,
         )
         .await
         .expect("create rekey proposal for rejection");
@@ -706,7 +691,6 @@ async fn rpc_e2e_5_reject_rekey() {
         fixture.child_multisig,
         rejecting_parent_ms,
         rejecting_parent_path.clone(),
-        None,
         proposal_index,
         TransactionKind::Rekey,
     )
@@ -720,7 +704,6 @@ async fn rpc_e2e_5_reject_rekey() {
         fixture.child_multisig,
         fixture.eoa_member,
         fixture.eoa_key_path.clone(),
-        None,
         proposal_index,
         TransactionKind::Rekey,
     )
@@ -780,7 +763,7 @@ async fn rpc_e2e_6_rekey_feature_gate_multisig() {
     let proposal_index = child_ms.transaction_index + 1;
 
     // Ensure the rekey proposal exists. The CLI does not auto-schedule rekey, so we create it.
-    let (child_proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, proposal_index, None);
+    let (child_proposal_pda, _) = get_proposal_pda(&fixture.child_multisig, proposal_index);
     if client.get_account(&child_proposal_pda).is_err() {
         // Use rekey_multisig_feature_gate to create the rekey proposal via parent[3] (skip EOA at index 1)
         rekey_multisig_feature_gate(
@@ -788,7 +771,6 @@ async fn rpc_e2e_6_rekey_feature_gate_multisig() {
             fixture.child_multisig,
             fixture.parent_multisigs[3],
             fixture.parent_key_paths[3].clone(),
-            None,
         )
         .await
         .expect("create rekey proposal via parent multisig");
@@ -809,7 +791,6 @@ async fn rpc_e2e_6_rekey_feature_gate_multisig() {
             fixture.child_multisig,
             voter,
             keypair_path.clone(),
-            None,
             proposal_index,
             TransactionKind::Rekey,
         )
@@ -827,7 +808,6 @@ async fn rpc_e2e_6_rekey_feature_gate_multisig() {
         fixture.child_multisig,
         executor_multisig,
         fixture.parent_key_paths[2].clone(),
-        None,
         proposal_index,
         TransactionKind::Rekey,
     )
@@ -910,7 +890,6 @@ async fn rpc_e2e_7_eoa_activation_flow() {
     let deployments = create_command_with_deployments(
         &mut config,
         Some(2), // threshold
-        vec![],
         Some(eoa_keypaths[0].clone()),
     )
     .await
@@ -936,7 +915,6 @@ async fn rpc_e2e_7_eoa_activation_flow() {
         child_multisig,
         eoa_pubkeys[0],
         eoa_keypaths[0].clone(),
-        None,
         1, // proposal index
         TransactionKind::Activate,
     )
@@ -951,7 +929,6 @@ async fn rpc_e2e_7_eoa_activation_flow() {
         child_multisig,
         eoa_pubkeys[1],
         eoa_keypaths[1].clone(),
-        None,
         1, // proposal index
         TransactionKind::Activate,
     )
@@ -961,7 +938,7 @@ async fn rpc_e2e_7_eoa_activation_flow() {
     println!("✅ EOA[1] approved activation proposal (2/2)");
 
     // Verify proposal is approved (2 approvals, threshold 2)
-    let (proposal_pda, _) = get_proposal_pda(&child_multisig, 1, None);
+    let (proposal_pda, _) = get_proposal_pda(&child_multisig, 1);
     let proposal_account = client
         .get_account(&proposal_pda)
         .expect("proposal account should exist");
@@ -981,7 +958,6 @@ async fn rpc_e2e_7_eoa_activation_flow() {
         child_multisig,
         eoa_pubkeys[1],
         eoa_keypaths[1].clone(),
-        None,
         1,
         TransactionKind::Activate,
     )
@@ -1067,7 +1043,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
     let deployments = create_command_with_deployments(
         &mut config,
         Some(2), // threshold
-        vec![],
         Some(eoa_keypaths[0].clone()),
     )
     .await
@@ -1093,7 +1068,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         child_multisig,
         eoa_pubkeys[0],
         eoa_keypaths[0].clone(),
-        None,
         1,
         TransactionKind::Activate,
     )
@@ -1106,7 +1080,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         child_multisig,
         eoa_pubkeys[1],
         eoa_keypaths[1].clone(),
-        None,
         1,
         TransactionKind::Activate,
     )
@@ -1119,7 +1092,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         child_multisig,
         eoa_pubkeys[1],
         eoa_keypaths[1].clone(),
-        None,
         1,
         TransactionKind::Activate,
     )
@@ -1148,7 +1120,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         child_multisig,
         eoa_pubkeys[2],
         eoa_keypaths[2].clone(),
-        None,
         TransactionKind::Revoke,
     )
     .await
@@ -1166,7 +1137,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         child_multisig,
         eoa_pubkeys[2],
         eoa_keypaths[2].clone(),
-        None,
         revocation_index,
         TransactionKind::Revoke,
     )
@@ -1178,7 +1148,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         child_multisig,
         eoa_pubkeys[0],
         eoa_keypaths[0].clone(),
-        None,
         revocation_index,
         TransactionKind::Revoke,
     )
@@ -1188,7 +1157,7 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
     println!("✅ Revocation proposal approved with 2 approvals");
 
     // Verify the proposal is now approved
-    let (proposal_pda, _) = get_proposal_pda(&child_multisig, revocation_index, None);
+    let (proposal_pda, _) = get_proposal_pda(&child_multisig, revocation_index);
     let proposal_account = client
         .get_account(&proposal_pda)
         .expect("proposal account should exist");
@@ -1208,7 +1177,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         child_multisig,
         eoa_pubkeys[2],
         eoa_keypaths[2].clone(),
-        None,
         revocation_index,
         TransactionKind::Revoke,
     )
