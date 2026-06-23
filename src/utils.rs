@@ -67,9 +67,8 @@ pub fn get_network_display(rpc_url: &str) -> &'static str {
 
 // Config management functions
 
-/// Returns the path to the local config file in the current working directory.
-/// The config file is named `feature-gate-multisig.json` and is stored in the
-/// directory where the tool is run from.
+/// Returns the path to the local config file (`config.json`) in the current
+/// working directory — the directory where the tool is run from.
 pub fn get_config_path() -> Result<PathBuf> {
     let current_dir =
         env::current_dir().map_err(|e| eyre::eyre!("Could not get current directory: {}", e))?;
