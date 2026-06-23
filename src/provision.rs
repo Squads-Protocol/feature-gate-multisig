@@ -124,80 +124,42 @@ pub fn build_squads_transaction_message(
     })
 }
 
+/// Returns true for transient node/network errors worth retrying — not deterministic
+/// failures like a preflight/program error.
+fn is_transient_rpc_error(err: &solana_client::client_error::ClientError) -> bool {
+    match &err.kind {
+        ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
+            // -32005 node unhealthy, -32004 request timed out, -32603 internal error.
+            *code == -32005 || *code == -32004 || *code == -32603
+        }
+        ClientErrorKind::Io(_) | ClientErrorKind::Reqwest(_) => true,
+        _ => false,
+    }
+}
+
 pub fn send_and_confirm_transaction(
     transaction: &VersionedTransaction,
     rpc_client: &RpcClient,
 ) -> eyre::Result<String> {
-    const MAX_RETRIES: usize = MAX_TX_RETRIES;
-    const BASE_DELAY_MS: u64 = BASE_RETRY_DELAY_MS;
-    const MAX_TOTAL_RETRY_TIME_MS: u64 = 10_000; // 10 seconds total
+    let config = RpcSendTransactionConfig {
+        skip_preflight: false,
+        preflight_commitment: Some(rpc_client.commitment().commitment),
+        // Leave max_retries unset so the RPC node rebroadcasts until the blockhash
+        // expires; we poll for confirmation rather than resending ourselves.
+        ..Default::default()
+    };
 
-    let mut last_error: Option<eyre::Report> = None;
-    let retry_start = std::time::Instant::now();
-
-    for attempt in 0..MAX_RETRIES {
-        // Check if we've exceeded our total retry time budget
-        if retry_start.elapsed().as_millis() as u64 >= MAX_TOTAL_RETRY_TIME_MS {
-            println!(
-                "Exceeded maximum retry time of {}ms",
-                MAX_TOTAL_RETRY_TIME_MS
-            );
-            break;
-        }
-
-        if attempt > 0 {
-            let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32 - 1));
-            // Ensure we don't exceed our total time budget with this delay
-            let remaining_time =
-                MAX_TOTAL_RETRY_TIME_MS.saturating_sub(retry_start.elapsed().as_millis() as u64);
-            let actual_delay = std::cmp::min(delay, remaining_time);
-
-            if actual_delay > 0 {
-                println!(
-                    "Retrying transaction in {}ms... (attempt {}/{}, {}ms elapsed)",
-                    actual_delay,
-                    attempt + 1,
-                    MAX_RETRIES,
-                    retry_start.elapsed().as_millis()
-                );
-                std::thread::sleep(Duration::from_millis(actual_delay));
-            } else {
-                println!(
-                    "No time remaining for delay, proceeding with retry attempt {}/{}",
-                    attempt + 1,
-                    MAX_RETRIES
-                );
+    // Send, retrying only transient node/network errors. A preflight failure is a
+    // deterministic program error, so surface its logs and fail immediately.
+    let mut signature = None;
+    let mut last_send_err = None;
+    for attempt in 0..MAX_TX_RETRIES {
+        match rpc_client.send_transaction_with_config(transaction, config) {
+            Ok(sig) => {
+                signature = Some(sig);
+                break;
             }
-        }
-
-        // First try to send the transaction
-        let signature = match rpc_client.send_transaction_with_config(
-            transaction,
-            RpcSendTransactionConfig {
-                skip_preflight: false,
-                preflight_commitment: Some(rpc_client.commitment().commitment),
-                encoding: None,
-                max_retries: Some(0), // We handle retries ourselves
-                min_context_slot: None,
-            },
-        ) {
-            Ok(sig) => sig,
             Err(err) => {
-                // Check if this is a retryable error
-                let is_retryable = match &err.kind {
-                    ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
-                        // Common retryable RPC errors
-                        *code == -32005 ||  // Node is unhealthy
-                        *code == -32004 ||  // RPC request timed out
-                        *code == -32603 ||  // Internal error
-                        *code == -32002 ||  // Transaction simulation failed
-                        *code == -32001 // Generic server error
-                    }
-                    ClientErrorKind::Io(_) => true, // Network issues
-                    ClientErrorKind::Reqwest(_) => true, // HTTP client issues
-                    _ => false,
-                };
-
                 if let ClientErrorKind::RpcError(RpcError::RpcResponseError {
                     data:
                         RpcResponseErrorData::SendTransactionPreflightFailure(
@@ -210,107 +172,62 @@ pub fn send_and_confirm_transaction(
                 {
                     println!("Simulation logs:\n\n{}\n", logs.join("\n").bright_yellow());
                 }
-
-                last_error = Some(eyre::eyre!("{}", err));
-
-                // Don't retry on the last attempt or if error is not retryable
-                if attempt == MAX_RETRIES - 1 || !is_retryable {
-                    break;
+                if !is_transient_rpc_error(&err) {
+                    return Err(eyre!("Failed to send transaction: {}", err));
                 }
-
                 println!(
-                    "Retryable error occurred: {}",
-                    last_error
-                        .as_ref()
-                        .map(|e| e.to_string())
-                        .unwrap_or_default()
-                        .bright_yellow()
+                    "Transient send error (attempt {}/{}): {}",
+                    attempt + 1,
+                    MAX_TX_RETRIES,
+                    err.to_string().bright_yellow()
                 );
-                continue;
-            }
-        };
-
-        // Now wait for confirmation with exponential backoff polling
-        let confirmation_start = std::time::Instant::now();
-        let mut confirmation_poll_delay = CONFIRMATION_POLL_INTERVAL_MS;
-
-        loop {
-            if confirmation_start.elapsed().as_millis() as u64 > CONFIRMATION_TIMEOUT_MS {
-                println!(
-                    "Transaction confirmation timeout after {}ms",
-                    CONFIRMATION_TIMEOUT_MS
-                );
-                break; // Will retry sending
-            }
-
-            match rpc_client.get_signature_status(&signature) {
-                Ok(Some(Ok(()))) => {
-                    return Ok(signature.to_string());
-                }
-                Ok(Some(Err(_))) => {
-                    // Transaction failed
-                    println!("Transaction failed confirmation");
-                    break;
-                }
-                Ok(None) => {
-                    // Transaction not yet confirmed, continue polling
-                }
-                Err(confirmation_err) => {
-                    // Check if confirmation error is retryable
-                    match &confirmation_err.kind {
-                        ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
-                            if *code == -32004 || *code == -32005 || *code == -32603 {
-                                // Temporary RPC issue, continue polling
-                                println!(
-                                    "Temporary confirmation error: {}",
-                                    confirmation_err.to_string().bright_yellow()
-                                );
-                            } else {
-                                // Non-retryable confirmation error, break and retry transaction
-                                println!(
-                                    "Non-retryable confirmation error: {}",
-                                    confirmation_err.to_string().bright_red()
-                                );
-                                break;
-                            }
-                        }
-                        ClientErrorKind::Io(_) | ClientErrorKind::Reqwest(_) => {
-                            // Network issues, continue polling
-                            println!(
-                                "Network error during confirmation: {}",
-                                confirmation_err.to_string().bright_yellow()
-                            );
-                        }
-                        _ => {
-                            // Unknown error, break and retry transaction
-                            println!(
-                                "Unknown confirmation error: {}",
-                                confirmation_err.to_string().bright_red()
-                            );
-                            break;
-                        }
-                    }
+                last_send_err = Some(err);
+                if attempt + 1 < MAX_TX_RETRIES {
+                    let delay = BASE_RETRY_DELAY_MS * 2_u64.pow(attempt as u32);
+                    std::thread::sleep(Duration::from_millis(delay));
                 }
             }
-
-            // Wait before next confirmation check with exponential backoff (capped at 5 seconds)
-            std::thread::sleep(Duration::from_millis(confirmation_poll_delay));
-            confirmation_poll_delay = std::cmp::min(confirmation_poll_delay * 2, 5000);
         }
-
-        // If we reach here, confirmation failed or timed out
-        last_error = Some(eyre!(
-            "Transaction sent but confirmation failed or timed out"
-        ));
     }
 
-    Err(eyre!(
-        "Transaction failed after {} attempts: {}",
-        MAX_RETRIES,
-        last_error
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "Unknown error".to_string())
-    ))
+    let signature = signature.ok_or_else(|| {
+        eyre!(
+            "Failed to send transaction after {} attempts: {}",
+            MAX_TX_RETRIES,
+            last_send_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".to_string())
+        )
+    })?;
+
+    // Poll for confirmation until the timeout, tolerating transient polling errors.
+    let confirmation_start = std::time::Instant::now();
+    loop {
+        match rpc_client.get_signature_status(&signature) {
+            Ok(Some(Ok(()))) => return Ok(signature.to_string()),
+            Ok(Some(Err(e))) => {
+                return Err(eyre!("Transaction {} failed on-chain: {}", signature, e))
+            }
+            Ok(None) => {}
+            Err(err) if !is_transient_rpc_error(&err) => {
+                return Err(eyre!(
+                    "Failed to confirm transaction {}: {}",
+                    signature,
+                    err
+                ));
+            }
+            Err(_) => {}
+        }
+
+        if confirmation_start.elapsed().as_millis() as u64 > CONFIRMATION_TIMEOUT_MS {
+            return Err(eyre!(
+                "Transaction {} not confirmed within {}ms",
+                signature,
+                CONFIRMATION_TIMEOUT_MS
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(CONFIRMATION_POLL_INTERVAL_MS));
+    }
 }
 
 pub fn get_account_data_with_retry(
