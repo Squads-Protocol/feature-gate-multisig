@@ -82,7 +82,7 @@ The CLI will display the required PDA if misconfigured. See [Parent Multisig Vot
 
 ## Configuration
 
-Stored at `~/.feature-gate-multisig-tool/config.json`:
+Stored as `config.json` in the directory where the tool is run:
 
 ```json
 {
