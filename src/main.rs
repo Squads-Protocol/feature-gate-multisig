@@ -30,7 +30,7 @@ Features:
 
 For more information, run: feature-gate-multisig-tool help <COMMAND>"
 )]
-#[command(version = "0.1.0")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
