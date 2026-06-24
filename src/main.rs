@@ -74,7 +74,9 @@ The contributor key receives Initiate-only permissions, while additional members
         #[arg(help = "The multisig address to inspect")]
         address: Option<String>,
     },
-    #[command(about = "Verify a feature gate multisig: program authenticity, feature state, owners")]
+    #[command(
+        about = "Verify a feature gate multisig: program authenticity, feature state, owners"
+    )]
     #[command(
         long_about = "Checks, across every configured network, that the Squads program is the authentic immutable v4, reports the feature gate account's status (fresh/pending/activated) and rent-exemption, and lists the multisig owners and threshold. Read-only."
     )]

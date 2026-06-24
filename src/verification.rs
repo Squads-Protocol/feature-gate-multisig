@@ -8,7 +8,7 @@
 
 use crate::commands::TransactionKind;
 use crate::feature_gate_program::{FEATURE_ACCOUNT_SIZE, FEATURE_GATE_PROGRAM_ID};
-use crate::squads::{get_vault_pda, SQUADS_MULTISIG_PROGRAM_ID};
+use crate::squads::{get_vault_pda, Multisig, SQUADS_MULTISIG_PROGRAM_ID};
 use eyre::{eyre, Result};
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
@@ -83,7 +83,10 @@ pub fn verify_feature_gate(rpc: &RpcClient, multisig: &Pubkey) -> Result<Feature
     let rent_min = rpc.get_minimum_balance_for_rent_exemption(FEATURE_ACCOUNT_SIZE)?;
 
     let (status, lamports) = match rpc.get_account(&feature_id) {
-        Ok(acc) => (classify_feature_account(&acc.owner, &acc.data), acc.lamports),
+        Ok(acc) => (
+            classify_feature_account(&acc.owner, &acc.data),
+            acc.lamports,
+        ),
         Err(e) if account_not_found(&e.to_string()) => (FeatureGateStatus::Fresh, 0),
         Err(e) => {
             return Err(eyre!(
@@ -214,6 +217,54 @@ pub fn program_warnings(p: &ProgramAuthenticity, is_mainnet: bool) -> Vec<String
         ));
     }
     warnings
+}
+
+/// Governance-safety warnings about a feature gate multisig's configuration.
+/// Never blocks; the verify command surfaces these.
+///
+/// A feature gate multisig must be autonomous: its `config_authority` is the
+/// default (all-zero) sentinel, so members and threshold can only change by a
+/// member vote. Any other authority can rewrite them unilaterally, which makes
+/// the owner list meaningless. A non-zero time lock delays executions.
+pub fn multisig_safety_warnings(ms: &Multisig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if ms.config_authority != Pubkey::default() {
+        warnings.push(format!(
+            "Multisig is not autonomous: config authority {} can change members and threshold unilaterally, so the owner list is not binding.",
+            ms.config_authority
+        ));
+    }
+    if ms.time_lock != 0 {
+        warnings.push(format!(
+            "Multisig has a non-zero time lock ({}s); executions are delayed by that long after approval.",
+            ms.time_lock
+        ));
+    }
+    warnings
+}
+
+/// True when the multisig is autonomous (config changes require a member vote).
+pub fn is_autonomous(ms: &Multisig) -> bool {
+    ms.config_authority == Pubkey::default()
+}
+
+/// A canonical fingerprint of a multisig's governance-relevant config, for
+/// detecting drift across networks. Covers threshold, config authority, time
+/// lock, and the member set (key + permissions), order-independent.
+pub fn config_fingerprint(ms: &Multisig) -> String {
+    let mut members: Vec<String> = ms
+        .members
+        .iter()
+        .map(|m| format!("{}:{}", m.key, m.permissions.mask))
+        .collect();
+    members.sort();
+    format!(
+        "threshold={};authority={};time_lock={};members=[{}]",
+        ms.threshold,
+        ms.config_authority,
+        ms.time_lock,
+        members.join(",")
+    )
 }
 
 /// Parse an upgradeable-loader ProgramData account into its upgrade authority
@@ -369,6 +420,69 @@ mod tests {
             ..p
         };
         assert_eq!(program_warnings(&broken, false).len(), 2);
+    }
+
+    fn multisig_with(config_authority: Pubkey, time_lock: u32, threshold: u16) -> Multisig {
+        use crate::squads::{Member, Permissions};
+        Multisig {
+            create_key: Pubkey::new_unique(),
+            config_authority,
+            threshold,
+            time_lock,
+            transaction_index: 0,
+            stale_transaction_index: 0,
+            rent_collector: None,
+            bump: 0,
+            members: vec![Member {
+                key: Pubkey::from_str_const("11111111111111111111111111111112"),
+                permissions: Permissions::all(),
+            }],
+        }
+    }
+
+    #[test]
+    fn multisig_safety_warns_on_authority_and_time_lock() {
+        // Autonomous, no time lock: clean.
+        let safe = multisig_with(Pubkey::default(), 0, 2);
+        assert!(multisig_safety_warnings(&safe).is_empty());
+        assert!(is_autonomous(&safe));
+
+        // A real config authority makes the owner list non-binding.
+        let controlled = multisig_with(Pubkey::new_unique(), 0, 2);
+        assert!(!is_autonomous(&controlled));
+        assert!(multisig_safety_warnings(&controlled)
+            .iter()
+            .any(|w| w.contains("not autonomous")));
+
+        // Non-zero time lock warns.
+        let delayed = multisig_with(Pubkey::default(), 3600, 2);
+        assert!(multisig_safety_warnings(&delayed)
+            .iter()
+            .any(|w| w.contains("time lock")));
+    }
+
+    #[test]
+    fn config_fingerprint_ignores_member_order_and_tracks_threshold() {
+        use crate::squads::{Member, Permissions};
+        let mut a = multisig_with(Pubkey::default(), 0, 2);
+        let mut b = a.clone();
+        // Same members, different declared order -> identical fingerprint.
+        a.members = vec![
+            Member {
+                key: Pubkey::from_str_const("11111111111111111111111111111112"),
+                permissions: Permissions::all(),
+            },
+            Member {
+                key: Pubkey::from_str_const("11111111111111111111111111111113"),
+                permissions: Permissions::all(),
+            },
+        ];
+        b.members = vec![a.members[1].clone(), a.members[0].clone()];
+        assert_eq!(config_fingerprint(&a), config_fingerprint(&b));
+
+        // Threshold change -> different fingerprint.
+        b.threshold = 1;
+        assert_ne!(config_fingerprint(&a), config_fingerprint(&b));
     }
 
     #[test]
