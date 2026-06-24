@@ -71,7 +71,6 @@ pub fn classify_feature_account(owner: &Pubkey, data: &[u8]) -> FeatureGateStatu
 /// Result of inspecting a multisig's feature gate account (vault 0).
 #[derive(Debug, Clone)]
 pub struct FeatureVerification {
-    pub multisig: Pubkey,
     pub feature_id: Pubkey,
     pub status: FeatureGateStatus,
     pub lamports: u64,
@@ -96,7 +95,6 @@ pub fn verify_feature_gate(rpc: &RpcClient, multisig: &Pubkey) -> Result<Feature
     };
 
     Ok(FeatureVerification {
-        multisig: *multisig,
         feature_id,
         status,
         lamports,
@@ -185,13 +183,21 @@ pub fn verify_squads_program(rpc: &RpcClient) -> Result<ProgramAuthenticity> {
 }
 
 /// Advisory warnings about the Squads program's authenticity. Never blocks.
-pub fn program_warnings(p: &ProgramAuthenticity) -> Vec<String> {
+///
+/// `is_mainnet` gates the immutability and bytecode-hash checks: those only hold
+/// on mainnet, where the official program is frozen and verified. Squads keeps
+/// its devnet/testnet deployments upgradeable and on different builds, so a
+/// mutable authority or mismatched hash there is expected, not a red flag.
+pub fn program_warnings(p: &ProgramAuthenticity, is_mainnet: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     if !p.executable {
         warnings.push("Squads program account is not executable.".to_string());
     }
     if !p.loader_owner_ok {
         warnings.push("Squads program is not owned by the upgradeable BPF loader.".to_string());
+    }
+    if !is_mainnet {
+        return warnings;
     }
     if !p.immutable {
         warnings.push(format!(
@@ -305,7 +311,6 @@ mod tests {
 
     fn verification_with(status: FeatureGateStatus, rent_exempt: bool) -> FeatureVerification {
         FeatureVerification {
-            multisig: Pubkey::new_unique(),
             feature_id: Pubkey::new_unique(),
             status,
             lamports: 0,
@@ -335,6 +340,35 @@ mod tests {
 
         // Rekey is not a feature-account op: no feature warnings regardless of state.
         assert!(feature_action_warnings(&pending, TransactionKind::Rekey).is_empty());
+    }
+
+    #[test]
+    fn program_warnings_gate_immutability_and_hash_to_mainnet() {
+        // A mutable, mismatched-hash program: a red flag on mainnet, expected elsewhere.
+        let p = ProgramAuthenticity {
+            program_id: SQUADS_MULTISIG_PROGRAM_ID,
+            executable: true,
+            loader_owner_ok: true,
+            immutable: false,
+            upgrade_authority: Some(Pubkey::new_unique()),
+            on_chain_hash: "deadbeef".to_string(),
+            hash_matches: false,
+        };
+
+        let mainnet = program_warnings(&p, true);
+        assert!(mainnet.iter().any(|w| w.contains("mutable")));
+        assert!(mainnet.iter().any(|w| w.contains("does not match")));
+
+        // Off mainnet, neither the mutability nor the hash mismatch warns.
+        assert!(program_warnings(&p, false).is_empty());
+
+        // Core checks (executable, loader ownership) still fire on any network.
+        let broken = ProgramAuthenticity {
+            executable: false,
+            loader_owner_ok: false,
+            ..p
+        };
+        assert_eq!(program_warnings(&broken, false).len(), 2);
     }
 
     #[test]

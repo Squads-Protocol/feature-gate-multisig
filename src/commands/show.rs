@@ -120,6 +120,53 @@ fn show_multisig(config: &Config, address: &str) -> Result<()> {
     Ok(())
 }
 
+/// Print the multisig members table (member index, pubkey, decoded permissions,
+/// bitmask). Shared by `show` and `verify`.
+pub(crate) fn print_members_table(multisig: &Multisig) {
+    #[derive(Tabled)]
+    struct MemberInfo {
+        #[tabled(rename = "#")]
+        index: usize,
+        #[tabled(rename = "Public Key")]
+        pubkey: String,
+        #[tabled(rename = "Permissions")]
+        permissions: String,
+        #[tabled(rename = "Bitmask")]
+        bitmask: u8,
+    }
+
+    println!(
+        "{} ({} total)",
+        "👥 MEMBERS".bright_blue().bold(),
+        multisig.members.len()
+    );
+    println!();
+
+    let member_data: Vec<MemberInfo> = multisig
+        .members
+        .iter()
+        .enumerate()
+        .map(|(i, member)| {
+            let perms = decode_permissions(member.permissions.mask);
+            MemberInfo {
+                index: i + 1,
+                pubkey: member.key.to_string(),
+                permissions: if perms.is_empty() {
+                    "None".to_string()
+                } else {
+                    perms.join(", ")
+                },
+                bitmask: member.permissions.mask,
+            }
+        })
+        .collect();
+
+    let mut members_table = Table::new(member_data);
+    members_table.with(Style::rounded());
+    println!("{}", members_table);
+    println!();
+}
+
 fn display_multisig_details(multisig: &Multisig, address: &Pubkey) -> Result<()> {
     println!("{}", "📋 MULTISIG DETAILS".bright_green().bold());
     println!("{}", "═".repeat(80).bright_green());
@@ -191,49 +238,8 @@ fn display_multisig_details(multisig: &Multisig, address: &Pubkey) -> Result<()>
     println!("{}", info_table);
     println!();
 
-    // Members table
-    #[derive(Tabled)]
-    struct MemberInfo {
-        #[tabled(rename = "#")]
-        index: usize,
-        #[tabled(rename = "Public Key")]
-        pubkey: String,
-        #[tabled(rename = "Permissions")]
-        permissions: String,
-        #[tabled(rename = "Bitmask")]
-        bitmask: u8,
-    }
-
-    println!(
-        "{} ({} total)",
-        "👥 MEMBERS".bright_blue().bold(),
-        multisig.members.len()
-    );
-    println!();
-
-    let member_data: Vec<MemberInfo> = multisig
-        .members
-        .iter()
-        .enumerate()
-        .map(|(i, member)| {
-            let perms = decode_permissions(member.permissions.mask);
-            MemberInfo {
-                index: i + 1,
-                pubkey: member.key.to_string(),
-                permissions: if perms.is_empty() {
-                    "None".to_string()
-                } else {
-                    perms.join(", ")
-                },
-                bitmask: member.permissions.mask,
-            }
-        })
-        .collect();
-
-    let mut members_table = Table::new(member_data);
-    members_table.with(Style::rounded());
-    println!("{}", members_table);
-    println!();
+    // Members table (shared with the `verify` command)
+    print_members_table(multisig);
 
     // Calculate and display vault addresses for common indices
     println!("{}", "🏦 VAULT ADDRESSES".bright_cyan().bold());

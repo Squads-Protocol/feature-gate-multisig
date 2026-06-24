@@ -5,8 +5,11 @@ mod output;
 mod provision;
 mod squads;
 mod utils;
+mod verification;
 
-use crate::commands::{config_command, create_command, interactive_mode, show_command};
+use crate::commands::{
+    config_command, create_command, interactive_mode, show_command, verify_command,
+};
 use crate::output::Output;
 use crate::utils::load_config;
 use clap::{Parser, Subcommand};
@@ -69,6 +72,14 @@ The contributor key receives Initiate-only permissions, while additional members
     )]
     Show {
         #[arg(help = "The multisig address to inspect")]
+        address: Option<String>,
+    },
+    #[command(about = "Verify a feature gate multisig: program authenticity, feature state, owners")]
+    #[command(
+        long_about = "Checks, across every configured network, that the Squads program is the authentic immutable v4, reports the feature gate account's status (fresh/pending/activated) and rent-exemption, and lists the multisig owners and threshold. Read-only."
+    )]
+    Verify {
+        #[arg(help = "The feature gate multisig address to verify")]
         address: Option<String>,
     },
     #[command(about = "Start interactive mode (default when no command is specified)")]
@@ -138,6 +149,7 @@ fn handle_command(command: Commands) -> Result<()> {
             create_command(&mut config, threshold_option, keypair)
         }
         Commands::Show { address } => show_command(&config, address),
+        Commands::Verify { address } => verify_command(&config, address),
         Commands::Interactive => interactive_mode(),
         Commands::Config => config_command(&config),
     }
