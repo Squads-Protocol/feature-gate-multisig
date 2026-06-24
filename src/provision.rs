@@ -18,11 +18,11 @@ use colored::Colorize;
 use eyre::eyre;
 use indicatif::ProgressBar;
 use inquire::Confirm;
-use solana_client::client_error::ClientErrorKind;
-use solana_client::rpc_client::RpcClient;
-use solana_client::rpc_config::RpcSendTransactionConfig;
-use solana_client::rpc_request::{RpcError, RpcResponseErrorData};
-use solana_client::rpc_response::RpcSimulateTransactionResult;
+use solana_rpc_client::rpc_client::RpcClient;
+use solana_rpc_client_api::client_error::{Error as ClientError, ErrorKind as ClientErrorKind};
+use solana_rpc_client_api::config::RpcSendTransactionConfig;
+use solana_rpc_client_api::request::{RpcError, RpcResponseErrorData};
+use solana_rpc_client_api::response::RpcSimulateTransactionResult;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_hash::Hash;
@@ -126,7 +126,7 @@ pub fn build_squads_transaction_message(
 
 /// Returns true for transient node/network errors worth retrying — not deterministic
 /// failures like a preflight/program error.
-fn is_transient_rpc_error(err: &solana_client::client_error::ClientError) -> bool {
+fn is_transient_rpc_error(err: &ClientError) -> bool {
     match &err.kind {
         ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
             // -32005 node unhealthy, -32004 request timed out, -32603 internal error.

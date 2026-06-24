@@ -10,7 +10,7 @@ use crate::utils::*;
 use colored::*;
 use eyre::Result;
 use inquire::Select;
-use solana_client::rpc_client::RpcClient;
+use solana_rpc_client::rpc_client::RpcClient;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 use tabled::{settings::Style, Table, Tabled};

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use borsh::BorshDeserialize;
 
-use solana_client::rpc_client::RpcClient;
+use solana_rpc_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer,
 };
