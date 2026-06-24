@@ -377,7 +377,7 @@ fn create_child_vote_transaction_message(
 ///
 /// # Returns
 /// Result containing the transaction signature or an error
-pub async fn create_and_send_funding_transaction(
+pub fn create_and_send_funding_transaction(
     rpc_url: &str,
     fee_payer_signer: &dyn Signer,
     feature_gate_address: &Pubkey,
@@ -688,7 +688,7 @@ pub fn decode_permissions(mask: u8) -> Vec<String> {
 
 /// Check that the fee payer has sufficient SOL balance on all networks
 /// Returns a Result indicating success or failure with network-specific errors
-pub async fn check_fee_payer_balance_on_networks(
+pub fn check_fee_payer_balance_on_networks(
     fee_payer_pubkey: &Pubkey,
     networks: &[String],
     required_balance_sol: f64,

@@ -212,7 +212,7 @@ fn confirm_action(prompt: &str, default: bool) -> bool {
 // Orchestrates one parent-multisig action (create/approve/reject/execute); the parameters are
 // independent context (ids, signer, network, operation, payload) that don't form a cohesive group.
 #[allow(clippy::too_many_arguments)]
-async fn handle_parent_multisig_flow(
+fn handle_parent_multisig_flow(
     parent_multisig: Pubkey,
     feature_gate_multisig_address: Pubkey,
     proposal_index: u64,
@@ -531,7 +531,7 @@ async fn handle_parent_multisig_flow(
     Ok(())
 }
 
-pub async fn approve_common_feature_gate_proposal(
+pub fn approve_common_feature_gate_proposal(
     config: &Config,
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
@@ -547,10 +547,9 @@ pub async fn approve_common_feature_gate_proposal(
         proposal_index,
         ProposalFlavor::Vault(kind),
     )
-    .await
 }
 
-pub async fn reject_common_feature_gate_proposal(
+pub fn reject_common_feature_gate_proposal(
     config: &Config,
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
@@ -584,8 +583,7 @@ pub async fn reject_common_feature_gate_proposal(
             &rpc_url,
             ProposalAction::Reject,
             ParentFlowPayload::None,
-        )
-        .await;
+        );
     }
 
     let blockhash = rpc_client.get_latest_blockhash()?;
@@ -621,7 +619,7 @@ pub async fn reject_common_feature_gate_proposal(
     Ok(())
 }
 
-pub async fn execute_common_feature_gate_proposal(
+pub fn execute_common_feature_gate_proposal(
     config: &Config,
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
@@ -669,8 +667,7 @@ pub async fn execute_common_feature_gate_proposal(
                 &rpc_url,
                 ProposalAction::Execute,
                 ParentFlowPayload::None,
-            )
-            .await;
+            );
         }
 
         // Vault transaction execute path
@@ -720,8 +717,7 @@ pub async fn execute_common_feature_gate_proposal(
             &rpc_url,
             ProposalAction::Execute,
             ParentFlowPayload::Execute(child_execution_account_metas),
-        )
-        .await;
+        );
     }
 
     // Permission check: voting_key must be a member with Execute permission on the child multisig
@@ -758,7 +754,7 @@ pub async fn execute_common_feature_gate_proposal(
     Ok(())
 }
 
-pub async fn create_feature_gate_proposal(
+pub fn create_feature_gate_proposal(
     config: &Config,
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
@@ -821,8 +817,7 @@ pub async fn create_feature_gate_proposal(
             &rpc_url,
             ProposalAction::Create,
             ParentFlowPayload::Create(vault_tx_message),
-        )
-        .await?;
+        )?;
 
         output::Output::field(
             "Vault proposal created at index:",
@@ -881,7 +876,7 @@ pub async fn create_feature_gate_proposal(
     Ok(())
 }
 
-pub async fn rekey_multisig_feature_gate(
+pub fn rekey_multisig_feature_gate(
     config: &Config,
     feature_gate_multisig_address: Pubkey,
     voting_key: Pubkey,
@@ -966,8 +961,7 @@ pub async fn rekey_multisig_feature_gate(
             &rpc_url,
             ProposalAction::Create,
             ParentFlowPayload::Create(child_tx_message?),
-        )
-        .await;
+        );
     }
 
     // EOA voting path - create config transaction and proposal
@@ -1049,8 +1043,7 @@ pub async fn rekey_multisig_feature_gate(
             voting_key,
             fee_payer_path,
             next_tx_index,
-        )
-        .await?;
+        )?;
     }
 
     output::Output::info(
@@ -1059,7 +1052,7 @@ pub async fn rekey_multisig_feature_gate(
     Ok(())
 }
 
-pub async fn approve_common_config_change(
+pub fn approve_common_config_change(
     config: &Config,
     multisig_address: Pubkey,
     voting_key: Pubkey,
@@ -1074,10 +1067,9 @@ pub async fn approve_common_config_change(
         transaction_index,
         ProposalFlavor::Config,
     )
-    .await
 }
 
-async fn approve_common_proposal(
+fn approve_common_proposal(
     config: &Config,
     multisig_address: Pubkey,
     voting_key: Pubkey,
@@ -1113,8 +1105,7 @@ async fn approve_common_proposal(
             &rpc_url,
             ProposalAction::Approve,
             ParentFlowPayload::None,
-        )
-        .await;
+        );
     }
 
     // EOA voting path - approve proposal
@@ -1162,7 +1153,7 @@ async fn approve_common_proposal(
     Ok(())
 }
 
-pub async fn execute_common_config_change(
+pub fn execute_common_config_change(
     config: &Config,
     multisig_address: Pubkey,
     voting_key: Pubkey,
@@ -1200,8 +1191,7 @@ pub async fn execute_common_config_change(
             &rpc_url,
             ProposalAction::Execute,
             ParentFlowPayload::None,
-        )
-        .await;
+        );
     }
 
     // Permission check: voting_key must be a member with Execute permission on the multisig

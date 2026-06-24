@@ -9,7 +9,7 @@ use crate::utils::*;
 use eyre::Result;
 use inquire::{Confirm, Select, Text};
 
-pub async fn interactive_mode() -> Result<()> {
+pub fn interactive_mode() -> Result<()> {
     let mut config = load_config()?;
 
     loop {
@@ -26,17 +26,17 @@ pub async fn interactive_mode() -> Result<()> {
         match choice {
             "Create new feature gate multisig" => {
                 let feepayer_path = prompt_for_fee_payer_path(&config)?;
-                create_command(&mut config, None, Some(feepayer_path)).await?;
+                create_command(&mut config, None, Some(feepayer_path))?;
             }
             "Proposal Actions (Approve/Reject/Execute)" => {
-                handle_proposal_action(&config).await?;
+                handle_proposal_action(&config)?;
             }
             "Show feature gate multisig details" => {
                 let address = Text::new("Enter the main multisig address:").prompt()?;
-                show_command(&config, Some(address)).await?;
+                show_command(&config, Some(address))?;
             }
             "Show configuration" => {
-                config_command(&config).await?;
+                config_command(&config)?;
             }
             "Exit" => break,
             _ => unreachable!(),
@@ -48,7 +48,7 @@ pub async fn interactive_mode() -> Result<()> {
     Ok(())
 }
 
-async fn handle_proposal_action(config: &Config) -> Result<()> {
+fn handle_proposal_action(config: &Config) -> Result<()> {
     println!("In the current setup, only the fee payer keypair is used for transactions, hence for EOA voting fee payer = voting account. For multisig setup, the fee payer needs to be a member of the parent multisig.\n");
 
     // Collect common inputs
@@ -97,8 +97,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                 voting_key,
                 fee_payer_path,
                 kind,
-            )
-            .await;
+            );
         }
 
         let proposal_index_str = Text::new("Enter the proposal index:").prompt()?;
@@ -128,8 +127,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     fee_payer_path,
                     proposal_index,
                     kind,
-                )
-                .await?;
+                )?;
             }
             "Reject" => {
                 reject_common_feature_gate_proposal(
@@ -139,8 +137,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     fee_payer_path,
                     proposal_index,
                     kind,
-                )
-                .await?;
+                )?;
             }
             "Execute" => {
                 execute_common_feature_gate_proposal(
@@ -150,8 +147,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     fee_payer_path,
                     proposal_index,
                     kind,
-                )
-                .await?;
+                )?;
             }
             _ => unreachable!(),
         }
@@ -164,8 +160,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                 feature_gate_multisig_address,
                 voting_key,
                 fee_payer_path,
-            )
-            .await;
+            );
         }
 
         let proposal_index_str = Text::new("Enter the proposal index:").prompt()?;
@@ -191,8 +186,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     voting_key,
                     fee_payer_path,
                     proposal_index,
-                )
-                .await?;
+                )?;
             }
             "Reject" => {
                 let confirmed = Confirm::new(&format!(
@@ -212,8 +206,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     fee_payer_path,
                     proposal_index,
                     TransactionKind::Rekey,
-                )
-                .await?;
+                )?;
             }
             "Execute" => {
                 let confirmed = Confirm::new(&format!(
@@ -232,8 +225,7 @@ async fn handle_proposal_action(config: &Config) -> Result<()> {
                     voting_key,
                     fee_payer_path,
                     proposal_index,
-                )
-                .await?;
+                )?;
             }
             _ => unreachable!(),
         }

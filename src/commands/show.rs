@@ -15,7 +15,7 @@ use solana_pubkey::Pubkey;
 use std::str::FromStr;
 use tabled::{settings::Style, Table, Tabled};
 
-pub async fn show_command(config: &Config, address: Option<String>) -> Result<()> {
+pub fn show_command(config: &Config, address: Option<String>) -> Result<()> {
     let address = if let Some(addr) = address {
         // Validate provided address
         match Pubkey::from_str(&addr) {
@@ -32,10 +32,10 @@ pub async fn show_command(config: &Config, address: Option<String>) -> Result<()
     } else {
         validate_pubkey_with_retry("Enter multisig address:")?.to_string()
     };
-    show_multisig(config, &address).await
+    show_multisig(config, &address)
 }
 
-async fn show_multisig(config: &Config, address: &str) -> Result<()> {
+fn show_multisig(config: &Config, address: &str) -> Result<()> {
     // Parse the multisig address
     let multisig_pubkey =
         Pubkey::from_str(address).map_err(|_| eyre::eyre!("Invalid multisig address format"))?;
@@ -115,7 +115,7 @@ async fn show_multisig(config: &Config, address: &str) -> Result<()> {
 
     // Fetch and display transaction and proposal details for all live indices.
     let rpc_client = create_rpc_client(&rpc_url);
-    fetch_and_display_transactions_and_proposals(&rpc_client, &multisig_pubkey, &multisig).await?;
+    fetch_and_display_transactions_and_proposals(&rpc_client, &multisig_pubkey, &multisig)?;
 
     Ok(())
 }
@@ -280,7 +280,7 @@ fn display_multisig_details(multisig: &Multisig, address: &Pubkey) -> Result<()>
     Ok(())
 }
 
-async fn fetch_and_display_transactions_and_proposals(
+fn fetch_and_display_transactions_and_proposals(
     rpc_client: &RpcClient,
     multisig_pubkey: &Pubkey,
     multisig: &Multisig,
@@ -327,7 +327,7 @@ async fn fetch_and_display_transactions_and_proposals(
         println!();
 
         // Fetch transaction account
-        match fetch_and_display_transaction(rpc_client, &transaction_pda, tx_index).await {
+        match fetch_and_display_transaction(rpc_client, &transaction_pda, tx_index) {
             Ok(_) => {}
             Err(e) => {
                 println!(
@@ -339,7 +339,7 @@ async fn fetch_and_display_transactions_and_proposals(
         }
 
         // Fetch proposal account
-        match fetch_and_display_proposal(rpc_client, &proposal_pda, tx_index).await {
+        match fetch_and_display_proposal(rpc_client, &proposal_pda, tx_index) {
             Ok(_) => {}
             Err(e) => {
                 println!(
@@ -362,7 +362,7 @@ enum TransactionType {
     Config(ConfigTransaction),
 }
 
-async fn fetch_and_display_transaction(
+fn fetch_and_display_transaction(
     rpc_client: &RpcClient,
     transaction_pda: &Pubkey,
     tx_index: u64,
@@ -729,7 +729,7 @@ fn display_vault_transaction(transaction: &VaultTransaction, tx_index: u64) {
     println!();
 }
 
-async fn fetch_and_display_proposal(
+fn fetch_and_display_proposal(
     rpc_client: &RpcClient,
     proposal_pda: &Pubkey,
     tx_index: u64,

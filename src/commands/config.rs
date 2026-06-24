@@ -2,7 +2,7 @@ use crate::output::Output;
 use crate::utils::*;
 use eyre::Result;
 
-pub async fn config_command(config: &Config) -> Result<()> {
+pub fn config_command(config: &Config) -> Result<()> {
     let config_path = get_config_path()?;
     let config_path_str = config_path.to_string_lossy();
 
