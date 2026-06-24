@@ -5,3 +5,4 @@ secret
 artifacts/
 config.json
 multisig-seed.json
+.DS_Store
