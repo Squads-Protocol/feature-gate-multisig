@@ -45,8 +45,16 @@ solana-rpc-client-api = "2.0.0"
 once_cell = "1.19"
 
 [lints.clippy]
-# Catch debugging/placeholder leftovers. Wider pedantic adoption is deferred
-# (~260 findings) — track separately.
+# Panic prevention: production code must not crash on bad input or RPC errors.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+# Code hygiene: no debugging or placeholder leftovers.
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+# Safety.
+exit = "deny"
+mem_forget = "deny"
+# Wider pedantic adoption is deferred (~260 findings) — track separately.

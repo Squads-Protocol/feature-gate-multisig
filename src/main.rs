@@ -1,3 +1,15 @@
+// unwrap/expect/panic are idiomatic in unit tests; the panic-prevention lints
+// stay strict for production code only.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::panic_in_result_fn
+    )
+)]
+
 mod commands;
 mod constants;
 mod feature_gate_program;
