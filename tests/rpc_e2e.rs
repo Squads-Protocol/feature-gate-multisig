@@ -25,9 +25,12 @@ use feature_gate_multisig_tool::feature_gate_program::{
 use feature_gate_multisig_tool::provision::create_multisig;
 use feature_gate_multisig_tool::squads::{
     get_proposal_pda, get_vault_pda, Member, Permissions, Proposal, ProposalStatus,
-    SQUADS_MULTISIG_PROGRAM_ID,
+    PERMISSION_VOTE, SQUADS_MULTISIG_PROGRAM_ID,
 };
 use feature_gate_multisig_tool::utils::Config;
+use feature_gate_multisig_tool::verification::{
+    is_autonomous, verify_feature_gate, verify_squads_program, FeatureGateStatus,
+};
 
 fn rpc_url() -> String {
     env::var("RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string())
@@ -1175,4 +1178,139 @@ fn rpc_e2e_8_eoa_revocation_flow() {
 
     println!("✅ EOA revocation flow E2E test completed successfully!");
     println!("   Demonstrated: EOA creates and executes revocation with the original threshold");
+}
+
+/// Test 9: Exercise the verification helpers against real on-chain state.
+/// Covers the plumbing that unit tests can't: hashing the real cloned Squads
+/// ELF, and classifying a feature account across a Fresh -> Pending transition.
+#[test]
+fn rpc_e2e_9_verify_checks() {
+    std::env::set_var("E2E_TEST_MODE", "1");
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    // Program authenticity: surfpool clones the frozen mainnet Squads program,
+    // so the on-chain bytecode must match the vendored verified-build hash.
+    let program = verify_squads_program(&client).expect("verify squads program");
+    assert!(program.executable, "Squads program should be executable");
+    assert!(
+        program.loader_owner_ok,
+        "Squads program should be owned by the upgradeable loader"
+    );
+    assert!(
+        program.immutable,
+        "cloned mainnet Squads program should be frozen"
+    );
+    assert!(
+        program.hash_matches,
+        "cloned Squads bytecode hash {} should match the vendored Squads v4 hash",
+        program.on_chain_hash
+    );
+    println!("✅ Squads program authenticity verified against cloned mainnet bytecode");
+
+    // Build an isolated EOA multisig so the feature-state transition is
+    // deterministic and independent of the other tests.
+    let temp_dir: PathBuf = std::env::temp_dir();
+    let mut eoa_keypaths = Vec::new();
+    let mut eoa_pubkeys = Vec::new();
+    for i in 0..3 {
+        let eoa = Keypair::new();
+        let sig = client
+            .request_airdrop(&eoa.pubkey(), 10_000_000_000)
+            .expect("request airdrop for eoa");
+        client.confirm_transaction(&sig).expect("confirm airdrop");
+
+        let keypair_path = temp_dir.join(format!("eoa_test9_{}.json", i));
+        std::fs::write(
+            &keypair_path,
+            serde_json::to_string(&eoa.to_bytes().to_vec()).unwrap(),
+        )
+        .expect("write eoa keypair");
+
+        eoa_pubkeys.push(eoa.pubkey());
+        eoa_keypaths.push(keypair_path.to_string_lossy().to_string());
+    }
+
+    let mut config = Config {
+        networks: vec![rpc_url()],
+        threshold: 2,
+        members: eoa_pubkeys.iter().map(|p| p.to_string()).collect(),
+        fee_payer_path: Some(eoa_keypaths[0].clone()),
+    };
+
+    let deployments =
+        create_command_with_deployments(&mut config, Some(2), Some(eoa_keypaths[0].clone()))
+            .expect("create feature gate via CLI");
+    let deployment = deployments.first().expect("deployment should exist");
+    let child_multisig = deployment.multisig_address;
+
+    // Before execution the feature account (vault 0) is unallocated -> Fresh.
+    let before = verify_feature_gate(&client, &child_multisig).expect("verify feature (fresh)");
+    assert_eq!(
+        before.status,
+        FeatureGateStatus::Fresh,
+        "feature should be Fresh before activation executes"
+    );
+    println!("✅ Feature gate classified Fresh before activation");
+
+    // Owners/config: the tool always provisions autonomous, no-time-lock multisigs.
+    let ms_account = client
+        .get_account(&child_multisig)
+        .expect("fetch child multisig");
+    let ms: feature_gate_multisig_tool::squads::Multisig =
+        BorshDeserialize::deserialize(&mut &ms_account.data[8..])
+            .expect("deserialize child multisig");
+    assert!(
+        is_autonomous(&ms),
+        "provisioned multisig should be autonomous"
+    );
+    assert_eq!(
+        ms.time_lock, 0,
+        "provisioned multisig should have no time lock"
+    );
+    assert_eq!(ms.threshold, 2);
+    // The CLI adds an Initiate-only contributor at index 0 alongside the 3 EOA owners.
+    assert_eq!(ms.members.len(), 4, "3 EOA owners + 1 contributor");
+    let voting = ms
+        .members
+        .iter()
+        .filter(|m| m.permissions.mask & PERMISSION_VOTE != 0)
+        .count();
+    assert_eq!(voting, 3, "the 3 EOA owners are the voting members");
+
+    // Activate: two EOAs approve, one executes.
+    for i in 0..2 {
+        approve_common_feature_gate_proposal(
+            &config,
+            child_multisig,
+            eoa_pubkeys[i],
+            eoa_keypaths[i].clone(),
+            1,
+            TransactionKind::Activate,
+        )
+        .expect("EOA approves activation");
+    }
+    execute_common_feature_gate_proposal(
+        &config,
+        child_multisig,
+        eoa_pubkeys[1],
+        eoa_keypaths[1].clone(),
+        1,
+        TransactionKind::Activate,
+    )
+    .expect("EOA executes activation");
+
+    // After execution the account is Feature-owned and queued -> Pending.
+    let after = verify_feature_gate(&client, &child_multisig).expect("verify feature (pending)");
+    assert_eq!(
+        after.status,
+        FeatureGateStatus::Pending,
+        "feature should be Pending after activation executes"
+    );
+    assert!(
+        after.rent_exempt,
+        "activated feature account should be rent-exempt"
+    );
+    println!("✅ Feature gate classified Pending after activation; verify checks complete");
 }
