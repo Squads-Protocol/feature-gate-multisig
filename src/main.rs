@@ -103,7 +103,7 @@ The contributor key receives Initiate-only permissions, while additional members
     Interactive,
     #[command(about = "Show current configuration including networks and saved members")]
     #[command(
-        long_about = "Displays the current configuration stored in ~/.feature-gate-multisig-tool/config.json including:
+        long_about = "Displays the current configuration stored in your OS config directory (e.g. ~/.config/feature-gate-multisig-tool/config.json on Linux) including:
 • Saved networks array for automatic deployment
 • Saved member public keys
 • Default threshold setting
