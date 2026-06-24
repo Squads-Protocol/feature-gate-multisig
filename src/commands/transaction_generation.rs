@@ -119,7 +119,7 @@ fn build_config_actions_for_kind(
 /// account discriminator — this gates the EOA-vs-parent-multisig flow, so spoofable
 /// lookalike data must not pass.
 fn load_multisig_if_any(
-    rpc_client: &solana_client::rpc_client::RpcClient,
+    rpc_client: &solana_rpc_client::rpc_client::RpcClient,
     key: &Pubkey,
 ) -> Result<Option<SquadsMultisig>> {
     let acc = match rpc_client.get_account(key) {
