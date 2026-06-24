@@ -106,13 +106,6 @@ pub struct Member {
     pub permissions: Permissions,
 }
 
-#[derive(Clone, Copy)]
-pub enum Permission {
-    Initiate = 1 << 0,
-    Vote = 1 << 1,
-    Execute = 1 << 2,
-}
-
 /// Permission bit constants for checking member permissions
 pub const PERMISSION_INITIATE: u8 = 1 << 0;
 pub const PERMISSION_VOTE: u8 = 1 << 1;
@@ -121,6 +114,15 @@ pub const PERMISSION_EXECUTE: u8 = 1 << 2;
 #[derive(BorshSerialize, BorshDeserialize, Eq, PartialEq, Clone, Copy, Default, Debug)]
 pub struct Permissions {
     pub mask: u8,
+}
+
+impl Permissions {
+    /// All permissions: Initiate + Vote + Execute.
+    pub const fn all() -> Self {
+        Self {
+            mask: PERMISSION_INITIATE | PERMISSION_VOTE | PERMISSION_EXECUTE,
+        }
+    }
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
@@ -197,6 +199,26 @@ impl VaultTransactionMessage {
         }
 
         false
+    }
+
+    /// Account metas for passing this stored message's accounts through to an
+    /// `ExecuteTransaction` instruction, preserving writability.
+    ///
+    /// None are marked as signers on purpose: the Squads program derives the
+    /// required signer PDA(s) from the stored message during CPI, and marking
+    /// them as signers in the outer instruction breaks account grouping.
+    pub fn execution_account_metas(&self) -> Vec<AccountMeta> {
+        self.account_keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                if self.is_static_writable_index(i) {
+                    AccountMeta::new(*key, false)
+                } else {
+                    AccountMeta::new_readonly(*key, false)
+                }
+            })
+            .collect()
     }
 }
 

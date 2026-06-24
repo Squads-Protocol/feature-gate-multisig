@@ -52,6 +52,12 @@ pub struct DeploymentResult {
     pub transaction_signature: String,
 }
 
+/// True when running under the E2E test harness, which auto-confirms prompts
+/// and picks defaults non-interactively.
+pub fn is_e2e_test_mode() -> bool {
+    std::env::var("E2E_TEST_MODE").is_ok()
+}
+
 /// Returns a human-readable network name based on the RPC URL.
 pub fn get_network_display(rpc_url: &str) -> &'static str {
     if rpc_url.contains("devnet") {
@@ -112,7 +118,7 @@ pub fn parse_saved_members(config: &Config) -> Vec<Member> {
             Ok(pubkey) => {
                 parsed_members.push(Member {
                     key: pubkey,
-                    permissions: Permissions { mask: 7 }, // Full permissions for saved members
+                    permissions: Permissions::all(), // Full permissions for saved members
                 });
             }
             Err(_) => {
@@ -141,7 +147,7 @@ pub fn collect_members_interactively() -> Result<Vec<Member>> {
             Ok(member_key) => {
                 interactive_members.push(Member {
                     key: member_key,
-                    permissions: Permissions { mask: 7 },
+                    permissions: Permissions::all(),
                 });
                 println!(
                     "  {} Added member: {} ({})",
@@ -543,7 +549,7 @@ pub fn choose_network_from_config(config: &Config) -> Result<String> {
     }
 
     // Non-interactive mode for E2E tests
-    if std::env::var("E2E_TEST_MODE").is_ok() {
+    if is_e2e_test_mode() {
         return Ok(available_networks[0].to_string());
     }
 
@@ -584,7 +590,7 @@ pub fn choose_network_mode(config: &Config, use_saved_config: bool) -> Result<(b
         );
     }
     // Auto-confirm in E2E test mode
-    let use_saved_networks = if std::env::var("E2E_TEST_MODE").is_ok() {
+    let use_saved_networks = if is_e2e_test_mode() {
         true
     } else {
         Confirm::new("Use saved networks for deployment?")
@@ -661,7 +667,7 @@ pub fn review_config(config: &Config) -> Result<bool> {
 
     println!();
     // Auto-confirm in E2E test mode
-    let use_config = if std::env::var("E2E_TEST_MODE").is_ok() {
+    let use_config = if is_e2e_test_mode() {
         true
     } else {
         Confirm::new("Use these saved members and settings?")
