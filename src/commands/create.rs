@@ -14,18 +14,18 @@ use solana_message::VersionedMessage;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 
-pub async fn create_command(
+pub fn create_command(
     config: &mut Config,
     threshold: Option<u16>,
     keypair_path: Option<String>,
 ) -> Result<()> {
     // Keep existing behaviour, but discard returned deployments
-    let _ = create_command_with_deployments(config, threshold, keypair_path).await?;
+    let _ = create_command_with_deployments(config, threshold, keypair_path)?;
     Ok(())
 }
 
 /// Variant of `create_command` that returns deployment details (used by E2E tests).
-pub async fn create_command_with_deployments(
+pub fn create_command_with_deployments(
     config: &mut Config,
     threshold: Option<u16>,
     keypair_path: Option<String>,
@@ -72,7 +72,7 @@ pub async fn create_command_with_deployments(
     if use_saved_networks && !saved_networks.is_empty() {
         let fee_payer_pubkey = fee_payer_signer.pubkey();
 
-        check_fee_payer_balance_on_networks(&fee_payer_pubkey, &saved_networks, 0.05).await?;
+        check_fee_payer_balance_on_networks(&fee_payer_pubkey, &saved_networks, 0.05)?;
     }
 
     let deployments = if use_saved_networks && !saved_networks.is_empty() {
@@ -83,8 +83,7 @@ pub async fn create_command_with_deployments(
             &fee_payer_signer,
             &members,
             final_threshold,
-        )
-        .await?
+        )?
     } else {
         deploy_to_manual_networks(
             config,
@@ -93,8 +92,7 @@ pub async fn create_command_with_deployments(
             &fee_payer_signer,
             &members,
             final_threshold,
-        )
-        .await?
+        )?
     };
 
     // Print summary table
@@ -124,7 +122,7 @@ pub async fn create_command_with_deployments(
     Ok(deployments)
 }
 
-async fn deploy_to_single_network(
+fn deploy_to_single_network(
     rpc_url: &str,
     create_key: &Keypair,
     setup_keypair: &Keypair,
@@ -142,7 +140,6 @@ async fn deploy_to_single_network(
         threshold,
         Some(crate::constants::DEFAULT_PRIORITY_FEE), // Priority fee
     )
-    .await
     .map_err(|e| eyre::eyre!("Failed to create multisig: {}", e))?;
 
     let vault_address = get_vault_pda(&multisig_address, 0).0;
@@ -171,7 +168,7 @@ async fn deploy_to_single_network(
         .map_err(|e| eyre::eyre!("Failed to create activation proposal: {}", e))?;
 
     // Fund the vault address (feature gate account) with rent-exempt lamports
-    create_and_send_funding_transaction(rpc_url, fee_payer_signer, &vault_address).await?;
+    create_and_send_funding_transaction(rpc_url, fee_payer_signer, &vault_address)?;
 
     Ok(DeploymentResult {
         rpc_url: rpc_url.to_string(),
@@ -181,7 +178,7 @@ async fn deploy_to_single_network(
     })
 }
 
-async fn deploy_to_saved_networks(
+fn deploy_to_saved_networks(
     networks: &[String],
     create_key: &Keypair,
     setup_keypair: &Keypair,
@@ -199,9 +196,7 @@ async fn deploy_to_saved_networks(
             fee_payer_signer,
             members,
             threshold,
-        )
-        .await
-        {
+        ) {
             Ok(deployment) => {
                 deployments.push(deployment);
             }
@@ -224,7 +219,7 @@ async fn deploy_to_saved_networks(
     Ok(deployments)
 }
 
-async fn deploy_to_manual_networks(
+fn deploy_to_manual_networks(
     config: &Config,
     create_key: &Keypair,
     contributor_keypair: &Keypair,
@@ -246,9 +241,7 @@ async fn deploy_to_manual_networks(
             fee_payer_signer,
             members,
             threshold,
-        )
-        .await
-        {
+        ) {
             Ok(deployment) => {
                 deployments.push(deployment);
             }

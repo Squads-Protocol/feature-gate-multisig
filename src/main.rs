@@ -87,13 +87,12 @@ The contributor key receives Initiate-only permissions, while additional members
     Config,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Some(command) => handle_command(command).await,
-        None => interactive_mode().await,
+        Some(command) => handle_command(command),
+        None => interactive_mode(),
     };
 
     if let Err(e) = result {
@@ -119,7 +118,7 @@ async fn main() {
     }
 }
 
-async fn handle_command(command: Commands) -> Result<()> {
+fn handle_command(command: Commands) -> Result<()> {
     let mut config = load_config()?;
 
     match command {
@@ -136,10 +135,10 @@ async fn handle_command(command: Commands) -> Result<()> {
                 }
             });
 
-            create_command(&mut config, threshold_option, keypair).await
+            create_command(&mut config, threshold_option, keypair)
         }
-        Commands::Show { address } => show_command(&config, address).await,
-        Commands::Interactive => interactive_mode().await,
-        Commands::Config => config_command(&config).await,
+        Commands::Show { address } => show_command(&config, address),
+        Commands::Interactive => interactive_mode(),
+        Commands::Config => config_command(&config),
     }
 }

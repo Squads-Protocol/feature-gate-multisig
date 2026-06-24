@@ -1630,7 +1630,6 @@ dependencies = [
  "solana-system-interface",
  "solana-transaction",
  "tabled",
- "tokio",
 ]
 
 [[package]]

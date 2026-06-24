@@ -54,12 +54,16 @@ struct Fixture {
 
 static FIXTURE: OnceCell<Fixture> = OnceCell::new();
 
-async fn build_fixture() -> Fixture {
+fn build_fixture() -> Fixture {
     // Enable non-interactive mode for E2E tests
     std::env::set_var("E2E_TEST_MODE", "1");
     std::env::set_var("RUST_LOG", "info");
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+
+    // surfpool clones the Squads program from mainnet on startup; wait for it
+    // before transacting, otherwise the first creations race the clone and fail.
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
 
     // Step 1: Create three parent multisigs
     let mut parent_multisigs = Vec::new();
@@ -83,7 +87,6 @@ async fn build_fixture() -> Fixture {
         let create_key = Keypair::new();
         let (multisig_pda, _signature) =
             create_multisig(rpc_url(), &creator, &create_key, members, 1, None)
-                .await
                 .expect("create parent multisig");
 
         let vault_pda = get_vault_pda(&multisig_pda, 0).0;
@@ -154,7 +157,6 @@ async fn build_fixture() -> Fixture {
         Some(3),
         Some(fee_payer_path.to_string_lossy().to_string()),
     )
-    .await
     .expect("create feature gate via create_command");
 
     let deployment = deployments.first().expect("deployment result should exist");
@@ -181,18 +183,25 @@ async fn build_fixture() -> Fixture {
     }
 }
 
-async fn get_fixture() -> &'static Fixture {
-    if let Some(f) = FIXTURE.get() {
-        return f;
-    }
-    let fixture = build_fixture().await;
-    let _ = FIXTURE.set(fixture);
-    FIXTURE.get().expect("fixture should be set")
+fn get_fixture() -> &'static Fixture {
+    FIXTURE.get_or_init(build_fixture)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn rpc_e2e_1_activate_feature_gate() {
-    let fixture = get_fixture().await;
+/// Poll until `address` is readable, giving surfpool time to clone mainnet
+/// accounts/programs on startup. Panics if it never appears.
+fn wait_for_account(client: &RpcClient, address: &Pubkey) {
+    for _ in 0..60 {
+        if client.get_account(address).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("surfpool did not load account {address} within 30s");
+}
+
+#[test]
+fn rpc_e2e_1_activate_feature_gate() {
+    let fixture = get_fixture();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
 
@@ -216,7 +225,6 @@ async fn rpc_e2e_1_activate_feature_gate() {
             proposal_index,
             TransactionKind::Activate,
         )
-        .await
         .expect("approve proposal");
 
         println!("✅ Approver {} approved proposal", i + 1);
@@ -233,7 +241,6 @@ async fn rpc_e2e_1_activate_feature_gate() {
         proposal_index,
         TransactionKind::Activate,
     )
-    .await
     .expect("execute proposal");
 
     println!("✅ Feature gate activated");
@@ -271,9 +278,9 @@ async fn rpc_e2e_1_activate_feature_gate() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn rpc_e2e_2_revoke_feature_gate() {
-    let fixture = get_fixture().await;
+#[test]
+fn rpc_e2e_2_revoke_feature_gate() {
+    let fixture = get_fixture();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
 
@@ -318,7 +325,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         fixture.parent_key_paths[0].clone(),
         TransactionKind::Revoke,
     )
-    .await
     .expect("create revoke proposal dynamically");
 
     println!(
@@ -363,7 +369,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         revocation_index,
         TransactionKind::Revoke,
     )
-    .await
     .expect("parent[0] approves revoke proposal");
 
     approve_common_feature_gate_proposal(
@@ -374,7 +379,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         revocation_index,
         TransactionKind::Revoke,
     )
-    .await
     .expect("EOA approves revoke proposal");
 
     approve_common_feature_gate_proposal(
@@ -385,7 +389,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         revocation_index,
         TransactionKind::Revoke,
     )
-    .await
     .expect("parent[2] approves revoke proposal");
 
     println!("✅ Revocation approved with 3 approvals!");
@@ -421,7 +424,6 @@ async fn rpc_e2e_2_revoke_feature_gate() {
         revocation_index,
         TransactionKind::Revoke,
     )
-    .await
     .expect("execute revoke proposal");
 
     println!("✅ Revocation executed!");
@@ -440,9 +442,9 @@ async fn rpc_e2e_2_revoke_feature_gate() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn rpc_e2e_3_reject_activation() {
-    let fixture = get_fixture().await;
+#[test]
+fn rpc_e2e_3_reject_activation() {
+    let fixture = get_fixture();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
 
@@ -468,7 +470,6 @@ async fn rpc_e2e_3_reject_activation() {
         fixture.parent_key_paths[0].clone(),
         TransactionKind::Activate,
     )
-    .await
     .expect("create activation proposal for rejection");
 
     println!(
@@ -490,7 +491,6 @@ async fn rpc_e2e_3_reject_activation() {
         proposal_index,
         TransactionKind::Activate,
     )
-    .await
     .expect("reject activation proposal by parent");
     println!("✅ Parent 1 rejected proposal");
 
@@ -503,7 +503,6 @@ async fn rpc_e2e_3_reject_activation() {
         proposal_index,
         TransactionKind::Activate,
     )
-    .await
     .expect("reject activation proposal by eoa");
     println!("✅ EOA member rejected proposal");
 
@@ -542,9 +541,9 @@ async fn rpc_e2e_3_reject_activation() {
     println!("✅ Feature gate rejection E2E test completed successfully!");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn rpc_e2e_4_reject_revocation() {
-    let fixture = get_fixture().await;
+#[test]
+fn rpc_e2e_4_reject_revocation() {
+    let fixture = get_fixture();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
 
@@ -570,7 +569,6 @@ async fn rpc_e2e_4_reject_revocation() {
         fixture.parent_key_paths[2].clone(),
         TransactionKind::Revoke,
     )
-    .await
     .expect("create revocation proposal for rejection");
 
     println!(
@@ -593,7 +591,6 @@ async fn rpc_e2e_4_reject_revocation() {
         proposal_index,
         TransactionKind::Revoke,
     )
-    .await
     .expect("reject revocation proposal by parent");
     println!("✅ Parent 1 rejected revocation proposal");
 
@@ -605,7 +602,6 @@ async fn rpc_e2e_4_reject_revocation() {
         proposal_index,
         TransactionKind::Revoke,
     )
-    .await
     .expect("reject revocation proposal by eoa");
     println!("✅ EOA member rejected revocation proposal");
 
@@ -644,9 +640,9 @@ async fn rpc_e2e_4_reject_revocation() {
     println!("✅ Feature gate revocation rejection E2E test completed successfully!");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn rpc_e2e_5_reject_rekey() {
-    let fixture = get_fixture().await;
+#[test]
+fn rpc_e2e_5_reject_rekey() {
+    let fixture = get_fixture();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
 
@@ -673,7 +669,6 @@ async fn rpc_e2e_5_reject_rekey() {
             fixture.parent_multisigs[0],
             fixture.parent_key_paths[0].clone(),
         )
-        .await
         .expect("create rekey proposal for rejection");
 
         println!(
@@ -694,7 +689,6 @@ async fn rpc_e2e_5_reject_rekey() {
         proposal_index,
         TransactionKind::Rekey,
     )
-    .await
     .expect("reject rekey proposal by parent");
     println!("✅ Parent 2 rejected rekey proposal");
 
@@ -707,7 +701,6 @@ async fn rpc_e2e_5_reject_rekey() {
         proposal_index,
         TransactionKind::Rekey,
     )
-    .await
     .expect("reject rekey proposal by eoa");
     println!("✅ EOA member rejected rekey proposal");
 
@@ -742,9 +735,9 @@ async fn rpc_e2e_5_reject_rekey() {
     println!("✅ Rekey rejection E2E test completed successfully!");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn rpc_e2e_6_rekey_feature_gate_multisig() {
-    let fixture = get_fixture().await;
+#[test]
+fn rpc_e2e_6_rekey_feature_gate_multisig() {
+    let fixture = get_fixture();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
 
@@ -772,7 +765,6 @@ async fn rpc_e2e_6_rekey_feature_gate_multisig() {
             fixture.parent_multisigs[3],
             fixture.parent_key_paths[3].clone(),
         )
-        .await
         .expect("create rekey proposal via parent multisig");
 
         println!(
@@ -794,7 +786,6 @@ async fn rpc_e2e_6_rekey_feature_gate_multisig() {
             proposal_index,
             TransactionKind::Rekey,
         )
-        .await
         .expect("approve rekey proposal");
 
         println!("✅ Approver {} approved rekey proposal", i + 1);
@@ -811,7 +802,6 @@ async fn rpc_e2e_6_rekey_feature_gate_multisig() {
         proposal_index,
         TransactionKind::Rekey,
     )
-    .await
     .expect("execute rekey proposal");
 
     println!("✅ Rekey executed");
@@ -846,8 +836,8 @@ async fn rpc_e2e_6_rekey_feature_gate_multisig() {
 /// Test 7: EOA approves and executes an activation proposal
 /// This test creates a new child multisig with EOA-only members using the real CLI flow,
 /// then EOAs approve and execute the pre-created activation proposal.
-#[tokio::test(flavor = "multi_thread")]
-async fn rpc_e2e_7_eoa_activation_flow() {
+#[test]
+fn rpc_e2e_7_eoa_activation_flow() {
     // Enable non-interactive mode
     std::env::set_var("E2E_TEST_MODE", "1");
 
@@ -892,7 +882,6 @@ async fn rpc_e2e_7_eoa_activation_flow() {
         Some(2), // threshold
         Some(eoa_keypaths[0].clone()),
     )
-    .await
     .expect("create feature gate via CLI");
 
     let deployment = deployments.first().expect("deployment should exist");
@@ -918,7 +907,6 @@ async fn rpc_e2e_7_eoa_activation_flow() {
         1, // proposal index
         TransactionKind::Activate,
     )
-    .await
     .expect("EOA[0] approves activation");
 
     println!("✅ EOA[0] approved activation proposal (1/2)");
@@ -932,7 +920,6 @@ async fn rpc_e2e_7_eoa_activation_flow() {
         1, // proposal index
         TransactionKind::Activate,
     )
-    .await
     .expect("EOA[1] approves activation");
 
     println!("✅ EOA[1] approved activation proposal (2/2)");
@@ -961,7 +948,6 @@ async fn rpc_e2e_7_eoa_activation_flow() {
         1,
         TransactionKind::Activate,
     )
-    .await
     .expect("EOA[1] executes activation");
 
     println!("✅ EOA[1] executed activation proposal");
@@ -999,8 +985,8 @@ async fn rpc_e2e_7_eoa_activation_flow() {
 /// Test 8: EOA creates and executes a revocation proposal
 /// Uses the same CLI flow as test 7 - creates multisig via create_command_with_deployments,
 /// then activates, then creates and executes revocation.
-#[tokio::test(flavor = "multi_thread")]
-async fn rpc_e2e_8_eoa_revocation_flow() {
+#[test]
+fn rpc_e2e_8_eoa_revocation_flow() {
     // Enable non-interactive mode
     std::env::set_var("E2E_TEST_MODE", "1");
 
@@ -1045,7 +1031,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         Some(2), // threshold
         Some(eoa_keypaths[0].clone()),
     )
-    .await
     .expect("create feature gate via CLI");
 
     let deployment = deployments.first().expect("deployment should exist");
@@ -1071,7 +1056,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         1,
         TransactionKind::Activate,
     )
-    .await
     .expect("EOA[0] approves activation");
 
     // EOA[1] approves the activation proposal
@@ -1083,7 +1067,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         1,
         TransactionKind::Activate,
     )
-    .await
     .expect("EOA[1] approves activation");
 
     // EOA[1] executes the activation
@@ -1095,7 +1078,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         1,
         TransactionKind::Activate,
     )
-    .await
     .expect("EOA[1] executes activation");
 
     println!("✅ Feature gate activated (prerequisite for revocation)");
@@ -1122,7 +1104,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         eoa_keypaths[2].clone(),
         TransactionKind::Revoke,
     )
-    .await
     .expect("EOA[2] creates revocation proposal");
 
     println!(
@@ -1140,7 +1121,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         revocation_index,
         TransactionKind::Revoke,
     )
-    .await
     .expect("EOA[2] approves revocation");
 
     approve_common_feature_gate_proposal(
@@ -1151,7 +1131,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         revocation_index,
         TransactionKind::Revoke,
     )
-    .await
     .expect("EOA[0] approves revocation");
 
     println!("✅ Revocation proposal approved with 2 approvals");
@@ -1180,7 +1159,6 @@ async fn rpc_e2e_8_eoa_revocation_flow() {
         revocation_index,
         TransactionKind::Revoke,
     )
-    .await
     .expect("EOA[2] executes revocation");
 
     println!("✅ EOA[2] executed revocation proposal");

@@ -274,7 +274,7 @@ pub fn get_account_data_with_retry(
             .unwrap_or_else(|| "Unknown error".to_string())
     ))
 }
-pub async fn create_multisig(
+pub fn create_multisig(
     rpc_url: String,
     fee_payer_keypair: &dyn Signer,
     create_key: &Keypair,
