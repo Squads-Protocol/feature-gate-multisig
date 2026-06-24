@@ -869,23 +869,9 @@ pub fn create_execute_transaction_message(
     .map_err(|e| eyre::eyre!("at {}: {}", transaction_pda, e))?;
     let transaction_message = transaction_contents.message;
 
-    let mut execution_account_metas = Vec::new();
-    for (i, account_key) in transaction_message.account_keys.iter().enumerate() {
-        // Do NOT preserve signer flags in the outer instruction. The Squads program
-        // reads the stored TransactionMessage which has num_signers to know which accounts
-        // to PDA-sign during CPI. Marking them as signers here causes message construction issues.
-        let is_signer = false;
-
-        let is_writable = transaction_message.is_static_writable_index(i);
-        if is_writable {
-            execution_account_metas.push(AccountMeta::new(*account_key, is_signer));
-        } else {
-            execution_account_metas.push(AccountMeta::new_readonly(*account_key, is_signer));
-        }
-    }
-
     // All accounts from the stored message are passed through to the Squads program,
     // including the parent multisig needed for vault PDA derivation during CPI.
+    let execution_account_metas = transaction_message.execution_account_metas();
 
     let account_keys = MultisigExecuteTransactionAccounts {
         multisig: *multisig_address,

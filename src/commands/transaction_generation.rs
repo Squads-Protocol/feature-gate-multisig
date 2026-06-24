@@ -684,28 +684,8 @@ pub fn execute_common_feature_gate_proposal(
         )?;
         let child_transaction_message = child_transaction_contents.message;
 
-        // Build execution account metas from the child transaction
-        let mut child_execution_account_metas = Vec::new();
-        for (i, account_key) in child_transaction_message.account_keys.iter().enumerate() {
-            // Preserve writability but do NOT mark any of the child execution
-            // accounts as signers. The Squads program will derive the required
-            // signer PDA(s) from the stored transaction message, and marking
-            // them as signers in the outer Execute instruction confuses the
-            // account grouping (leading to InvalidAccount during CPI).
-            let is_signer = false;
-            let is_writable = child_transaction_message.is_static_writable_index(i);
-            if is_writable {
-                child_execution_account_metas.push(solana_instruction::AccountMeta::new(
-                    *account_key,
-                    is_signer,
-                ));
-            } else {
-                child_execution_account_metas.push(solana_instruction::AccountMeta::new_readonly(
-                    *account_key,
-                    is_signer,
-                ));
-            }
-        }
+        // Build execution account metas from the child transaction.
+        let child_execution_account_metas = child_transaction_message.execution_account_metas();
 
         return handle_parent_multisig_flow(
             voting_key,

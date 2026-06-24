@@ -198,6 +198,26 @@ impl VaultTransactionMessage {
 
         false
     }
+
+    /// Account metas for passing this stored message's accounts through to an
+    /// `ExecuteTransaction` instruction, preserving writability.
+    ///
+    /// None are marked as signers on purpose: the Squads program derives the
+    /// required signer PDA(s) from the stored message during CPI, and marking
+    /// them as signers in the outer instruction breaks account grouping.
+    pub fn execution_account_metas(&self) -> Vec<AccountMeta> {
+        self.account_keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                if self.is_static_writable_index(i) {
+                    AccountMeta::new(*key, false)
+                } else {
+                    AccountMeta::new_readonly(*key, false)
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(BorshDeserialize, BorshSerialize, Clone)]
