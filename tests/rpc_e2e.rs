@@ -24,7 +24,7 @@ use feature_gate_multisig_tool::feature_gate_program::{
 };
 use feature_gate_multisig_tool::provision::create_multisig;
 use feature_gate_multisig_tool::squads::{
-    get_proposal_pda, get_vault_pda, Member, Permission, Permissions, Proposal, ProposalStatus,
+    get_proposal_pda, get_vault_pda, Member, Permissions, Proposal, ProposalStatus,
     SQUADS_MULTISIG_PROGRAM_ID,
 };
 use feature_gate_multisig_tool::utils::Config;
@@ -34,9 +34,7 @@ fn rpc_url() -> String {
 }
 
 fn full_permissions() -> Permissions {
-    Permissions {
-        mask: (Permission::Initiate as u8) | (Permission::Vote as u8) | (Permission::Execute as u8),
-    }
+    Permissions::all()
 }
 
 struct Fixture {

@@ -106,13 +106,6 @@ pub struct Member {
     pub permissions: Permissions,
 }
 
-#[derive(Clone, Copy)]
-pub enum Permission {
-    Initiate = 1 << 0,
-    Vote = 1 << 1,
-    Execute = 1 << 2,
-}
-
 /// Permission bit constants for checking member permissions
 pub const PERMISSION_INITIATE: u8 = 1 << 0;
 pub const PERMISSION_VOTE: u8 = 1 << 1;
@@ -121,6 +114,15 @@ pub const PERMISSION_EXECUTE: u8 = 1 << 2;
 #[derive(BorshSerialize, BorshDeserialize, Eq, PartialEq, Clone, Copy, Default, Debug)]
 pub struct Permissions {
     pub mask: u8,
+}
+
+impl Permissions {
+    /// All permissions: Initiate + Vote + Execute.
+    pub const fn all() -> Self {
+        Self {
+            mask: PERMISSION_INITIATE | PERMISSION_VOTE | PERMISSION_EXECUTE,
+        }
+    }
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]

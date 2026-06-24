@@ -112,7 +112,7 @@ pub fn parse_saved_members(config: &Config) -> Vec<Member> {
             Ok(pubkey) => {
                 parsed_members.push(Member {
                     key: pubkey,
-                    permissions: Permissions { mask: 7 }, // Full permissions for saved members
+                    permissions: Permissions::all(), // Full permissions for saved members
                 });
             }
             Err(_) => {
@@ -141,7 +141,7 @@ pub fn collect_members_interactively() -> Result<Vec<Member>> {
             Ok(member_key) => {
                 interactive_members.push(Member {
                     key: member_key,
-                    permissions: Permissions { mask: 7 },
+                    permissions: Permissions::all(),
                 });
                 println!(
                     "  {} Added member: {} ({})",

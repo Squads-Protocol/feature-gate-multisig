@@ -90,11 +90,7 @@ fn build_config_actions_for_kind(
             actions.push(crate::squads::ConfigAction::AddMember {
                 new_member: crate::squads::Member {
                     key: Pubkey::default(),
-                    permissions: crate::squads::Permissions {
-                        mask: (crate::squads::Permission::Initiate as u8)
-                            | (crate::squads::Permission::Vote as u8)
-                            | (crate::squads::Permission::Execute as u8),
-                    },
+                    permissions: crate::squads::Permissions::all(),
                 },
             });
 
