@@ -188,7 +188,7 @@ fn verify_member_permission(
 
 /// Interactive confirmation - auto-confirms in E2E test mode
 fn confirm_action(prompt: &str, default: bool) -> bool {
-    if std::env::var("E2E_TEST_MODE").is_ok() {
+    if crate::utils::is_e2e_test_mode() {
         return true;
     }
     Confirm::new(prompt)
@@ -896,7 +896,7 @@ pub fn rekey_multisig_feature_gate(
     }
 
     // Final confirmation
-    if std::env::var("E2E_TEST_MODE").is_err() {
+    if !crate::utils::is_e2e_test_mode() {
         let confirm =
             Confirm::new("This will permanently disable voting on this multisig. Are you sure?")
                 .with_default(false)

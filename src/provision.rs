@@ -354,7 +354,7 @@ pub fn create_multisig(
     );
     println!();
 
-    let proceed = if std::env::var("E2E_TEST_MODE").is_ok() {
+    let proceed = if crate::utils::is_e2e_test_mode() {
         true
     } else {
         Confirm::new("Do you want to proceed?")
