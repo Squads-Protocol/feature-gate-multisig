@@ -5,3 +5,4 @@ pub mod output;
 pub mod provision;
 pub mod squads;
 pub mod utils;
+pub mod verification;

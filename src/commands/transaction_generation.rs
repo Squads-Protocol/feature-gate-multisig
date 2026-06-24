@@ -197,6 +197,26 @@ fn confirm_action(prompt: &str, default: bool) -> bool {
         .unwrap_or(false)
 }
 
+/// Pre-flight check before acting on a feature gate: surface any state warnings
+/// for `kind` (e.g. revoke on a non-pending feature) and confirm. Returns false
+/// if the user declines.
+fn confirm_feature_preflight(
+    rpc_client: &solana_rpc_client::rpc_client::RpcClient,
+    multisig: &Pubkey,
+    kind: TransactionKind,
+) -> Result<bool> {
+    let verification = crate::verification::verify_feature_gate(rpc_client, multisig)?;
+    let warnings = crate::verification::feature_action_warnings(&verification, kind);
+    if warnings.is_empty() {
+        return Ok(true);
+    }
+    output::Output::warning("Feature gate pre-flight raised concerns:");
+    for warning in &warnings {
+        output::Output::warning(warning);
+    }
+    Ok(confirm_action("Proceed despite the above?", false))
+}
+
 /// Common flow for creating and optionally executing a parent multisig proposal
 /// that operates on a child multisig.
 ///
@@ -634,6 +654,13 @@ pub fn execute_common_feature_gate_proposal(
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
 
+    // Pre-flight: warn if the feature state is wrong for this action
+    // (e.g. revoking something that is not pending fails on-chain).
+    if !confirm_feature_preflight(&rpc_client, &feature_gate_multisig_address, kind)? {
+        output::Output::info("Cancelled.");
+        return Ok(());
+    }
+
     // Readiness check: ensure approvals >= threshold on child proposal
     let (approved, threshold, _status) = get_proposal_status_and_threshold(
         &feature_gate_multisig_address,
@@ -755,6 +782,12 @@ pub fn create_feature_gate_proposal(
 
     // Feature ID is the child vault address (vault 0)
     let feature_id = get_vault_pda(&feature_gate_multisig_address, 0).0;
+
+    // Pre-flight: warn if the feature state is wrong for this action.
+    if !confirm_feature_preflight(&rpc_client, &feature_gate_multisig_address, kind)? {
+        output::Output::info("Cancelled.");
+        return Ok(());
+    }
 
     // Detect if voting_key is itself a Squads multisig (parent)
     let is_parent_multisig = load_multisig_if_any(&rpc_client, &voting_key)?.is_some();

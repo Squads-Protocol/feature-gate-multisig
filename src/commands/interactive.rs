@@ -2,7 +2,7 @@ use crate::commands::{
     approve_common_config_change, approve_common_feature_gate_proposal, config_command,
     create_command, create_feature_gate_proposal, execute_common_config_change,
     execute_common_feature_gate_proposal, reject_common_feature_gate_proposal,
-    rekey_multisig_feature_gate, show_command, TransactionKind,
+    rekey_multisig_feature_gate, show_command, verify_command, TransactionKind,
 };
 use crate::squads::get_vault_pda;
 use crate::utils::*;
@@ -16,6 +16,7 @@ pub fn interactive_mode() -> Result<()> {
         let options = vec![
             "Create new feature gate multisig",
             "Show feature gate multisig details",
+            "Verify feature gate multisig",
             "Show configuration",
             "Proposal Actions (Approve/Reject/Execute)",
             "Exit",
@@ -34,6 +35,10 @@ pub fn interactive_mode() -> Result<()> {
             "Show feature gate multisig details" => {
                 let address = Text::new("Enter the main multisig address:").prompt()?;
                 show_command(&config, Some(address))?;
+            }
+            "Verify feature gate multisig" => {
+                let address = Text::new("Enter the feature gate multisig address:").prompt()?;
+                verify_command(&config, Some(address))?;
             }
             "Show configuration" => {
                 config_command(&config)?;
