@@ -1,6 +1,15 @@
 //! RPC-based E2E tests against a running surfpool instance.
 //! Run `surfpool start` first, which will load Squads BPF and start a local validator.
 
+// unwrap/expect/panic are idiomatic in tests; the panic-prevention lints apply
+// to production code only.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::panic_in_result_fn
+)]
+
 use std::env;
 use std::path::PathBuf;
 
