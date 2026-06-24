@@ -21,6 +21,10 @@ jobs:
         with:
           persist-credentials: false
 
+      # hidapi (via solana-remote-wallet) needs libudev to build on Linux.
+      - name: Install system deps
+        run: sudo apt-get install -y libudev-dev
+
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537  # master
         with:
           toolchain: stable
@@ -62,6 +66,10 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
+
+      # hidapi (via solana-remote-wallet) needs libudev to build on Linux.
+      - name: Install system deps
+        run: sudo apt-get install -y libudev-dev
 
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537  # master
         with:
