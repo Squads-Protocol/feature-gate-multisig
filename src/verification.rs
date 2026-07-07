@@ -36,7 +36,9 @@ pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw
 /// Detect whether `rpc` points at Solana mainnet by comparing the cluster's
 /// genesis hash against the known mainnet genesis hash. Unlike URL matching,
 /// this identifies the cluster from the chain itself, so custom RPC endpoints
-/// are classified correctly.
+/// are classified correctly. Mainnet forks/simulators (e.g. surfpool) report
+/// mainnet's genesis hash and classify as mainnet, which is intended: they
+/// carry mainnet state, so the strict mainnet checks apply.
 pub fn is_mainnet_cluster(rpc: &RpcClient) -> Result<bool> {
     let genesis = rpc
         .get_genesis_hash()

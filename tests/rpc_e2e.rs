@@ -1219,11 +1219,17 @@ fn rpc_e2e_9_verify_checks() {
     );
     println!("✅ Squads program authenticity verified against cloned mainnet bytecode");
 
-    // Cluster detection: surfpool is a localnet, so its genesis hash must not
-    // classify as mainnet even though it clones mainnet programs.
+    // Cluster detection: surfpool forks mainnet and reports mainnet's genesis
+    // hash, so it classifies as mainnet. That is the intended semantic: the
+    // genesis hash identifies the chain (mainnet forks carry mainnet state and
+    // the real frozen Squads program), unlike the URL heuristic, which would
+    // misread 127.0.0.1 as non-mainnet.
     let mainnet = is_mainnet_cluster(&client).expect("fetch genesis hash");
-    assert!(!mainnet, "surfpool localnet must not classify as mainnet");
-    println!("✅ Genesis-hash cluster detection classifies surfpool as non-mainnet");
+    assert!(
+        mainnet,
+        "surfpool forks mainnet, so it classifies as mainnet"
+    );
+    println!("✅ Genesis-hash cluster detection classifies the mainnet fork as mainnet");
 
     // Build an isolated EOA multisig so the feature-state transition is
     // deterministic and independent of the other tests.
