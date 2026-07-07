@@ -38,7 +38,8 @@ use feature_gate_multisig_tool::squads::{
 };
 use feature_gate_multisig_tool::utils::Config;
 use feature_gate_multisig_tool::verification::{
-    is_autonomous, verify_feature_gate, verify_squads_program, FeatureGateStatus,
+    is_autonomous, is_mainnet_cluster, verify_feature_gate, verify_squads_program,
+    FeatureGateStatus,
 };
 
 fn rpc_url() -> String {
@@ -1217,6 +1218,18 @@ fn rpc_e2e_9_verify_checks() {
         program.on_chain_hash
     );
     println!("✅ Squads program authenticity verified against cloned mainnet bytecode");
+
+    // Cluster detection: surfpool forks mainnet and reports mainnet's genesis
+    // hash, so it classifies as mainnet. That is the intended semantic: the
+    // genesis hash identifies the chain (mainnet forks carry mainnet state and
+    // the real frozen Squads program), unlike the URL heuristic, which would
+    // misread 127.0.0.1 as non-mainnet.
+    let mainnet = is_mainnet_cluster(&client).expect("fetch genesis hash");
+    assert!(
+        mainnet,
+        "surfpool forks mainnet, so it classifies as mainnet"
+    );
+    println!("✅ Genesis-hash cluster detection classifies the mainnet fork as mainnet");
 
     // Build an isolated EOA multisig so the feature-state transition is
     // deterministic and independent of the other tests.
