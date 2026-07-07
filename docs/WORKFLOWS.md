@@ -15,9 +15,11 @@ Step-by-step examples for common operations.
 
 ## 0. Configuration Setup
 
-The tool stores configuration at:
+The tool stores configuration in your OS config directory (shown below for Linux;
+on macOS it is `~/Library/Application Support/feature-gate-multisig-tool/config.json`).
+Run `feature-gate-multisig-tool config` to print the exact path.
 ```
-~/.feature-gate-multisig-tool/config.json
+~/.config/feature-gate-multisig-tool/config.json
 ```
 
 ### Create config manually (optional)
@@ -25,10 +27,10 @@ The tool stores configuration at:
 Pre-populate the config to skip interactive prompts:
 
 ```bash
-mkdir -p ~/.feature-gate-multisig-tool
+mkdir -p ~/.config/feature-gate-multisig-tool
 ```
 
-Create `~/.feature-gate-multisig-tool/config.json`:
+Create `~/.config/feature-gate-multisig-tool/config.json`:
 ```json
 {
   "threshold": 3,

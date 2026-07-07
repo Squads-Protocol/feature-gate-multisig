@@ -1,10 +1,10 @@
 use crate::constants::*;
-use crate::provision::{create_rpc_client, get_account_data_with_retry};
+use crate::provision::{create_rpc_client, fetch_squads_multisig, get_account_data_with_retry};
 use crate::squads::{
     deserialize_squads_account, get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction,
     ConfigTransaction, Multisig, Proposal, ProposalStatus, VaultTransaction,
-    CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR, MULTISIG_ACCOUNT_DISCRIMINATOR,
-    PROPOSAL_ACCOUNT_DISCRIMINATOR, VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+    CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR, PROPOSAL_ACCOUNT_DISCRIMINATOR,
+    VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
 };
 use crate::utils::*;
 use colored::*;
@@ -46,11 +46,6 @@ fn show_multisig(config: &Config, address: &str) -> Result<()> {
     );
     println!();
 
-    // Try all configured networks until we find the account
-    let mut account_data = None;
-    let mut successful_rpc_url = None;
-    let mut last_error = None;
-
     let networks_to_try = if !config.networks.is_empty() {
         config.networks.clone()
     } else {
@@ -63,52 +58,20 @@ fn show_multisig(config: &Config, address: &str) -> Result<()> {
     println!("🌐 Trying network: {}", rpc_url.bright_white());
 
     let rpc_client = create_rpc_client(&rpc_url);
-    match get_account_data_with_retry(&rpc_client, &multisig_pubkey) {
-        Ok(data) => {
-            println!("✅ Found account on: {}", rpc_url.bright_green());
-            account_data = Some(data);
-            successful_rpc_url = Some(rpc_url.clone());
-        }
-        Err(e) => {
-            let error_str = e.to_string();
-            if error_str.contains("AccountNotFound") || error_str.contains("could not find account")
-            {
-                println!("❌ Account not found on: {}", rpc_url.bright_red());
-                last_error = Some(format!("Account not found: {}. This address may not exist on any of the configured networks or may not be a multisig account.", multisig_pubkey));
-            } else {
-                println!("❌ Error querying {}: {}", rpc_url.bright_red(), e);
-                last_error = Some(format!("Failed to query networks: {}", e));
-            }
-        }
-    }
+    // fetch_squads_multisig validates owner == Squads program before deserializing,
+    // so a spoofed look-alike account is rejected rather than rendered as a multisig.
+    let multisig = fetch_squads_multisig(&rpc_client, &multisig_pubkey, "multisig")?;
 
-    let (rpc_url, account_data) = match (successful_rpc_url, account_data) {
-        (Some(url), Some(data)) => (url, data),
-        _ => {
-            return Err(eyre::eyre!(
-                "{}",
-                last_error.unwrap_or_else(
-                    || "Failed to find account on any configured network".to_string()
-                )
-            ));
-        }
-    };
-
+    println!(
+        "✅ Found and verified multisig on: {}",
+        rpc_url.bright_green()
+    );
     println!();
-    println!("📡 Using network: {}", rpc_url.bright_white());
     println!(
         "🎯 Multisig address: {}",
         multisig_pubkey.to_string().bright_white()
     );
     println!();
-
-    println!("📊 Account data length: {} bytes", account_data.len());
-
-    let multisig: Multisig =
-        deserialize_squads_account(&account_data, MULTISIG_ACCOUNT_DISCRIMINATOR, "multisig")
-            .map_err(|e| eyre::eyre!("{}. This account may not be a valid Squads multisig.", e))?;
-
-    println!("✅ Multisig deserialized successfully!");
 
     // Display the multisig details
     display_multisig_details(&multisig, &multisig_pubkey)?;

@@ -11,13 +11,13 @@ use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-/// Default config file name for local project config
+/// Per-user config directory (under the OS config dir) and file name.
+const CONFIG_DIR_NAME: &str = "feature-gate-multisig-tool";
 const CONFIG_FILE_NAME: &str = "config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,12 +80,14 @@ pub fn is_mainnet(rpc_url: &str) -> bool {
 
 // Config management functions
 
-/// Returns the path to the local config file (`config.json`) in the current
-/// working directory — the directory where the tool is run from.
+/// Returns the path to the per-user config file:
+/// `<OS config dir>/feature-gate-multisig-tool/config.json` (for example
+/// `~/.config/feature-gate-multisig-tool/config.json` on Linux). Stable
+/// regardless of the current working directory.
 pub fn get_config_path() -> Result<PathBuf> {
-    let current_dir =
-        env::current_dir().map_err(|e| eyre::eyre!("Could not get current directory: {}", e))?;
-    Ok(current_dir.join(CONFIG_FILE_NAME))
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| eyre::eyre!("Could not determine the user config directory"))?;
+    Ok(config_dir.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
 }
 
 pub fn load_config() -> Result<Config> {
@@ -107,6 +109,11 @@ pub fn load_config() -> Result<Config> {
 
 pub fn save_config(config: &Config) -> Result<()> {
     let config_path = get_config_path()?;
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| eyre::eyre!("Failed to create config directory: {}", e))?;
+    }
 
     let config_str = serde_json::to_string_pretty(config)
         .map_err(|e| eyre::eyre!("Failed to serialize config: {}", e))?;

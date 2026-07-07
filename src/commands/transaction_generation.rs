@@ -186,6 +186,18 @@ fn verify_member_permission(
     Ok(())
 }
 
+/// In EOA (single-signer) mode the voting key is itself a required signer, but only the
+/// fee payer keypair is supplied to sign. Fail fast with a clear message when they differ
+/// instead of letting the transaction fail on-chain for a missing signature.
+fn require_eoa_voting_key_matches_fee_payer(voting_key: &Pubkey, fee_payer: &Pubkey) -> Result<()> {
+    if voting_key != fee_payer {
+        return Err(eyre::eyre!(
+            "In EOA mode, voting_key must match fee_payer. Got voting_key={voting_key}, fee_payer={fee_payer}"
+        ));
+    }
+    Ok(())
+}
+
 /// Interactive confirmation - auto-confirms in E2E test mode
 fn confirm_action(prompt: &str, default: bool) -> bool {
     if crate::utils::is_e2e_test_mode() {
@@ -602,6 +614,12 @@ pub fn reject_common_feature_gate_proposal(
         );
     }
 
+    // EOA voting path: voting_key must be a member with Vote permission (preflight,
+    // mirroring approve), and must equal the fee payer since only the fee payer signs.
+    let child_ms = fetch_squads_multisig(&rpc_client, &feature_gate_multisig_address, "multisig")?;
+    verify_member_permission(&child_ms, &voting_key, PERMISSION_VOTE, "Rejecter")?;
+    require_eoa_voting_key_matches_fee_payer(&voting_key, &fee_payer_signer.pubkey())?;
+
     let blockhash = rpc_client.get_latest_blockhash()?;
     let transaction_message = create_vote_proposal_message(
         &feature_gate_multisig_address,
@@ -727,6 +745,7 @@ pub fn execute_common_feature_gate_proposal(
     let child_ms = fetch_squads_multisig(&rpc_client, &feature_gate_multisig_address, "multisig")?;
 
     verify_member_permission(&child_ms, &voting_key, PERMISSION_EXECUTE, "Executor")?;
+    require_eoa_voting_key_matches_fee_payer(&voting_key, &fee_payer_signer.pubkey())?;
 
     // Fresh blockhash and build execute message for the proposal
     let blockhash = rpc_client.get_latest_blockhash()?;
@@ -847,14 +866,7 @@ pub fn create_feature_gate_proposal(
         "Creator",
     )?;
 
-    // Verify voting_key is the same as fee_payer in EOA mode
-    if voting_key != fee_payer_signer.pubkey() {
-        return Err(eyre::eyre!(
-            "In EOA mode, voting_key must match fee_payer. Got voting_key={}, fee_payer={}",
-            voting_key,
-            fee_payer_signer.pubkey()
-        ));
-    }
+    require_eoa_voting_key_matches_fee_payer(&voting_key, &fee_payer_signer.pubkey())?;
 
     let vault_message =
         crate::provision::create_feature_gate_transaction_message(feature_id, kind)?;
@@ -1011,14 +1023,7 @@ pub fn rekey_multisig_feature_gate(
     // Get fresh blockhash right before sending
     let blockhash = rpc_client.get_latest_blockhash()?;
 
-    // Verify voting_key is the same as fee_payer in EOA mode
-    if voting_key != fee_payer_signer.pubkey() {
-        return Err(eyre::eyre!(
-            "In EOA mode, voting_key must match fee_payer. Got voting_key={}, fee_payer={}",
-            voting_key,
-            fee_payer_signer.pubkey()
-        ));
-    }
+    require_eoa_voting_key_matches_fee_payer(&voting_key, &fee_payer_signer.pubkey())?;
 
     // Build a v0 message for config rekey creation (tx + proposal)
     let v0_message = solana_message::v0::Message::try_compile(
@@ -1122,6 +1127,7 @@ fn approve_common_proposal(
     let child_ms = fetch_squads_multisig(&rpc_client, &multisig_address, "multisig")?;
 
     verify_member_permission(&child_ms, &voting_key, PERMISSION_VOTE, "Approver")?;
+    require_eoa_voting_key_matches_fee_payer(&voting_key, &fee_payer_signer.pubkey())?;
 
     let approve_msg = create_vote_proposal_message(
         &multisig_address,
@@ -1207,6 +1213,7 @@ pub fn execute_common_config_change(
     let multisig = fetch_squads_multisig(&rpc_client, &multisig_address, "multisig")?;
 
     verify_member_permission(&multisig, &voting_key, PERMISSION_EXECUTE, "Executor")?;
+    require_eoa_voting_key_matches_fee_payer(&voting_key, &fee_payer_signer.pubkey())?;
 
     output::Output::header("Config Execute - Signer Details");
     output::Output::field("Fee payer", &fee_payer_signer.pubkey().to_string());

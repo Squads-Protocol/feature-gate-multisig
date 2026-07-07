@@ -87,7 +87,13 @@ pub fn build_squads_transaction_message(
     let num_writable_signers = num_signers
         .checked_sub(compiled.header.num_readonly_signed_accounts)
         .ok_or_else(|| eyre!("compiled message has more readonly signers than signers"))?;
-    let num_writable_non_signers = (compiled.account_keys.len() as u8)
+    let total_accounts = u8::try_from(compiled.account_keys.len()).map_err(|_| {
+        eyre!(
+            "compiled message has {} accounts, exceeding the 255 a Squads message can encode",
+            compiled.account_keys.len()
+        )
+    })?;
+    let num_writable_non_signers = total_accounts
         .checked_sub(num_signers)
         .and_then(|non_signers| {
             non_signers.checked_sub(compiled.header.num_readonly_unsigned_accounts)
