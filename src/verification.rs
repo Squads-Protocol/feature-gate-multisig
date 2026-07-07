@@ -30,6 +30,20 @@ pub const SQUADS_V4_PROGRAM_HASH: &str =
 /// precedes the ELF: 4-byte enum tag + 8-byte slot + 1-byte option + 32-byte authority.
 const PROGRAMDATA_HEADER_LEN: usize = 45;
 
+/// Genesis hash of Solana mainnet-beta.
+pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
+/// Detect whether `rpc` points at Solana mainnet by comparing the cluster's
+/// genesis hash against the known mainnet genesis hash. Unlike URL matching,
+/// this identifies the cluster from the chain itself, so custom RPC endpoints
+/// are classified correctly.
+pub fn is_mainnet_cluster(rpc: &RpcClient) -> Result<bool> {
+    let genesis = rpc
+        .get_genesis_hash()
+        .map_err(|e| eyre!("failed to fetch genesis hash: {e}"))?;
+    Ok(genesis.to_string() == MAINNET_GENESIS_HASH)
+}
+
 /// On-chain state of a feature gate account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureGateStatus {

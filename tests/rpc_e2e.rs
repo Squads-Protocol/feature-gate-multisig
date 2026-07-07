@@ -38,7 +38,8 @@ use feature_gate_multisig_tool::squads::{
 };
 use feature_gate_multisig_tool::utils::Config;
 use feature_gate_multisig_tool::verification::{
-    is_autonomous, verify_feature_gate, verify_squads_program, FeatureGateStatus,
+    is_autonomous, is_mainnet_cluster, verify_feature_gate, verify_squads_program,
+    FeatureGateStatus,
 };
 
 fn rpc_url() -> String {
@@ -1217,6 +1218,12 @@ fn rpc_e2e_9_verify_checks() {
         program.on_chain_hash
     );
     println!("✅ Squads program authenticity verified against cloned mainnet bytecode");
+
+    // Cluster detection: surfpool is a localnet, so its genesis hash must not
+    // classify as mainnet even though it clones mainnet programs.
+    let mainnet = is_mainnet_cluster(&client).expect("fetch genesis hash");
+    assert!(!mainnet, "surfpool localnet must not classify as mainnet");
+    println!("✅ Genesis-hash cluster detection classifies surfpool as non-mainnet");
 
     // Build an isolated EOA multisig so the feature-state transition is
     // deterministic and independent of the other tests.

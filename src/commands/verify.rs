@@ -5,8 +5,9 @@ use crate::provision::{create_rpc_client, fetch_squads_multisig};
 use crate::squads::{Multisig, PERMISSION_VOTE};
 use crate::utils::{get_network_display, is_mainnet, validate_pubkey_with_retry, Config};
 use crate::verification::{
-    config_fingerprint, is_autonomous, multisig_safety_warnings, program_warnings,
-    verify_feature_gate, verify_squads_program, FeatureVerification, ProgramAuthenticity,
+    config_fingerprint, is_autonomous, is_mainnet_cluster, multisig_safety_warnings,
+    program_warnings, verify_feature_gate, verify_squads_program, FeatureVerification,
+    ProgramAuthenticity,
 };
 use eyre::Result;
 use solana_pubkey::Pubkey;
@@ -40,9 +41,21 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
             get_network_display(network),
             network
         ));
-        if let Some(ms) =
-            verify_on_network(&create_rpc_client(network), &multisig, is_mainnet(network))
-        {
+        let rpc = create_rpc_client(network);
+        // Identify the cluster from its genesis hash rather than trusting the URL;
+        // fall back to the URL heuristic only if the RPC call fails.
+        let mainnet = match is_mainnet_cluster(&rpc) {
+            Ok(mainnet) => mainnet,
+            Err(e) => {
+                let fallback = is_mainnet(network);
+                Output::warning(&format!(
+                    "Could not detect cluster from genesis hash ({e}); \
+                     falling back to URL heuristic (mainnet: {fallback})."
+                ));
+                fallback
+            }
+        };
+        if let Some(ms) = verify_on_network(&rpc, &multisig, mainnet) {
             seen.push((get_network_display(network), ms));
         }
     }

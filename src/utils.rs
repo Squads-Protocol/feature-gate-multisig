@@ -71,9 +71,9 @@ pub fn get_network_display(rpc_url: &str) -> &'static str {
     }
 }
 
-/// True when the RPC endpoint is Solana mainnet. The verified Squads v4 bytecode
-/// hash and the frozen-authority guarantee only hold on mainnet; devnet/testnet
-/// deployments are upgradeable and built from different bytecode.
+/// URL-based mainnet heuristic. Only a fallback: cluster detection normally uses
+/// the genesis hash ([`crate::verification::is_mainnet_cluster`]), which identifies
+/// the chain itself; this substring check is used when that RPC call fails.
 pub fn is_mainnet(rpc_url: &str) -> bool {
     rpc_url.contains("mainnet")
 }
