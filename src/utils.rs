@@ -20,6 +20,10 @@ use std::time::Duration;
 const CONFIG_DIR_NAME: &str = "feature-gate-multisig-tool";
 const CONFIG_FILE_NAME: &str = "config.json";
 
+/// Env var overriding the config directory. Set by the E2E tests (pointing at a
+/// temp dir) so test runs never read or overwrite the real per-user config.
+pub const CONFIG_DIR_ENV: &str = "FEATURE_GATE_MULTISIG_CONFIG_DIR";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub threshold: u16,
@@ -83,8 +87,12 @@ pub fn is_mainnet(rpc_url: &str) -> bool {
 /// Returns the path to the per-user config file:
 /// `<OS config dir>/feature-gate-multisig-tool/config.json` (for example
 /// `~/.config/feature-gate-multisig-tool/config.json` on Linux). Stable
-/// regardless of the current working directory.
+/// regardless of the current working directory. [`CONFIG_DIR_ENV`] overrides
+/// the directory entirely (used by tests).
 pub fn get_config_path() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os(CONFIG_DIR_ENV).filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir).join(CONFIG_FILE_NAME));
+    }
     let config_dir = dirs::config_dir()
         .ok_or_else(|| eyre::eyre!("Could not determine the user config directory"))?;
     Ok(config_dir.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))

@@ -40,8 +40,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # Plain `cargo test` must be self-contained: the surfpool E2E tests are
+      # #[ignore]d and only run via `make test-surfpool` (the e2e job).
       - name: Unit tests
-        run: cargo test --lib
+        run: cargo test
 
   deny:
     name: cargo-deny
