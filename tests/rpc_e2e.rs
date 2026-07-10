@@ -28,6 +28,7 @@ use feature_gate_multisig_tool::commands::transaction_generation::{
     execute_common_feature_gate_proposal, reject_common_feature_gate_proposal,
     rekey_multisig_feature_gate, TransactionKind,
 };
+use feature_gate_multisig_tool::commands::verify::verify_command;
 use feature_gate_multisig_tool::feature_gate_program::{
     FEATURE_ACCOUNT_SIZE, FEATURE_GATE_PROGRAM_ID,
 };
@@ -1335,4 +1336,11 @@ fn rpc_e2e_9_verify_checks() {
         "activated feature account should be rent-exempt"
     );
     println!("✅ Feature gate classified Pending after activation; verify checks complete");
+
+    // Smoke test the full verify command end to end: the network loop, all three
+    // display sections, and (skipped, single network) cross-network consistency.
+    // The assertions above cover the logic; this catches wiring/display panics.
+    verify_command(&config, Some(child_multisig.to_string()))
+        .expect("verify command should run cleanly against the activated multisig");
+    println!("✅ verify command ran end to end");
 }
