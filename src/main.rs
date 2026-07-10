@@ -20,11 +20,12 @@ mod utils;
 mod verification;
 
 use crate::commands::{
-    config_command, create_command, interactive_mode, show_command, verify_command,
+    config_command, create_command, interactive_mode, proposal_command, show_command,
+    verify_command, ProposalCommand, ProposalCommandArgs, TransactionKind,
 };
 use crate::output::Output;
 use crate::utils::load_config;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::*;
 use eyre::Result;
 
@@ -96,6 +97,44 @@ The contributor key receives Initiate-only permissions, while additional members
         #[arg(help = "The feature gate multisig address to verify")]
         address: Option<String>,
     },
+    #[command(about = "Create a proposal on a feature gate multisig")]
+    #[command(
+        long_about = "Creates a new proposal on the feature gate multisig: activate or revoke the feature (vault transaction), or rekey the multisig (config transaction). Runs the feature-state pre-flight check and confirms before sending."
+    )]
+    Propose {
+        #[command(flatten)]
+        args: ProposalActionArgs,
+    },
+    #[command(about = "Approve a proposal on a feature gate multisig")]
+    Approve {
+        #[command(flatten)]
+        args: ProposalActionArgs,
+        #[arg(
+            long,
+            help = "Proposal index to approve (see `show` for live proposals)"
+        )]
+        index: u64,
+    },
+    #[command(about = "Reject a proposal on a feature gate multisig")]
+    Reject {
+        #[command(flatten)]
+        args: ProposalActionArgs,
+        #[arg(
+            long,
+            help = "Proposal index to reject (see `show` for live proposals)"
+        )]
+        index: u64,
+    },
+    #[command(about = "Execute an approved proposal on a feature gate multisig")]
+    Execute {
+        #[command(flatten)]
+        args: ProposalActionArgs,
+        #[arg(
+            long,
+            help = "Proposal index to execute (see `show` for live proposals)"
+        )]
+        index: u64,
+    },
     #[command(about = "Start interactive mode (default when no command is specified)")]
     #[command(
         long_about = "Launches the interactive mode which provides a guided experience for creating multisig wallets. This is the default mode when no command is specified."
@@ -110,6 +149,51 @@ The contributor key receives Initiate-only permissions, while additional members
 • Configuration file location"
     )]
     Config,
+}
+
+/// Arguments shared by the proposal subcommands (propose/approve/reject/execute).
+#[derive(Args)]
+struct ProposalActionArgs {
+    #[arg(long, help = "The feature gate multisig address")]
+    multisig: String,
+    #[arg(long, value_enum, help = "What the proposal does")]
+    kind: KindArg,
+    #[arg(
+        long,
+        help = "Voting key: your EOA or parent multisig (defaults to the saved config value)"
+    )]
+    voting_key: Option<String>,
+    #[arg(
+        short = 'k',
+        long,
+        help = "Fee payer keypair path (defaults to the saved config value)"
+    )]
+    keypair: Option<String>,
+    #[arg(
+        long,
+        help = "Non-interactive: resolve each confirmation to its default answer"
+    )]
+    yes: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KindArg {
+    /// Activate the feature gate
+    Activate,
+    /// Revoke a pending feature gate activation
+    Revoke,
+    /// Rekey the multisig (permanently disables voting)
+    Rekey,
+}
+
+impl From<KindArg> for TransactionKind {
+    fn from(kind: KindArg) -> Self {
+        match kind {
+            KindArg::Activate => TransactionKind::Activate,
+            KindArg::Revoke => TransactionKind::Revoke,
+            KindArg::Rekey => TransactionKind::Rekey,
+        }
+    }
 }
 
 fn main() {
@@ -164,7 +248,39 @@ fn handle_command(command: Commands) -> Result<()> {
         }
         Commands::Show { address } => show_command(&config, address),
         Commands::Verify { address } => verify_command(&config, address),
+        Commands::Propose { args } => run_proposal(&config, ProposalCommand::Propose, args, None),
+        Commands::Approve { args, index } => {
+            run_proposal(&config, ProposalCommand::Approve, args, Some(index))
+        }
+        Commands::Reject { args, index } => {
+            run_proposal(&config, ProposalCommand::Reject, args, Some(index))
+        }
+        Commands::Execute { args, index } => {
+            run_proposal(&config, ProposalCommand::Execute, args, Some(index))
+        }
         Commands::Interactive => interactive_mode(),
         Commands::Config => config_command(&config),
     }
+}
+
+fn run_proposal(
+    config: &crate::utils::Config,
+    command: ProposalCommand,
+    args: ProposalActionArgs,
+    index: Option<u64>,
+) -> Result<()> {
+    if args.yes {
+        std::env::set_var(crate::utils::ASSUME_YES_ENV, "1");
+    }
+    proposal_command(
+        config,
+        command,
+        ProposalCommandArgs {
+            multisig: args.multisig,
+            kind: args.kind.into(),
+            voting_key: args.voting_key,
+            keypair: args.keypair,
+            index,
+        },
+    )
 }

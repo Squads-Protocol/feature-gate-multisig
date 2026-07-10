@@ -33,6 +33,10 @@ pub struct Config {
     pub networks: Vec<String>,
     #[serde(default)]
     pub fee_payer_path: Option<String>,
+    /// Default voting key (EOA or parent multisig) for proposal actions. A signer's
+    /// identity is stable across the many feature gate multisigs they act on.
+    #[serde(default)]
+    pub voting_key: Option<String>,
 }
 
 impl Default for Config {
@@ -42,6 +46,7 @@ impl Default for Config {
             members: Vec::new(),
             networks: vec![DEFAULT_DEVNET_URL.to_string()],
             fee_payer_path: None,
+            voting_key: None,
         }
     }
 }
@@ -60,6 +65,16 @@ pub struct DeploymentResult {
 /// and picks defaults non-interactively.
 pub fn is_e2e_test_mode() -> bool {
     std::env::var("E2E_TEST_MODE").is_ok()
+}
+
+/// Env var set by the `--yes` CLI flag. Confirmations resolve to their default
+/// answer instead of prompting, so routine "send now?" prompts proceed while
+/// safety prompts that default to "no" (e.g. pre-flight warnings) still abort.
+pub const ASSUME_YES_ENV: &str = "FEATURE_GATE_MULTISIG_ASSUME_YES";
+
+/// True when `--yes` was passed: take each confirmation's default answer.
+pub fn is_assume_yes() -> bool {
+    std::env::var(ASSUME_YES_ENV).is_ok()
 }
 
 /// Load a signer from a CLI-style path: a keypair file or `usb://ledger`.
@@ -579,6 +594,11 @@ pub fn choose_network_from_config(config: &Config) -> Result<String> {
 
     if available_networks.is_empty() {
         return Err(eyre::eyre!("No networks available"));
+    }
+
+    // Nothing to choose: a single configured network is used as-is.
+    if available_networks.len() == 1 {
+        return Ok(available_networks[0].to_string());
     }
 
     // Non-interactive mode for E2E tests
