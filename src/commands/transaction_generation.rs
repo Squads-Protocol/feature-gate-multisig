@@ -229,6 +229,251 @@ fn confirm_feature_preflight(
     Ok(confirm_action("Proceed despite the above?", false))
 }
 
+/// Permission mask, display name, and action description required on the child
+/// multisig for a parent-flow operation.
+fn operation_requirements(
+    operation: ProposalAction,
+    kind: TransactionKind,
+    proposal_index: u64,
+) -> (u8, &'static str, String) {
+    match operation {
+        ProposalAction::Approve => (
+            PERMISSION_VOTE,
+            "Vote",
+            format!("Approve {} at index {}", kind.label(), proposal_index),
+        ),
+        ProposalAction::Reject => (
+            PERMISSION_VOTE,
+            "Vote",
+            format!("Reject {} at index {}", kind.label(), proposal_index),
+        ),
+        ProposalAction::Execute => (
+            PERMISSION_EXECUTE,
+            "Execute",
+            format!("Execute {} at index {}", kind.label(), proposal_index),
+        ),
+        ProposalAction::Create => (
+            PERMISSION_INITIATE | PERMISSION_VOTE,
+            "Initiate+Vote",
+            format!(
+                "Create {} proposal at index {}",
+                kind.label(),
+                proposal_index
+            ),
+        ),
+    }
+}
+
+/// The fee payer creates the parent transaction and proposal, so it must be a
+/// parent member with Initiate permission.
+fn ensure_fee_payer_can_initiate(
+    parent_ms: &SquadsMultisig,
+    fee_payer: &Pubkey,
+    parent_multisig: &Pubkey,
+) -> Result<()> {
+    let (is_member, has_initiate) =
+        check_member_permission(parent_ms, fee_payer, PERMISSION_INITIATE);
+    if !is_member {
+        output::Output::error(
+            "Fee payer must be a member of the parent multisig to create/approve/execute proposals.",
+        );
+        output::Output::hint(&format!(
+            "Current fee payer: {}\nParent multisig: {}\nAdd the fee payer as a member (with Initiate permission) or choose a fee payer that is already a member with Initiate.",
+            fee_payer, parent_multisig,
+        ));
+        return Err(eyre::eyre!(
+            "Fee payer is not a member of the parent multisig"
+        ));
+    }
+    if !has_initiate {
+        output::Output::error("Fee payer lacks Initiate permission on the parent multisig.");
+        return Err(eyre::eyre!(
+            "Fee payer missing Initiate permission on parent multisig"
+        ));
+    }
+    Ok(())
+}
+
+/// The parent multisig acts on the child by signing via CPI as its vault PDA, so
+/// the child must list that PDA (not the parent multisig address) as a member
+/// with the operation's required permission.
+fn ensure_parent_vault_member_on_child(
+    child_ms: &SquadsMultisig,
+    parent_vault_member: &Pubkey,
+    parent_multisig: &Pubkey,
+    required_permission_mask: u8,
+    permission_name: &str,
+) -> Result<()> {
+    let (_, parent_vault_has_permission) =
+        check_member_permission(child_ms, parent_vault_member, required_permission_mask);
+    if parent_vault_has_permission {
+        return Ok(());
+    }
+
+    let parent_multisig_is_member = child_ms.members.iter().any(|m| m.key == *parent_multisig);
+    if parent_multisig_is_member {
+        output::Output::error("Child multisig has the parent multisig address as a member, but not the parent vault PDA. The parent program cannot sign as the multisig address during CPI.");
+        output::Output::hint(&format!(
+            "Please add the parent vault PDA as a member with {} permission on the child: {}",
+            permission_name, parent_vault_member
+        ));
+    } else {
+        output::Output::error(&format!(
+            "Child multisig is missing the parent vault PDA as a member with {} permission.",
+            permission_name
+        ));
+        output::Output::hint(&format!(
+            "Add this key as a member with {}: {}",
+            permission_name, parent_vault_member
+        ));
+    }
+    Err(eyre::eyre!(
+        "Child multisig missing required member for programmatic {}",
+        permission_name.to_lowercase()
+    ))
+}
+
+/// Build the child-multisig instruction message that the parent proposal wraps,
+/// dispatching on the operation, the child transaction flavor, and the payload.
+fn build_child_transaction_message(
+    operation: ProposalAction,
+    child_flavor: ChildTransactionFlavor,
+    payload: ParentFlowPayload,
+    child_multisig: Pubkey,
+    proposal_index: u64,
+    parent_vault_member: Pubkey,
+    fee_payer: Pubkey,
+) -> Result<TransactionMessage> {
+    match (operation, child_flavor, payload) {
+        (ProposalAction::Approve, _, ParentFlowPayload::None) => {
+            create_child_vote_approve_transaction_message(
+                child_multisig,
+                proposal_index,
+                parent_vault_member,
+            )
+        }
+        (ProposalAction::Reject, _, ParentFlowPayload::None) => {
+            create_child_vote_reject_transaction_message(
+                child_multisig,
+                proposal_index,
+                parent_vault_member,
+            )
+        }
+        (
+            ProposalAction::Execute,
+            ChildTransactionFlavor::Vault,
+            ParentFlowPayload::Execute(exec),
+        ) => create_child_execute_transaction_message(
+            child_multisig,
+            proposal_index,
+            parent_vault_member,
+            exec,
+        ),
+        (ProposalAction::Execute, ChildTransactionFlavor::Config, ParentFlowPayload::None) => {
+            create_child_execute_config_transaction_message(
+                child_multisig,
+                proposal_index,
+                parent_vault_member,
+            )
+        }
+        (ProposalAction::Create, ChildTransactionFlavor::Vault, ParentFlowPayload::Create(msg)) => {
+            crate::provision::create_child_create_vault_transaction_and_proposal_message(
+                child_multisig,
+                proposal_index,
+                parent_vault_member,
+                fee_payer,
+                msg,
+            )
+        }
+        (ProposalAction::Create, _, ParentFlowPayload::Create(msg)) => Ok(msg),
+        (ProposalAction::Execute, ChildTransactionFlavor::Vault, _) => Err(eyre::eyre!(
+            "Execution accounts required for Execute operation"
+        )),
+        (ProposalAction::Create, _, _) => Err(eyre::eyre!(
+            "Creation message required for Create operation"
+        )),
+        _ => Err(eyre::eyre!(
+            "Invalid parent flow payload for requested operation"
+        )),
+    }
+}
+
+/// Approve the just-created parent proposal and, when approvals already meet the
+/// threshold and the fee payer may execute, offer to execute it immediately.
+fn approve_and_maybe_execute_parent(
+    rpc_client: &solana_rpc_client::rpc_client::RpcClient,
+    parent_multisig: &Pubkey,
+    parent_ms: &SquadsMultisig,
+    parent_proposal_index: u64,
+    fee_payer_signer: &dyn Signer,
+    operation: ProposalAction,
+) -> Result<()> {
+    // Fetch a fresh blockhash: confirming the create transaction above can take
+    // long enough for the previous one to expire.
+    let approve_blockhash = rpc_client.get_latest_blockhash()?;
+    let approve_msg = create_vote_proposal_message(
+        parent_multisig,
+        &fee_payer_signer.pubkey(),
+        &fee_payer_signer.pubkey(),
+        parent_proposal_index,
+        approve_blockhash,
+        PROPOSAL_APPROVE_DISCRIMINATOR,
+    )?;
+    let approve_tx =
+        VersionedTransaction::try_new(VersionedMessage::V0(approve_msg), &[fee_payer_signer])?;
+    let approve_sig = crate::provision::send_and_confirm_transaction(&approve_tx, rpc_client)
+        .map_err(|e| eyre::eyre!("Failed to approve parent proposal: {}", e))?;
+    output::Output::field("Parent proposal approved (sig):", &approve_sig);
+
+    // If approvals meet threshold, offer to execute the parent proposal now
+    let (approved, threshold, _status) =
+        get_proposal_status_and_threshold(parent_multisig, parent_proposal_index, rpc_client)?;
+    let (is_fee_payer_member, has_execute_permission) =
+        check_member_permission(parent_ms, &fee_payer_signer.pubkey(), PERMISSION_EXECUTE);
+
+    if approved as u16 >= threshold
+        && is_fee_payer_member
+        && has_execute_permission
+        && confirm_action("Execute this parent proposal now?", true)
+    {
+        let fresh_blockhash = rpc_client.get_latest_blockhash()?;
+        // Parent multisig always stores vault transactions, even when creating config on child
+        let exec_msg = create_execute_transaction_message(
+            parent_multisig,
+            &fee_payer_signer.pubkey(),
+            &fee_payer_signer.pubkey(),
+            parent_proposal_index,
+            rpc_client,
+            fresh_blockhash,
+        )?;
+        let exec_tx =
+            VersionedTransaction::try_new(VersionedMessage::V0(exec_msg), &[fee_payer_signer])?;
+        let exec_sig = crate::provision::send_and_confirm_transaction(&exec_tx, rpc_client)
+            .map_err(|e| eyre::eyre!("Failed to execute parent proposal: {}", e))?;
+        output::Output::field("Parent proposal executed (sig):", &exec_sig);
+
+        let success_message = match operation {
+            ProposalAction::Approve => "Child proposal has been approved via parent multisig!",
+            ProposalAction::Reject => "Child proposal has been rejected via parent multisig!",
+            ProposalAction::Execute => "Child transaction has been executed via parent multisig!",
+            ProposalAction::Create => "Child proposal has been created via parent multisig!",
+        };
+        output::Output::success(success_message);
+    } else if !is_fee_payer_member {
+        output::Output::hint(
+            "Fee payer is not a member of the parent multisig; cannot auto-execute.",
+        );
+    } else if !has_execute_permission {
+        output::Output::hint("Executor does not have Execute permission on the parent multisig.");
+    } else {
+        output::Output::hint(&format!(
+            "Parent approvals {}/{} — waiting for more confirmations before execution.",
+            approved, threshold
+        ));
+    }
+    Ok(())
+}
+
 /// Common flow for creating and optionally executing a parent multisig proposal
 /// that operates on a child multisig.
 ///
@@ -257,94 +502,24 @@ fn handle_parent_multisig_flow(
     let parent_ms = fetch_squads_multisig(&rpc_client, &parent_multisig, "parent multisig")?;
     let parent_next_index = parent_ms.transaction_index + 1;
 
-    // The fee payer must be a member of the parent multisig with Initiate permission
-    let (is_member, has_initiate) =
-        check_member_permission(&parent_ms, &fee_payer_signer.pubkey(), PERMISSION_INITIATE);
-    if !is_member {
-        output::Output::error(
-            "Fee payer must be a member of the parent multisig to create/approve/execute proposals.",
-        );
-        output::Output::hint(&format!(
-            "Current fee payer: {}\nParent multisig: {}\nAdd the fee payer as a member (with Initiate permission) or choose a fee payer that is already a member with Initiate.",
-            fee_payer_signer.pubkey(), parent_multisig,
-        ));
-        return Err(eyre::eyre!(
-            "Fee payer is not a member of the parent multisig"
-        ));
-    }
-    if !has_initiate {
-        output::Output::error("Fee payer lacks Initiate permission on the parent multisig.");
-        return Err(eyre::eyre!(
-            "Fee payer missing Initiate permission on parent multisig"
-        ));
-    }
+    ensure_fee_payer_can_initiate(&parent_ms, &fee_payer_signer.pubkey(), &parent_multisig)?;
 
-    // Prefer using the parent vault PDA as the child member
+    // The parent acts on the child as its vault PDA, which must be a child member.
     let parent_vault_member = get_vault_pda(&parent_multisig, 0).0;
-
-    // Validate the child multisig includes the parent vault PDA with required permission
     let child_ms = fetch_squads_multisig(
         &rpc_client,
         &feature_gate_multisig_address,
         "child multisig",
     )?;
-
-    // Check required permission based on operation type
-    let (required_permission_mask, permission_name, action_description) = match &operation {
-        ProposalAction::Approve => (
-            PERMISSION_VOTE,
-            "Vote",
-            format!("Approve {} at index {}", kind.label(), proposal_index),
-        ),
-        ProposalAction::Reject => (
-            PERMISSION_VOTE,
-            "Vote",
-            format!("Reject {} at index {}", kind.label(), proposal_index),
-        ),
-        ProposalAction::Execute => (
-            PERMISSION_EXECUTE,
-            "Execute",
-            format!("Execute {} at index {}", kind.label(), proposal_index),
-        ),
-        ProposalAction::Create => (
-            PERMISSION_INITIATE | PERMISSION_VOTE,
-            "Initiate+Vote",
-            format!(
-                "Create {} proposal at index {}",
-                kind.label(),
-                proposal_index
-            ),
-        ),
-    };
-
-    let action_description = action_description.as_str();
-
-    let (_, parent_vault_has_permission) =
-        check_member_permission(&child_ms, &parent_vault_member, required_permission_mask);
-
-    if !parent_vault_has_permission {
-        let parent_multisig_is_member = child_ms.members.iter().any(|m| m.key == parent_multisig);
-        if parent_multisig_is_member {
-            output::Output::error("Child multisig has the parent multisig address as a member, but not the parent vault PDA. The parent program cannot sign as the multisig address during CPI.");
-            output::Output::hint(&format!(
-                "Please add the parent vault PDA as a member with {} permission on the child: {}",
-                permission_name, parent_vault_member
-            ));
-        } else {
-            output::Output::error(&format!(
-                "Child multisig is missing the parent vault PDA as a member with {} permission.",
-                permission_name
-            ));
-            output::Output::hint(&format!(
-                "Add this key as a member with {}: {}",
-                permission_name, parent_vault_member
-            ));
-        }
-        return Err(eyre::eyre!(
-            "Child multisig missing required member for programmatic {}",
-            permission_name.to_lowercase()
-        ));
-    }
+    let (required_permission_mask, permission_name, action_description) =
+        operation_requirements(operation, kind, proposal_index);
+    ensure_parent_vault_member_on_child(
+        &child_ms,
+        &parent_vault_member,
+        &parent_multisig,
+        required_permission_mask,
+        permission_name,
+    )?;
 
     // Display information about the parent multisig transaction
     output::Output::header(&format!(
@@ -359,10 +534,10 @@ fn handle_parent_multisig_flow(
     output::Output::field("Parent Transaction Index:", &parent_next_index.to_string());
     output::Output::field("Child Proposal Index:", &proposal_index.to_string());
     output::Output::field("Transaction Type:", kind.label());
-    output::Output::field("Action:", action_description);
+    output::Output::field("Action:", &action_description);
 
     // Ask for confirmation before creating the parent multisig proposal
-    let confirmation_prompt = match &operation {
+    let confirmation_prompt = match operation {
         ProposalAction::Approve => "Create parent multisig proposal for this transaction?",
         ProposalAction::Reject => "Create parent multisig proposal to reject this transaction?",
         ProposalAction::Execute => "Create parent multisig proposal to execute child transaction?",
@@ -370,71 +545,20 @@ fn handle_parent_multisig_flow(
             "Create parent multisig proposal to create a new child transaction/proposal?"
         }
     };
-
     if !confirm_action(confirmation_prompt, true) {
         output::Output::info("Parent multisig proposal creation cancelled.");
         return Ok(());
     }
 
-    // Create the transaction message based on operation type
-    let tx_message = match (operation, child_flavor, payload) {
-        (ProposalAction::Approve, _, ParentFlowPayload::None) => {
-            create_child_vote_approve_transaction_message(
-                feature_gate_multisig_address,
-                proposal_index,
-                parent_vault_member,
-            )?
-        }
-        (ProposalAction::Reject, _, ParentFlowPayload::None) => {
-            create_child_vote_reject_transaction_message(
-                feature_gate_multisig_address,
-                proposal_index,
-                parent_vault_member,
-            )?
-        }
-        (
-            ProposalAction::Execute,
-            ChildTransactionFlavor::Vault,
-            ParentFlowPayload::Execute(exec),
-        ) => create_child_execute_transaction_message(
-            feature_gate_multisig_address,
-            proposal_index,
-            parent_vault_member,
-            exec,
-        )?,
-        (ProposalAction::Execute, ChildTransactionFlavor::Config, ParentFlowPayload::None) => {
-            create_child_execute_config_transaction_message(
-                feature_gate_multisig_address,
-                proposal_index,
-                parent_vault_member,
-            )?
-        }
-        (ProposalAction::Create, ChildTransactionFlavor::Vault, ParentFlowPayload::Create(msg)) => {
-            crate::provision::create_child_create_vault_transaction_and_proposal_message(
-                feature_gate_multisig_address,
-                proposal_index,
-                parent_vault_member,
-                fee_payer_signer.pubkey(),
-                msg,
-            )?
-        }
-        (ProposalAction::Create, _, ParentFlowPayload::Create(msg)) => msg,
-        (ProposalAction::Execute, ChildTransactionFlavor::Vault, _) => {
-            return Err(eyre::eyre!(
-                "Execution accounts required for Execute operation"
-            ))
-        }
-        (ProposalAction::Create, _, _) => {
-            return Err(eyre::eyre!(
-                "Creation message required for Create operation"
-            ))
-        }
-        _ => {
-            return Err(eyre::eyre!(
-                "Invalid parent flow payload for requested operation"
-            ))
-        }
-    };
+    let tx_message = build_child_transaction_message(
+        operation,
+        child_flavor,
+        payload,
+        feature_gate_multisig_address,
+        proposal_index,
+        parent_vault_member,
+        fee_payer_signer.pubkey(),
+    )?;
 
     if matches!(operation, ProposalAction::Create) {
         output::Output::warning(&format!(
@@ -472,89 +596,14 @@ fn handle_parent_multisig_flow(
 
     // Offer to approve the parent proposal immediately
     if confirm_action("Approve this parent proposal now?", true) {
-        let parent_proposal_index = parent_next_index;
-        // Fetch a fresh blockhash: confirming the create transaction above can take
-        // long enough for the previous one to expire.
-        let approve_blockhash = rpc_client.get_latest_blockhash()?;
-        let approve_msg = create_vote_proposal_message(
-            &parent_multisig,
-            &fee_payer_signer.pubkey(),
-            &fee_payer_signer.pubkey(),
-            parent_proposal_index,
-            approve_blockhash,
-            PROPOSAL_APPROVE_DISCRIMINATOR,
-        )?;
-        let approve_tx =
-            VersionedTransaction::try_new(VersionedMessage::V0(approve_msg), &[fee_payer_signer])?;
-        let approve_sig = crate::provision::send_and_confirm_transaction(&approve_tx, &rpc_client)
-            .map_err(|e| eyre::eyre!("Failed to approve parent proposal: {}", e))?;
-        output::Output::field("Parent proposal approved (sig):", &approve_sig);
-
-        // If approvals meet threshold, offer to execute the parent proposal now
-        let (approved, threshold, _status) = get_proposal_status_and_threshold(
-            &parent_multisig,
-            parent_proposal_index,
+        approve_and_maybe_execute_parent(
             &rpc_client,
+            &parent_multisig,
+            &parent_ms,
+            parent_next_index,
+            fee_payer_signer,
+            operation,
         )?;
-        let (is_fee_payer_member, has_execute_permission) =
-            check_member_permission(&parent_ms, &fee_payer_signer.pubkey(), PERMISSION_EXECUTE);
-
-        if approved as u16 >= threshold
-            && is_fee_payer_member
-            && has_execute_permission
-            && confirm_action("Execute this parent proposal now?", true)
-        {
-            let fresh_blockhash = rpc_client.get_latest_blockhash()?;
-            // Parent multisig always stores vault transactions, even when creating config on child
-            let exec_msg = create_execute_transaction_message(
-                &parent_multisig,
-                &fee_payer_signer.pubkey(),
-                &fee_payer_signer.pubkey(),
-                parent_proposal_index,
-                &rpc_client,
-                fresh_blockhash,
-            )?;
-            let exec_tx =
-                VersionedTransaction::try_new(VersionedMessage::V0(exec_msg), &[fee_payer_signer])?;
-            let exec_sig = crate::provision::send_and_confirm_transaction(&exec_tx, &rpc_client)
-                .map_err(|e| eyre::eyre!("Failed to execute parent proposal: {}", e))?;
-            output::Output::field("Parent proposal executed (sig):", &exec_sig);
-
-            // Display success message based on operation type
-            match operation {
-                ProposalAction::Approve => {
-                    output::Output::success(
-                        "Child proposal has been approved via parent multisig!",
-                    );
-                }
-                ProposalAction::Reject => {
-                    output::Output::success(
-                        "Child proposal has been rejected via parent multisig!",
-                    );
-                }
-                ProposalAction::Execute => {
-                    output::Output::success(
-                        "Child transaction has been executed via parent multisig!",
-                    );
-                }
-                ProposalAction::Create => {
-                    output::Output::success("Child proposal has been created via parent multisig!");
-                }
-            }
-        } else if !is_fee_payer_member {
-            output::Output::hint(
-                "Fee payer is not a member of the parent multisig; cannot auto-execute.",
-            );
-        } else if !has_execute_permission {
-            output::Output::hint(
-                "Executor does not have Execute permission on the parent multisig.",
-            );
-        } else {
-            output::Output::hint(&format!(
-                "Parent approvals {}/{} — waiting for more confirmations before execution.",
-                approved, threshold
-            ));
-        }
     }
     Ok(())
 }
