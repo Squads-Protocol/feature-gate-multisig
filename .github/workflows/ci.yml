@@ -38,12 +38,12 @@ jobs:
       # --all-targets compile-checks the E2E tests too; they need a live surfpool
       # validator to run, so they are not executed here.
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       # Plain `cargo test` must be self-contained: the surfpool E2E tests are
       # #[ignore]d and only run via `make test-surfpool` (the e2e job).
       - name: Unit tests
-        run: cargo test
+        run: cargo test --locked
 
   deny:
     name: cargo-deny
