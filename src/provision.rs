@@ -64,7 +64,7 @@ pub fn fetch_squads_multisig(
 /// Compile `instructions` into a Squads `TransactionMessage` using Solana's official v0
 /// message compiler, then translate the result into the Squads wire format.
 ///
-/// `payer` becomes `account_keys[0]` — the required fee-payer/signer — matching Solana's
+/// `payer` becomes `account_keys[0]` - the required fee-payer/signer - matching Solana's
 /// account-ordering invariant. For Squads inner messages this is the vault PDA that signs
 /// via CPI. `address_lookup_table_accounts` lets callers pull accounts from on-chain lookup
 /// tables; pass `&[]` to keep every account static.
@@ -130,7 +130,7 @@ pub fn build_squads_transaction_message(
     })
 }
 
-/// Returns true for transient node/network errors worth retrying — not deterministic
+/// Returns true for transient node/network errors worth retrying - not deterministic
 /// failures like a preflight/program error.
 fn is_transient_rpc_error(err: &ClientError) -> bool {
     match &*err.kind {

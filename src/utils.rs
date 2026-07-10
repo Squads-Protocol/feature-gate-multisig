@@ -307,6 +307,92 @@ pub fn prompt_for_threshold_with_max(max_members: usize) -> Result<u16> {
     }
 }
 
+/// Prompt for the voting key with the saved config default pre-filled and
+/// editable, so a saved identity is one Enter away but never silently binding.
+/// Offers to persist a newly entered key as the default.
+///
+/// `config` must be the full user config (not a narrowed clone), since saving
+/// writes it back to disk.
+pub fn prompt_for_voting_key(config: &Config) -> Result<Pubkey> {
+    let saved = config.voting_key.as_deref();
+    let key = loop {
+        let mut prompt = Text::new("Enter the voting key (EOA or parent multisig):");
+        if let Some(saved) = saved {
+            prompt = prompt.with_default(saved);
+        }
+        let input = prompt.prompt()?;
+        match Pubkey::from_str(input.trim()) {
+            Ok(key) => break key,
+            Err(_) => println!(
+                "  {} Invalid public key, please try again.",
+                "❌".bright_red()
+            ),
+        }
+    };
+
+    let changed = saved != Some(key.to_string().as_str());
+    if changed
+        && !is_e2e_test_mode()
+        && !is_assume_yes()
+        && Confirm::new("Save as default voting key for future commands?")
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false)
+    {
+        let mut updated = config.clone();
+        updated.voting_key = Some(key.to_string());
+        save_config(&updated)?;
+        println!("  {} Voting key saved to config.", "✓".bright_green());
+    }
+    Ok(key)
+}
+
+/// Resolve a `--network` argument to an RPC URL: an exact configured URL, a
+/// configured network's display name (devnet/testnet/mainnet, case-insensitive),
+/// or any explicit http(s) URL.
+pub fn resolve_network_arg(config: &Config, arg: &str) -> Result<String> {
+    let configured = if config.networks.is_empty() {
+        vec![DEFAULT_DEVNET_URL.to_string()]
+    } else {
+        config.networks.clone()
+    };
+    if let Some(url) = configured.iter().find(|url| url.as_str() == arg) {
+        return Ok(url.clone());
+    }
+    if let Some(url) = configured
+        .iter()
+        .find(|url| get_network_display(url).eq_ignore_ascii_case(arg))
+    {
+        return Ok(url.clone());
+    }
+    if arg.starts_with("http://") || arg.starts_with("https://") {
+        return Ok(arg.to_string());
+    }
+    Err(eyre::eyre!(
+        "Unknown network '{}'. Use a configured network name or URL: {}",
+        arg,
+        configured.join(", ")
+    ))
+}
+
+/// Prompt for a pubkey with an optional editable default pre-filled.
+pub fn prompt_for_pubkey_with_default(prompt: &str, default: Option<&str>) -> Result<Pubkey> {
+    loop {
+        let mut text = Text::new(prompt);
+        if let Some(default) = default {
+            text = text.with_default(default);
+        }
+        let input = text.prompt()?;
+        match Pubkey::from_str(input.trim()) {
+            Ok(key) => return Ok(key),
+            Err(_) => println!(
+                "  {} Invalid public key, please try again.",
+                "❌".bright_red()
+            ),
+        }
+    }
+}
+
 pub fn prompt_for_pubkey(prompt: &str) -> Result<Pubkey> {
     let input = Text::new(prompt).prompt()?;
     match Pubkey::from_str(&input) {
@@ -849,4 +935,42 @@ pub fn check_fee_payer_balance_on_networks(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_network_arg_by_url_name_or_passthrough() {
+        let config = Config {
+            networks: vec![
+                "https://api.devnet.solana.com".to_string(),
+                "https://api.mainnet.solana.com".to_string(),
+            ],
+            ..Config::default()
+        };
+
+        // Exact configured URL.
+        assert_eq!(
+            resolve_network_arg(&config, "https://api.devnet.solana.com").unwrap(),
+            "https://api.devnet.solana.com"
+        );
+        // Display name, case-insensitive, resolves to the configured URL.
+        assert_eq!(
+            resolve_network_arg(&config, "Mainnet").unwrap(),
+            "https://api.mainnet.solana.com"
+        );
+        // Unconfigured but explicit URLs pass through.
+        assert_eq!(
+            resolve_network_arg(&config, "http://127.0.0.1:8899").unwrap(),
+            "http://127.0.0.1:8899"
+        );
+        // Anything else is an error naming the configured options.
+        let err = resolve_network_arg(&config, "testnet")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unknown network"));
+        assert!(err.contains("https://api.devnet.solana.com"));
+    }
 }
