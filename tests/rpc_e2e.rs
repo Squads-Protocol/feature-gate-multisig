@@ -24,6 +24,9 @@ use solana_signer::Signer;
 use once_cell::sync::OnceCell;
 
 use feature_gate_multisig_tool::commands::create::create_command_with_deployments;
+use feature_gate_multisig_tool::commands::proposal::{
+    proposal_command, ProposalCommand, ProposalCommandArgs,
+};
 use feature_gate_multisig_tool::commands::transaction_generation::{
     approve_common_feature_gate_proposal, create_feature_gate_proposal,
     execute_common_feature_gate_proposal, reject_common_feature_gate_proposal,
@@ -173,6 +176,7 @@ fn build_fixture() -> Fixture {
         threshold: 3,
         members,
         fee_payer_path: Some(fee_payer_path.to_string_lossy().to_string()),
+        voting_key: None,
     };
 
     let deployments = create_command_with_deployments(
@@ -220,6 +224,62 @@ fn wait_for_account(client: &RpcClient, address: &Pubkey) {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     panic!("surfpool did not load account {address} within 30s");
+}
+
+/// Create three funded EOA members (keypair files under the temp dir with a
+/// unique `prefix`) and deploy a fresh feature gate multisig with them via the
+/// real CLI create flow, which pre-creates the activation proposal at index 1.
+/// Returns (config, multisig, vault, eoa pubkeys, eoa keypair paths).
+fn setup_eoa_multisig(
+    client: &RpcClient,
+    prefix: &str,
+    threshold: u16,
+) -> (Config, Pubkey, Pubkey, Vec<Pubkey>, Vec<String>) {
+    let temp_dir: PathBuf = std::env::temp_dir();
+    let mut eoa_keypaths = Vec::new();
+    let mut eoa_pubkeys = Vec::new();
+    for i in 0..3 {
+        let eoa = Keypair::new();
+        let sig = client
+            .request_airdrop(&eoa.pubkey(), 10_000_000_000)
+            .expect("request airdrop for eoa");
+        client
+            .confirm_transaction(&sig)
+            .expect("confirm airdrop for eoa");
+
+        let keypair_path = temp_dir.join(format!("{}_{}.json", prefix, i));
+        std::fs::write(
+            &keypair_path,
+            serde_json::to_string(&eoa.to_bytes().to_vec()).unwrap(),
+        )
+        .expect("write eoa keypair");
+
+        eoa_pubkeys.push(eoa.pubkey());
+        eoa_keypaths.push(keypair_path.to_string_lossy().to_string());
+    }
+
+    let mut config = Config {
+        networks: vec![rpc_url()],
+        threshold,
+        members: eoa_pubkeys.iter().map(|p| p.to_string()).collect(),
+        fee_payer_path: Some(eoa_keypaths[0].clone()),
+        voting_key: None,
+    };
+
+    let deployments = create_command_with_deployments(
+        &mut config,
+        Some(threshold),
+        Some(eoa_keypaths[0].clone()),
+    )
+    .expect("create feature gate via CLI");
+    let deployment = deployments.first().expect("deployment should exist");
+    (
+        config,
+        deployment.multisig_address,
+        deployment.vault_address,
+        eoa_pubkeys,
+        eoa_keypaths,
+    )
 }
 
 #[test]
@@ -871,51 +931,8 @@ fn rpc_e2e_7_eoa_activation_flow() {
     init_test_env();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
-    let temp_dir: PathBuf = std::env::temp_dir();
-
-    // Create 3 EOA members for a new child multisig
-    let mut eoa_keypaths = Vec::new();
-    let mut eoa_pubkeys = Vec::new();
-
-    for i in 0..3 {
-        let eoa = Keypair::new();
-        let sig = client
-            .request_airdrop(&eoa.pubkey(), 10_000_000_000)
-            .expect("request airdrop for eoa");
-        client
-            .confirm_transaction(&sig)
-            .expect("confirm airdrop for eoa");
-
-        let keypair_path = temp_dir.join(format!("eoa_test7_{}.json", i));
-        let keypair_bytes: Vec<u8> = eoa.to_bytes().to_vec();
-        std::fs::write(
-            &keypair_path,
-            serde_json::to_string(&keypair_bytes).unwrap(),
-        )
-        .expect("write eoa keypair");
-
-        eoa_pubkeys.push(eoa.pubkey());
-        eoa_keypaths.push(keypair_path.to_string_lossy().to_string());
-    }
-
-    // Use create_command_with_deployments like the real CLI - this creates multisig + initial activation proposal
-    let mut config = Config {
-        networks: vec![rpc_url()],
-        threshold: 2,
-        members: eoa_pubkeys.iter().map(|p| p.to_string()).collect(),
-        fee_payer_path: Some(eoa_keypaths[0].clone()),
-    };
-
-    let deployments = create_command_with_deployments(
-        &mut config,
-        Some(2), // threshold
-        Some(eoa_keypaths[0].clone()),
-    )
-    .expect("create feature gate via CLI");
-
-    let deployment = deployments.first().expect("deployment should exist");
-    let child_multisig = deployment.multisig_address;
-    let child_vault = deployment.vault_address;
+    let (config, child_multisig, child_vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test7", 2);
 
     println!(
         "✅ Created EOA-only child multisig via CLI: {}",
@@ -1020,51 +1037,8 @@ fn rpc_e2e_8_eoa_revocation_flow() {
     init_test_env();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
-    let temp_dir: PathBuf = std::env::temp_dir();
-
-    // Create 3 EOA members
-    let mut eoa_keypaths = Vec::new();
-    let mut eoa_pubkeys = Vec::new();
-
-    for i in 0..3 {
-        let eoa = Keypair::new();
-        let sig = client
-            .request_airdrop(&eoa.pubkey(), 10_000_000_000)
-            .expect("request airdrop for eoa");
-        client
-            .confirm_transaction(&sig)
-            .expect("confirm airdrop for eoa");
-
-        let keypair_path = temp_dir.join(format!("eoa_test8_{}.json", i));
-        let keypair_bytes: Vec<u8> = eoa.to_bytes().to_vec();
-        std::fs::write(
-            &keypair_path,
-            serde_json::to_string(&keypair_bytes).unwrap(),
-        )
-        .expect("write eoa keypair");
-
-        eoa_pubkeys.push(eoa.pubkey());
-        eoa_keypaths.push(keypair_path.to_string_lossy().to_string());
-    }
-
-    // Use create_command_with_deployments like the real CLI - this creates multisig + initial activation proposal
-    let mut config = Config {
-        networks: vec![rpc_url()],
-        threshold: 2,
-        members: eoa_pubkeys.iter().map(|p| p.to_string()).collect(),
-        fee_payer_path: Some(eoa_keypaths[0].clone()),
-    };
-
-    let deployments = create_command_with_deployments(
-        &mut config,
-        Some(2), // threshold
-        Some(eoa_keypaths[0].clone()),
-    )
-    .expect("create feature gate via CLI");
-
-    let deployment = deployments.first().expect("deployment should exist");
-    let child_multisig = deployment.multisig_address;
-    let child_vault = deployment.vault_address;
+    let (config, child_multisig, child_vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test8", 2);
 
     println!(
         "✅ Created EOA-only child multisig via CLI: {}",
@@ -1252,39 +1226,8 @@ fn rpc_e2e_9_verify_checks() {
 
     // Build an isolated EOA multisig so the feature-state transition is
     // deterministic and independent of the other tests.
-    let temp_dir: PathBuf = std::env::temp_dir();
-    let mut eoa_keypaths = Vec::new();
-    let mut eoa_pubkeys = Vec::new();
-    for i in 0..3 {
-        let eoa = Keypair::new();
-        let sig = client
-            .request_airdrop(&eoa.pubkey(), 10_000_000_000)
-            .expect("request airdrop for eoa");
-        client.confirm_transaction(&sig).expect("confirm airdrop");
-
-        let keypair_path = temp_dir.join(format!("eoa_test9_{}.json", i));
-        std::fs::write(
-            &keypair_path,
-            serde_json::to_string(&eoa.to_bytes().to_vec()).unwrap(),
-        )
-        .expect("write eoa keypair");
-
-        eoa_pubkeys.push(eoa.pubkey());
-        eoa_keypaths.push(keypair_path.to_string_lossy().to_string());
-    }
-
-    let mut config = Config {
-        networks: vec![rpc_url()],
-        threshold: 2,
-        members: eoa_pubkeys.iter().map(|p| p.to_string()).collect(),
-        fee_payer_path: Some(eoa_keypaths[0].clone()),
-    };
-
-    let deployments =
-        create_command_with_deployments(&mut config, Some(2), Some(eoa_keypaths[0].clone()))
-            .expect("create feature gate via CLI");
-    let deployment = deployments.first().expect("deployment should exist");
-    let child_multisig = deployment.multisig_address;
+    let (config, child_multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test9", 2);
 
     // Before execution the feature account (vault 0) is unallocated -> Fresh.
     let before = verify_feature_gate(&client, &child_multisig).expect("verify feature (fresh)");
@@ -1361,4 +1304,80 @@ fn rpc_e2e_9_verify_checks() {
     verify_command(&config, Some(child_multisig.to_string()))
         .expect("verify command should run cleanly against the activated multisig");
     println!("✅ verify command ran end to end");
+}
+
+/// Test 10: the non-interactive proposal subcommands drive a full feature gate
+/// lifecycle end to end: approve + execute the pre-created activation, then
+/// propose, approve, and execute a revocation.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_10_proposal_subcommands() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test10", 2);
+
+    let args = |voter: usize, kind: TransactionKind, index: Option<u64>| ProposalCommandArgs {
+        multisig: multisig.to_string(),
+        kind,
+        voting_key: Some(eoa_pubkeys[voter].to_string()),
+        keypair: Some(eoa_keypaths[voter].clone()),
+        index,
+    };
+
+    // The create flow pre-creates the activation proposal at index 1.
+    for voter in 0..2 {
+        proposal_command(
+            &config,
+            ProposalCommand::Approve,
+            args(voter, TransactionKind::Activate, Some(1)),
+        )
+        .expect("approve activation via subcommand");
+    }
+    proposal_command(
+        &config,
+        ProposalCommand::Execute,
+        args(1, TransactionKind::Activate, Some(1)),
+    )
+    .expect("execute activation via subcommand");
+
+    let activated = verify_feature_gate(&client, &multisig).expect("verify feature (pending)");
+    assert_eq!(
+        activated.status,
+        FeatureGateStatus::Pending,
+        "feature should be Pending after subcommand-driven activation"
+    );
+
+    // Revoke: propose (lands at index 2), approve to threshold, execute.
+    proposal_command(
+        &config,
+        ProposalCommand::Propose,
+        args(0, TransactionKind::Revoke, None),
+    )
+    .expect("propose revoke via subcommand");
+    for voter in 0..2 {
+        proposal_command(
+            &config,
+            ProposalCommand::Approve,
+            args(voter, TransactionKind::Revoke, Some(2)),
+        )
+        .expect("approve revoke via subcommand");
+    }
+    proposal_command(
+        &config,
+        ProposalCommand::Execute,
+        args(1, TransactionKind::Revoke, Some(2)),
+    )
+    .expect("execute revoke via subcommand");
+
+    let reverted = verify_feature_gate(&client, &multisig).expect("verify feature (fresh)");
+    assert_eq!(
+        reverted.status,
+        FeatureGateStatus::Fresh,
+        "feature should be Fresh again after the subcommand-driven revoke"
+    );
+    println!("✅ proposal subcommands drove the full lifecycle end to end");
 }
