@@ -62,6 +62,17 @@ pub fn is_e2e_test_mode() -> bool {
     std::env::var("E2E_TEST_MODE").is_ok()
 }
 
+/// Load a signer from a CLI-style path: a keypair file or `usb://ledger`.
+///
+/// `signer_from_path` is deprecated upstream pending Agave's unstable-API split,
+/// but it remains the supported way to load hardware wallets; revisit once a
+/// stable successor exists.
+#[allow(deprecated)]
+pub fn load_signer(path: &str, name: &str) -> Result<Box<dyn Signer>> {
+    solana_clap_v3_utils::keypair::signer_from_path(&Default::default(), path, name, &mut None)
+        .map_err(|e| eyre::eyre!("Failed to load {}: {}", name, e))
+}
+
 /// Returns a human-readable network name based on the RPC URL.
 pub fn get_network_display(rpc_url: &str) -> &'static str {
     if rpc_url.contains("devnet") {

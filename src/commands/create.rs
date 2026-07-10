@@ -8,7 +8,6 @@ use crate::squads::{get_proposal_pda, get_vault_pda, Member, Permissions};
 use crate::utils::*;
 use colored::*;
 use eyre::Result;
-use solana_clap_v3_utils::keypair::signer_from_path;
 use solana_keypair::Keypair;
 use solana_message::VersionedMessage;
 use solana_signer::Signer;
@@ -45,9 +44,7 @@ pub fn create_command_with_deployments(
         .or_else(|| config.fee_payer_path.clone())
         .ok_or_else(|| eyre::eyre!("Fee payer keypair path is required"))?;
 
-    let fee_payer_signer =
-        signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
-            .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
+    let fee_payer_signer = load_signer(&fee_payer_path, "fee payer")?;
 
     // Create setup keypair (always separate from fee payer)
     let setup_keypair = Keypair::new();

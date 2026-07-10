@@ -1,5 +1,4 @@
 use eyre::Result;
-use solana_clap_v3_utils::keypair::signer_from_path;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -23,7 +22,7 @@ use crate::{
     },
     utils::{
         choose_network_from_config, create_child_vote_approve_transaction_message,
-        create_child_vote_reject_transaction_message, Config,
+        create_child_vote_reject_transaction_message, load_signer, Config,
     },
 };
 use inquire::Confirm;
@@ -634,9 +633,7 @@ pub fn reject_common_feature_gate_proposal(
     proposal_index: u64,
     kind: TransactionKind,
 ) -> Result<()> {
-    let fee_payer_signer =
-        signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
-            .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
+    let fee_payer_signer = load_signer(&fee_payer_path, "fee payer")?;
 
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
@@ -710,13 +707,7 @@ pub fn execute_common_feature_gate_proposal(
     proposal_index: u64,
     kind: TransactionKind,
 ) -> Result<()> {
-    let fee_payer_signer = signer_from_path(
-        &Default::default(), // matches
-        &fee_payer_path,
-        "fee payer",
-        &mut None, // wallet_manager
-    )
-    .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
+    let fee_payer_signer = load_signer(&fee_payer_path, "fee payer")?;
 
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
@@ -832,9 +823,7 @@ pub fn create_feature_gate_proposal(
     fee_payer_path: String,
     kind: TransactionKind,
 ) -> Result<()> {
-    let fee_payer_signer =
-        signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
-            .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
+    let fee_payer_signer = load_signer(&fee_payer_path, "fee payer")?;
 
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
@@ -952,9 +941,7 @@ pub fn rekey_multisig_feature_gate(
     voting_key: Pubkey,
     fee_payer_path: String,
 ) -> Result<()> {
-    let fee_payer_signer =
-        signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
-            .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
+    let fee_payer_signer = load_signer(&fee_payer_path, "fee payer")?;
 
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
@@ -1140,9 +1127,7 @@ fn approve_common_proposal(
     proposal_index: u64,
     flavor: ProposalFlavor,
 ) -> Result<()> {
-    let fee_payer_signer =
-        signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
-            .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
+    let fee_payer_signer = load_signer(&fee_payer_path, "fee payer")?;
 
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
@@ -1224,9 +1209,7 @@ pub fn execute_common_config_change(
     fee_payer_path: String,
     transaction_index: u64,
 ) -> Result<()> {
-    let fee_payer_signer =
-        signer_from_path(&Default::default(), &fee_payer_path, "fee payer", &mut None)
-            .map_err(|e| eyre::eyre!("Failed to load fee payer: {}", e))?;
+    let fee_payer_signer = load_signer(&fee_payer_path, "fee payer")?;
 
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
