@@ -300,8 +300,8 @@ fn is_actionable(
     }
 }
 
-/// List the multisig's proposals that `action` can still act on — with what
-/// they do, their status, and vote counts — and let the user pick one instead
+/// List the multisig's proposals that `action` can still act on - with what
+/// they do, their status, and vote counts - and let the user pick one instead
 /// of typing an index from memory. Executed, rejected, cancelled, and stale
 /// proposals are skipped (with a note). Falls back to manual entry when
 /// nothing is listable or the user prefers. Returns the chosen index and its
@@ -344,7 +344,7 @@ fn prompt_for_proposal_index(
                 }
                 entries.push((index, kind));
                 options.push(format!(
-                    "#{index} — {} — {} — {} approval(s), {} rejection(s)",
+                    "#{index} - {} - {} - {} approval(s), {} rejection(s)",
                     kind.label(),
                     proposal_status_label(&proposal.status),
                     proposal.approved.len(),

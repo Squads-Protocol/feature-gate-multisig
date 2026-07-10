@@ -115,7 +115,7 @@ fn build_config_actions_for_kind(
 
 /// Attempt to load an account as a Squads multisig. Returns Ok(None) if the account
 /// doesn't exist, isn't owned by the Squads program, or doesn't carry the Multisig
-/// account discriminator — this gates the EOA-vs-parent-multisig flow, so spoofable
+/// account discriminator - this gates the EOA-vs-parent-multisig flow, so spoofable
 /// lookalike data must not pass.
 fn load_multisig_if_any(
     rpc_client: &solana_rpc_client::rpc_client::RpcClient,
@@ -471,7 +471,7 @@ fn approve_and_maybe_execute_parent(
         output::Output::hint("Executor does not have Execute permission on the parent multisig.");
     } else {
         output::Output::hint(&format!(
-            "Parent approvals {}/{} — waiting for more confirmations before execution.",
+            "Parent approvals {}/{} - waiting for more confirmations before execution.",
             approved, threshold
         ));
     }
