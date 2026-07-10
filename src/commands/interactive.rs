@@ -69,13 +69,13 @@ fn handle_proposal_action(config: &Config) -> Result<()> {
 
     // Pick the network once up front: the proposal picker queries it, and the
     // single-network config makes the downstream flows skip their own prompt.
+    // The original `config` stays around for prompts that persist defaults.
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
-    let config = Config {
+    let network_config = Config {
         networks: vec![rpc_url],
         ..config.clone()
     };
-    let config = &config;
 
     let action_options = vec!["Create", "Approve", "Reject", "Execute", "Cancel"];
     let action_choice: &str = Select::new("Select action:", action_options).prompt()?;
@@ -129,15 +129,19 @@ fn handle_proposal_action(config: &Config) -> Result<()> {
         (command, kind, Some(index))
     };
 
-    // Same entry point as the CLI subcommands: fee payer and voting key resolve
-    // from saved config defaults, prompting only when absent.
+    // Prompt with the saved default pre-filled (editable), and pass the key
+    // explicitly: interactive users always see which identity is voting.
+    let voting_key = prompt_for_voting_key(config)?;
+
+    // Same entry point as the CLI subcommands; the fee payer resolves from the
+    // saved config default, prompting only when absent.
     proposal_command(
-        config,
+        &network_config,
         command,
         ProposalCommandArgs {
             multisig: multisig.to_string(),
             kind,
-            voting_key: None,
+            voting_key: Some(voting_key.to_string()),
             keypair: None,
             index,
         },

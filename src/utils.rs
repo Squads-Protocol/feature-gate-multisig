@@ -307,6 +307,46 @@ pub fn prompt_for_threshold_with_max(max_members: usize) -> Result<u16> {
     }
 }
 
+/// Prompt for the voting key with the saved config default pre-filled and
+/// editable, so a saved identity is one Enter away but never silently binding.
+/// Offers to persist a newly entered key as the default.
+///
+/// `config` must be the full user config (not a narrowed clone), since saving
+/// writes it back to disk.
+pub fn prompt_for_voting_key(config: &Config) -> Result<Pubkey> {
+    let saved = config.voting_key.as_deref();
+    let key = loop {
+        let mut prompt = Text::new("Enter the voting key (EOA or parent multisig):");
+        if let Some(saved) = saved {
+            prompt = prompt.with_default(saved);
+        }
+        let input = prompt.prompt()?;
+        match Pubkey::from_str(input.trim()) {
+            Ok(key) => break key,
+            Err(_) => println!(
+                "  {} Invalid public key, please try again.",
+                "❌".bright_red()
+            ),
+        }
+    };
+
+    let changed = saved != Some(key.to_string().as_str());
+    if changed
+        && !is_e2e_test_mode()
+        && !is_assume_yes()
+        && Confirm::new("Save as default voting key for future commands?")
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false)
+    {
+        let mut updated = config.clone();
+        updated.voting_key = Some(key.to_string());
+        save_config(&updated)?;
+        println!("  {} Voting key saved to config.", "✓".bright_green());
+    }
+    Ok(key)
+}
+
 pub fn prompt_for_pubkey(prompt: &str) -> Result<Pubkey> {
     let input = Text::new(prompt).prompt()?;
     match Pubkey::from_str(&input) {
