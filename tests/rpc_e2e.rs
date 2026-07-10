@@ -46,6 +46,17 @@ fn rpc_url() -> String {
     env::var("RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string())
 }
 
+/// Non-interactive mode plus an isolated config dir, so test runs never read
+/// or overwrite the real per-user config. Tests run with --test-threads=1, so
+/// setting process-global env here is safe.
+fn init_test_env() {
+    std::env::set_var("E2E_TEST_MODE", "1");
+    std::env::set_var(
+        feature_gate_multisig_tool::utils::CONFIG_DIR_ENV,
+        std::env::temp_dir().join("feature-gate-multisig-e2e-config"),
+    );
+}
+
 fn full_permissions() -> Permissions {
     Permissions::all()
 }
@@ -66,8 +77,7 @@ struct Fixture {
 static FIXTURE: OnceCell<Fixture> = OnceCell::new();
 
 fn build_fixture() -> Fixture {
-    // Enable non-interactive mode for E2E tests
-    std::env::set_var("E2E_TEST_MODE", "1");
+    init_test_env();
     std::env::set_var("RUST_LOG", "info");
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
@@ -211,6 +221,7 @@ fn wait_for_account(client: &RpcClient, address: &Pubkey) {
 }
 
 #[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
 fn rpc_e2e_1_activate_feature_gate() {
     let fixture = get_fixture();
 
@@ -290,6 +301,7 @@ fn rpc_e2e_1_activate_feature_gate() {
 }
 
 #[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
 fn rpc_e2e_2_revoke_feature_gate() {
     let fixture = get_fixture();
 
@@ -454,6 +466,7 @@ fn rpc_e2e_2_revoke_feature_gate() {
 }
 
 #[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
 fn rpc_e2e_3_reject_activation() {
     let fixture = get_fixture();
 
@@ -553,6 +566,7 @@ fn rpc_e2e_3_reject_activation() {
 }
 
 #[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
 fn rpc_e2e_4_reject_revocation() {
     let fixture = get_fixture();
 
@@ -652,6 +666,7 @@ fn rpc_e2e_4_reject_revocation() {
 }
 
 #[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
 fn rpc_e2e_5_reject_rekey() {
     let fixture = get_fixture();
 
@@ -747,6 +762,7 @@ fn rpc_e2e_5_reject_rekey() {
 }
 
 #[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
 fn rpc_e2e_6_rekey_feature_gate_multisig() {
     let fixture = get_fixture();
 
@@ -848,9 +864,9 @@ fn rpc_e2e_6_rekey_feature_gate_multisig() {
 /// This test creates a new child multisig with EOA-only members using the real CLI flow,
 /// then EOAs approve and execute the pre-created activation proposal.
 #[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
 fn rpc_e2e_7_eoa_activation_flow() {
-    // Enable non-interactive mode
-    std::env::set_var("E2E_TEST_MODE", "1");
+    init_test_env();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
     let temp_dir: PathBuf = std::env::temp_dir();
@@ -997,9 +1013,9 @@ fn rpc_e2e_7_eoa_activation_flow() {
 /// Uses the same CLI flow as test 7 - creates multisig via create_command_with_deployments,
 /// then activates, then creates and executes revocation.
 #[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
 fn rpc_e2e_8_eoa_revocation_flow() {
-    // Enable non-interactive mode
-    std::env::set_var("E2E_TEST_MODE", "1");
+    init_test_env();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
     let temp_dir: PathBuf = std::env::temp_dir();
@@ -1194,8 +1210,9 @@ fn rpc_e2e_8_eoa_revocation_flow() {
 /// Covers the plumbing that unit tests can't: hashing the real cloned Squads
 /// ELF, and classifying a feature account across a Fresh -> Pending transition.
 #[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
 fn rpc_e2e_9_verify_checks() {
-    std::env::set_var("E2E_TEST_MODE", "1");
+    init_test_env();
 
     let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
     wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
