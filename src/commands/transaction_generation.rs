@@ -427,7 +427,7 @@ fn approve_and_maybe_execute_parent(
         VersionedTransaction::try_new(VersionedMessage::V0(approve_msg), &[fee_payer_signer])?;
     let approve_sig = crate::provision::send_and_confirm_transaction(&approve_tx, rpc_client)
         .map_err(|e| eyre::eyre!("Failed to approve parent proposal: {}", e))?;
-    output::Output::field("Parent proposal approved (sig):", &approve_sig);
+    output::Output::field("Parent proposal approved (sig)", &approve_sig);
 
     // If approvals meet threshold, offer to execute the parent proposal now
     let (approved, threshold, _status) =
@@ -454,7 +454,7 @@ fn approve_and_maybe_execute_parent(
             VersionedTransaction::try_new(VersionedMessage::V0(exec_msg), &[fee_payer_signer])?;
         let exec_sig = crate::provision::send_and_confirm_transaction(&exec_tx, rpc_client)
             .map_err(|e| eyre::eyre!("Failed to execute parent proposal: {}", e))?;
-        output::Output::field("Parent proposal executed (sig):", &exec_sig);
+        output::Output::field("Parent proposal executed (sig)", &exec_sig);
 
         let success_message = match operation {
             ProposalAction::Approve => "Child proposal has been approved via parent multisig!",
@@ -530,15 +530,12 @@ fn handle_parent_multisig_flow(
         "Parent Multisig {} Transaction Details:",
         permission_name
     ));
-    output::Output::field("Parent Multisig:", &parent_multisig.to_string());
-    output::Output::field(
-        "Child Multisig:",
-        &feature_gate_multisig_address.to_string(),
-    );
-    output::Output::field("Parent Transaction Index:", &parent_next_index.to_string());
-    output::Output::field("Child Proposal Index:", &proposal_index.to_string());
-    output::Output::field("Transaction Type:", kind.label());
-    output::Output::field("Action:", &action_description);
+    output::Output::field("Parent Multisig", &parent_multisig.to_string());
+    output::Output::field("Child Multisig", &feature_gate_multisig_address.to_string());
+    output::Output::field("Parent Transaction Index", &parent_next_index.to_string());
+    output::Output::field("Child Proposal Index", &proposal_index.to_string());
+    output::Output::field("Transaction Type", kind.label());
+    output::Output::field("Action", &action_description);
 
     // Ask for confirmation before creating the parent multisig proposal
     let confirmation_prompt = match operation {
@@ -584,8 +581,8 @@ fn handle_parent_multisig_flow(
         Some(crate::constants::DEFAULT_COMPUTE_UNITS),
         blockhash,
     )?;
-    output::Output::address("Parent transaction PDA:", &tx_pda.to_string());
-    output::Output::address("Parent proposal PDA:", &prop_pda.to_string());
+    output::Output::address("Parent transaction PDA", &tx_pda.to_string());
+    output::Output::address("Parent proposal PDA", &prop_pda.to_string());
 
     let transaction =
         VersionedTransaction::try_new(VersionedMessage::V0(msg), &[fee_payer_signer])?;
@@ -596,7 +593,7 @@ fn handle_parent_multisig_flow(
         "Parent Multisig {} Transaction Created & Sent:",
         permission_name
     ));
-    output::Output::field("Signature:", &signature);
+    output::Output::field("Signature", &signature);
 
     // Offer to approve the parent proposal immediately
     if confirm_action("Approve this parent proposal now?", true) {
@@ -700,7 +697,7 @@ pub fn reject_common_feature_gate_proposal(
 
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to send reject transaction: {}", e))?;
-    output::Output::field("Reject transaction sent successfully:", &signature);
+    output::Output::field("Reject transaction sent successfully", &signature);
     Ok(())
 }
 
@@ -817,7 +814,7 @@ pub fn execute_common_feature_gate_proposal(
     // Send and confirm
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to execute proposal: {}", e))?;
-    output::Output::field("Proposal executed (sig):", &signature);
+    output::Output::field("Proposal executed (sig)", &signature);
     Ok(())
 }
 
@@ -869,7 +866,7 @@ pub fn create_feature_gate_proposal(
         // voting_key is the parent multisig address, derive the vault PDA from it
         let parent_vault_pda = crate::squads::get_vault_pda(&voting_key, 0).0;
         output::Output::field(
-            "Parent vault PDA (creator/rent_payer):",
+            "Parent vault PDA (creator/rent_payer)",
             &parent_vault_pda.to_string(),
         );
 
@@ -891,7 +888,7 @@ pub fn create_feature_gate_proposal(
         )?;
 
         output::Output::field(
-            "Vault proposal created at index:",
+            "Vault proposal created at index",
             &next_tx_index.to_string(),
         );
 
@@ -931,8 +928,8 @@ pub fn create_feature_gate_proposal(
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to create {} proposal: {}", kind.label(), e))?;
 
-    output::Output::field("Vault proposal index:", &next_tx_index.to_string());
-    output::Output::field("Create proposal signature:", &signature);
+    output::Output::field("Vault proposal index", &next_tx_index.to_string());
+    output::Output::field("Create proposal signature", &signature);
 
     output::Output::info(
         "Next step: Gather approvals from other members, then execute the proposal.",
@@ -1083,8 +1080,8 @@ pub fn rekey_multisig_feature_gate(
     // Send and confirm
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to create rekey proposal: {}", e))?;
-    output::Output::field("Rekey proposal created (sig):", &signature);
-    output::Output::field("Proposal index:", &next_tx_index.to_string());
+    output::Output::field("Rekey proposal created (sig)", &signature);
+    output::Output::field("Proposal index", &next_tx_index.to_string());
 
     // Offer to approve the config proposal immediately
     if Confirm::new("Approve this config proposal now?")
@@ -1281,6 +1278,6 @@ pub fn execute_common_config_change(
     // Send and confirm
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to execute config change: {}", e))?;
-    output::Output::field("Config change executed (sig):", &signature);
+    output::Output::field("Config change executed (sig)", &signature);
     Ok(())
 }

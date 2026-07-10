@@ -33,6 +33,7 @@ use solana_rpc_client_api::request::{RpcError, RpcResponseErrorData};
 use solana_rpc_client_api::response::RpcSimulateTransactionResult;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
+use std::str::FromStr;
 use std::time::Duration;
 
 /// Creates an RPC client with consistent commitment configuration
@@ -51,6 +52,26 @@ pub fn fetch_squads_multisig(
         .get_account(address)
         .map_err(|e| eyre!("Failed to fetch {} {}: {}", account_kind, address, e))?;
     if acc.owner != SQUADS_MULTISIG_PROGRAM_ID {
+        // The most common mix-up: pasting the feature gate account (the
+        // multisig's vault PDA) instead of the multisig itself.
+        if acc.owner == crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID {
+            let hint = find_multisig_for_feature_account(rpc_client, address)
+                .map(|multisig| format!(" Its multisig is {multisig}."))
+                .unwrap_or_default();
+            return Err(eyre!(
+                "{} {} is a feature gate account, not the multisig. Enter the multisig address the feature gate derives from (the feature gate is its vault 0).{}",
+                account_kind,
+                address,
+                hint
+            ));
+        }
+        if acc.owner == solana_system_interface::program::ID {
+            return Err(eyre!(
+                "{} {} is a plain system account (a wallet, or an unactivated feature gate), not a multisig. Enter the multisig address itself.",
+                account_kind,
+                address
+            ));
+        }
         return Err(eyre!(
             "{} {} is not owned by the Squads program (owner: {})",
             account_kind,
@@ -59,6 +80,66 @@ pub fn fetch_squads_multisig(
         ));
     }
     deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, account_kind)
+}
+
+/// Best-effort reverse lookup from a feature gate account to its multisig.
+///
+/// The vault-PDA derivation is one-way, but the transaction that activated the
+/// feature was executed by the multisig, so its account keys contain it. Scan
+/// the feature account's recent transactions for a key whose vault 0 derives
+/// to the feature account; the match is proof, not a guess.
+pub fn find_multisig_for_feature_account(
+    rpc_client: &RpcClient,
+    feature_account: &Pubkey,
+) -> Option<Pubkey> {
+    const MAX_TRANSACTIONS_SCANNED: usize = 5;
+
+    let signatures = rpc_client
+        .get_signatures_for_address(feature_account)
+        .ok()?;
+    for info in signatures.iter().take(MAX_TRANSACTIONS_SCANNED) {
+        let Ok(signature) = solana_signature::Signature::from_str(&info.signature) else {
+            continue;
+        };
+        let Ok(tx) = rpc_client.get_transaction_with_config(
+            &signature,
+            solana_rpc_client_api::config::RpcTransactionConfig {
+                encoding: Some(
+                    solana_transaction_status_client_types::UiTransactionEncoding::Base64,
+                ),
+                commitment: Some(rpc_client.commitment()),
+                max_supported_transaction_version: Some(0),
+            },
+        ) else {
+            continue;
+        };
+        let Some(decoded) = tx.transaction.transaction.decode() else {
+            continue;
+        };
+        for key in decoded.message.static_account_keys() {
+            if get_vault_pda(key, 0).0 == *feature_account {
+                return Some(*key);
+            }
+        }
+        // Accounts referenced via address lookup tables are absent from the
+        // static keys, but the RPC meta carries them already resolved.
+        let loaded: Option<solana_transaction_status_client_types::UiLoadedAddresses> = tx
+            .transaction
+            .meta
+            .as_ref()
+            .and_then(|meta| Option::from(meta.loaded_addresses.clone()));
+        if let Some(loaded) = loaded {
+            for addr in loaded.writable.iter().chain(loaded.readonly.iter()) {
+                let Ok(key) = Pubkey::from_str(addr) else {
+                    continue;
+                };
+                if get_vault_pda(&key, 0).0 == *feature_account {
+                    return Some(key);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Compile `instructions` into a Squads `TransactionMessage` using Solana's official v0
