@@ -30,35 +30,49 @@ pub fn interactive_mode() -> Result<()> {
             "Exit",
         ];
 
-        let choice: &str = Select::new("What would you like to do?", options).prompt()?;
+        let choice: &str = match Select::new("What would you like to do?", options).prompt() {
+            Ok(choice) => choice,
+            // Esc at the top level means quit.
+            Err(inquire::InquireError::OperationCanceled) => break,
+            Err(e) => return Err(e.into()),
+        };
 
-        match choice {
-            "Create new feature gate multisig" => {
-                let feepayer_path = prompt_for_fee_payer_path(&config)?;
-                create_command(&mut config, None, Some(feepayer_path))?;
-            }
-            "Proposal Actions (Approve/Reject/Execute)" => {
-                handle_proposal_action(&config)?;
-            }
-            "Show feature gate multisig details" => {
-                let address = Text::new("Enter the main multisig address:").prompt()?;
-                show_command(&config, Some(address))?;
-            }
-            "Verify feature gate multisig" => {
-                let address = Text::new("Enter the feature gate multisig address:").prompt()?;
-                verify_command(&config, Some(address))?;
-            }
-            "Show configuration" => {
-                config_command(&config)?;
-            }
+        let result = match choice {
+            "Create new feature gate multisig" => prompt_for_fee_payer_path(&config)
+                .and_then(|path| create_command(&mut config, None, Some(path))),
+            "Proposal Actions (Approve/Reject/Execute)" => handle_proposal_action(&config),
+            "Show feature gate multisig details" => Text::new("Enter the main multisig address:")
+                .prompt()
+                .map_err(eyre::Report::from)
+                .and_then(|address| show_command(&config, Some(address))),
+            "Verify feature gate multisig" => Text::new("Enter the feature gate multisig address:")
+                .prompt()
+                .map_err(eyre::Report::from)
+                .and_then(|address| verify_command(&config, Some(address))),
+            "Show configuration" => config_command(&config),
             "Exit" => break,
             _ => unreachable!(),
+        };
+
+        // Esc inside an action cancels back to the menu; real errors still exit.
+        match result {
+            Ok(()) => {}
+            Err(e) if is_prompt_cancellation(&e) => Output::info("Cancelled."),
+            Err(e) => return Err(e),
         }
 
         println!("\n");
     }
 
     Ok(())
+}
+
+/// True when the error is the user pressing Esc in an inquire prompt.
+fn is_prompt_cancellation(error: &eyre::Report) -> bool {
+    matches!(
+        error.downcast_ref::<inquire::InquireError>(),
+        Some(inquire::InquireError::OperationCanceled)
+    )
 }
 
 fn handle_proposal_action(config: &Config) -> Result<()> {
