@@ -19,6 +19,9 @@ use solana_rpc_client::rpc_client::RpcClient;
 
 pub fn interactive_mode() -> Result<()> {
     let mut config = load_config()?;
+    // Session memory: the multisig acted on last, pre-filled on the next pass.
+    // Useful when driving the same feature gate across several networks.
+    let mut last_multisig: Option<String> = None;
 
     loop {
         let options = vec![
@@ -40,7 +43,9 @@ pub fn interactive_mode() -> Result<()> {
         let result = match choice {
             "Create new feature gate multisig" => prompt_for_fee_payer_path(&config)
                 .and_then(|path| create_command(&mut config, None, Some(path))),
-            "Proposal Actions (Approve/Reject/Execute)" => handle_proposal_action(&config),
+            "Proposal Actions (Approve/Reject/Execute)" => {
+                handle_proposal_action(&config, &mut last_multisig)
+            }
             "Show feature gate multisig details" => Text::new("Enter the main multisig address:")
                 .prompt()
                 .map_err(eyre::Report::from)
@@ -75,10 +80,14 @@ fn is_prompt_cancellation(error: &eyre::Report) -> bool {
     )
 }
 
-fn handle_proposal_action(config: &Config) -> Result<()> {
+fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -> Result<()> {
     println!("In the current setup, only the fee payer keypair is used for transactions, hence for EOA voting fee payer = voting account. For multisig setup, the fee payer needs to be a member of the parent multisig.\n");
 
-    let multisig = prompt_for_pubkey("Enter the feature gate multisig address:")?;
+    let multisig = prompt_for_pubkey_with_default(
+        "Enter the feature gate multisig address:",
+        last_multisig.as_deref(),
+    )?;
+    *last_multisig = Some(multisig.to_string());
     let feature_gate_id = get_vault_pda(&multisig, 0).0;
 
     // Pick the network once up front: the proposal picker queries it, and the

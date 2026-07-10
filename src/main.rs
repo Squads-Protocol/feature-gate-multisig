@@ -171,6 +171,11 @@ struct ProposalActionArgs {
     keypair: Option<String>,
     #[arg(
         long,
+        help = "Network to act on: a configured network name (devnet/testnet/mainnet) or an RPC URL. Prompts when omitted and several networks are configured"
+    )]
+    network: Option<String>,
+    #[arg(
+        long,
         help = "Non-interactive: resolve each confirmation to its default answer"
     )]
     yes: bool,
@@ -272,8 +277,14 @@ fn run_proposal(
     if args.yes {
         std::env::set_var(crate::utils::ASSUME_YES_ENV, "1");
     }
+    // --network narrows the config to one endpoint, so downstream flows use it
+    // without prompting.
+    let mut config = config.clone();
+    if let Some(network) = &args.network {
+        config.networks = vec![crate::utils::resolve_network_arg(&config, network)?];
+    }
     proposal_command(
-        config,
+        &config,
         command,
         ProposalCommandArgs {
             multisig: args.multisig,

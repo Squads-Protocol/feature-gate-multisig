@@ -347,6 +347,52 @@ pub fn prompt_for_voting_key(config: &Config) -> Result<Pubkey> {
     Ok(key)
 }
 
+/// Resolve a `--network` argument to an RPC URL: an exact configured URL, a
+/// configured network's display name (devnet/testnet/mainnet, case-insensitive),
+/// or any explicit http(s) URL.
+pub fn resolve_network_arg(config: &Config, arg: &str) -> Result<String> {
+    let configured = if config.networks.is_empty() {
+        vec![DEFAULT_DEVNET_URL.to_string()]
+    } else {
+        config.networks.clone()
+    };
+    if let Some(url) = configured.iter().find(|url| url.as_str() == arg) {
+        return Ok(url.clone());
+    }
+    if let Some(url) = configured
+        .iter()
+        .find(|url| get_network_display(url).eq_ignore_ascii_case(arg))
+    {
+        return Ok(url.clone());
+    }
+    if arg.starts_with("http://") || arg.starts_with("https://") {
+        return Ok(arg.to_string());
+    }
+    Err(eyre::eyre!(
+        "Unknown network '{}'. Use a configured network name or URL: {}",
+        arg,
+        configured.join(", ")
+    ))
+}
+
+/// Prompt for a pubkey with an optional editable default pre-filled.
+pub fn prompt_for_pubkey_with_default(prompt: &str, default: Option<&str>) -> Result<Pubkey> {
+    loop {
+        let mut text = Text::new(prompt);
+        if let Some(default) = default {
+            text = text.with_default(default);
+        }
+        let input = text.prompt()?;
+        match Pubkey::from_str(input.trim()) {
+            Ok(key) => return Ok(key),
+            Err(_) => println!(
+                "  {} Invalid public key, please try again.",
+                "❌".bright_red()
+            ),
+        }
+    }
+}
+
 pub fn prompt_for_pubkey(prompt: &str) -> Result<Pubkey> {
     let input = Text::new(prompt).prompt()?;
     match Pubkey::from_str(&input) {
@@ -889,4 +935,42 @@ pub fn check_fee_payer_balance_on_networks(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_network_arg_by_url_name_or_passthrough() {
+        let config = Config {
+            networks: vec![
+                "https://api.devnet.solana.com".to_string(),
+                "https://api.mainnet.solana.com".to_string(),
+            ],
+            ..Config::default()
+        };
+
+        // Exact configured URL.
+        assert_eq!(
+            resolve_network_arg(&config, "https://api.devnet.solana.com").unwrap(),
+            "https://api.devnet.solana.com"
+        );
+        // Display name, case-insensitive, resolves to the configured URL.
+        assert_eq!(
+            resolve_network_arg(&config, "Mainnet").unwrap(),
+            "https://api.mainnet.solana.com"
+        );
+        // Unconfigured but explicit URLs pass through.
+        assert_eq!(
+            resolve_network_arg(&config, "http://127.0.0.1:8899").unwrap(),
+            "http://127.0.0.1:8899"
+        );
+        // Anything else is an error naming the configured options.
+        let err = resolve_network_arg(&config, "testnet")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unknown network"));
+        assert!(err.contains("https://api.devnet.solana.com"));
+    }
 }
