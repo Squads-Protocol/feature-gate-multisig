@@ -133,7 +133,7 @@ pub fn build_squads_transaction_message(
 /// Returns true for transient node/network errors worth retrying — not deterministic
 /// failures like a preflight/program error.
 fn is_transient_rpc_error(err: &ClientError) -> bool {
-    match &err.kind {
+    match &*err.kind {
         ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
             // -32005 node unhealthy, -32004 request timed out, -32603 internal error.
             *code == -32005 || *code == -32004 || *code == -32603
@@ -174,7 +174,7 @@ pub fn send_and_confirm_transaction(
                             },
                         ),
                     ..
-                }) = &err.kind
+                }) = &*err.kind
                 {
                     println!("Simulation logs:\n\n{}\n", logs.join("\n").bright_yellow());
                 }
@@ -254,7 +254,7 @@ pub fn get_account_data_with_retry(
         match rpc_client.get_account_data(pubkey) {
             Ok(data) => return Ok(data),
             Err(err) => {
-                let is_retryable = match &err.kind {
+                let is_retryable = match &*err.kind {
                     ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
                         *code == -32005 || *code == -32004 || *code == -32603
                     }
