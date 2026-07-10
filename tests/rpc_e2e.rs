@@ -36,7 +36,7 @@ use feature_gate_multisig_tool::commands::verify::verify_command;
 use feature_gate_multisig_tool::feature_gate_program::{
     FEATURE_ACCOUNT_SIZE, FEATURE_GATE_PROGRAM_ID,
 };
-use feature_gate_multisig_tool::provision::create_multisig;
+use feature_gate_multisig_tool::provision::{create_multisig, fetch_squads_multisig};
 use feature_gate_multisig_tool::squads::{
     get_proposal_pda, get_vault_pda, Member, Permissions, Proposal, ProposalStatus,
     PERMISSION_VOTE, SQUADS_MULTISIG_PROGRAM_ID,
@@ -1226,7 +1226,7 @@ fn rpc_e2e_9_verify_checks() {
 
     // Build an isolated EOA multisig so the feature-state transition is
     // deterministic and independent of the other tests.
-    let (config, child_multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+    let (config, child_multisig, child_vault, eoa_pubkeys, eoa_keypaths) =
         setup_eoa_multisig(&client, "eoa_test9", 2);
 
     // Before execution the feature account (vault 0) is unallocated -> Fresh.
@@ -1297,6 +1297,23 @@ fn rpc_e2e_9_verify_checks() {
         "activated feature account should be rent-exempt"
     );
     println!("✅ Feature gate classified Pending after activation; verify checks complete");
+
+    // Pasting the feature gate account instead of the multisig must fail with
+    // a hint that names the actual multisig (reverse lookup via the activation
+    // transaction's account keys).
+    let err = match fetch_squads_multisig(&client, &child_vault, "multisig") {
+        Ok(_) => panic!("vault address must not pass as a multisig"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("feature gate account"),
+        "error should explain the mix-up: {err}"
+    );
+    assert!(
+        err.contains(&child_multisig.to_string()),
+        "error should name the multisig: {err}"
+    );
+    println!("✅ Wrong-address error names the multisig via reverse lookup");
 
     // Smoke test the full verify command end to end: the network loop, all three
     // display sections, and (skipped, single network) cross-network consistency.

@@ -46,10 +46,12 @@ pub fn interactive_mode() -> Result<()> {
             "Proposal Actions (Approve/Reject/Execute)" => {
                 handle_proposal_action(&config, &mut last_multisig)
             }
-            "Show feature gate multisig details" => Text::new("Enter the main multisig address:")
-                .prompt()
-                .map_err(eyre::Report::from)
-                .and_then(|address| show_command(&config, Some(address))),
+            "Show feature gate multisig details" => {
+                Text::new("Enter the feature gate multisig address:")
+                    .prompt()
+                    .map_err(eyre::Report::from)
+                    .and_then(|address| show_command(&config, Some(address)))
+            }
             "Verify feature gate multisig" => Text::new("Enter the feature gate multisig address:")
                 .prompt()
                 .map_err(eyre::Report::from)
@@ -325,13 +327,33 @@ fn prompt_for_proposal_index(
     let mut entries: Vec<(u64, ProposalKind)> = Vec::new();
     let mut options: Vec<String> = Vec::new();
     let mut skipped = 0u64;
+    let mut known_max: Option<u64> = None;
     match fetch_squads_multisig(rpc_client, multisig, "multisig") {
         Ok(ms) if ms.transaction_index > 0 => {
+            known_max = Some(ms.transaction_index);
             let first = ms.transaction_index.saturating_sub(MAX_LISTED - 1).max(1);
+            if first > 1 {
+                Output::info(&format!(
+                    "Showing the last {MAX_LISTED} proposals; older ones (#1-#{}) via manual entry.",
+                    first - 1
+                ));
+            }
             for index in first..=ms.transaction_index {
                 let (proposal_pda, _) = get_proposal_pda(multisig, index);
-                let Ok(account) = rpc_client.get_account(&proposal_pda) else {
-                    continue;
+                let account = match rpc_client.get_account(&proposal_pda) {
+                    Ok(account) => account,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        // Missing accounts are normal (closed/reclaimed); only a
+                        // real fetch failure deserves a warning, so the list is
+                        // never silently incomplete.
+                        if !msg.contains("AccountNotFound")
+                            && !msg.contains("could not find account")
+                        {
+                            Output::warning(&format!("Could not fetch proposal #{index}: {e}"));
+                        }
+                        continue;
+                    }
                 };
                 let Ok(proposal) = deserialize_squads_account::<Proposal>(
                     &account.data,
@@ -385,6 +407,13 @@ fn prompt_for_proposal_index(
     let index: u64 = index_str
         .parse()
         .map_err(|_| eyre::eyre!("Invalid proposal index"))?;
+    if let Some(max) = known_max {
+        if index == 0 || index > max {
+            return Err(eyre::eyre!(
+                "Proposal index must be between 1 and {max} for this multisig"
+            ));
+        }
+    }
     Ok((index, describe_transaction(rpc_client, multisig, index)))
 }
 
