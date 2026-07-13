@@ -4,13 +4,32 @@ CLI tool for creating and managing Solana feature gate multisigs using the Squad
 
 ## Installation
 
+The tool is distributed as source: you build the exact code you reviewed, and
+`--locked` builds use the committed lockfile, which pins every dependency by
+version and checksum.
+
+Requires a Rust toolchain ([rustup](https://rustup.rs)), and `libudev-dev` +
+`pkg-config` on Linux (for hardware-wallet support).
+
+Install a released version:
+
+```bash
+cargo install --locked --git https://github.com/Squads-Protocol/feature-gate-multisig --tag <version>
+```
+
+Or clone and build:
+
 ```bash
 git clone https://github.com/Squads-Protocol/feature-gate-multisig.git
 cd feature-gate-multisig
-cargo build --release
+git checkout <version>   # pick a release tag; omit for the development branch
+cargo build --release --locked
 ```
 
 Binary: `./target/release/feature-gate-multisig-tool`
+
+Releases are announced as git tags; see [CHANGELOG.md](CHANGELOG.md) for what
+each version contains.
 
 ## Quick Start
 
