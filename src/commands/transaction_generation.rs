@@ -73,7 +73,7 @@ impl TransactionKind {
 
 /// Build config actions for multisig configuration operations.
 /// Returns a vector of ConfigActions appropriate for the transaction kind.
-fn build_config_actions_for_kind(
+pub(crate) fn build_config_actions_for_kind(
     kind: TransactionKind,
     multisig_members: &[crate::squads::Member],
 ) -> Result<Vec<crate::squads::ConfigAction>> {

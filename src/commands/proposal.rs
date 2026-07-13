@@ -4,15 +4,15 @@
 
 use crate::commands::transaction_generation::{
     approve_common_config_change, approve_common_feature_gate_proposal,
-    create_feature_gate_proposal, execute_common_config_change,
+    build_config_actions_for_kind, create_feature_gate_proposal, execute_common_config_change,
     execute_common_feature_gate_proposal, reject_common_feature_gate_proposal,
     rekey_multisig_feature_gate, TransactionKind,
 };
 use crate::feature_gate_program::{activate_feature_funded, revoke_pending_activation};
 use crate::output::Output;
-use crate::provision::create_rpc_client;
+use crate::provision::{create_rpc_client, fetch_squads_multisig};
 use crate::squads::{
-    deserialize_squads_account, get_transaction_pda, get_vault_pda, ConfigTransaction,
+    deserialize_squads_account, get_transaction_pda, get_vault_pda, ConfigTransaction, Member,
     ProposalStatus, VaultTransaction, VaultTransactionMessage,
     CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR, SQUADS_MULTISIG_PROGRAM_ID,
     VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
@@ -230,14 +230,24 @@ pub(crate) fn describe_transaction(
         return ProposalKind::Unknown;
     };
 
-    if deserialize_squads_account::<ConfigTransaction>(
+    if let Ok(config_tx) = deserialize_squads_account::<ConfigTransaction>(
         &account.data,
         CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
         "config transaction",
-    )
-    .is_ok()
-    {
-        return ProposalKind::Rekey;
+    ) {
+        // Classify a config transaction as Rekey only when its actions are the
+        // canonical brick set, not merely because it is a config transaction.
+        // A config change that adds a member or lowers the threshold must not
+        // wear the benign "Rekey" label. Compared against the current members,
+        // which equal the rekey's targets until it executes.
+        let members = fetch_squads_multisig(rpc_client, multisig, "multisig")
+            .map(|ms| ms.members)
+            .unwrap_or_default();
+        return if is_canonical_rekey(&config_tx.actions, &members) {
+            ProposalKind::Rekey
+        } else {
+            ProposalKind::Other
+        };
     }
 
     let Ok(vault_tx) = deserialize_squads_account::<VaultTransaction>(
@@ -249,6 +259,18 @@ pub(crate) fn describe_transaction(
     };
 
     classify_vault_message(&vault_tx.message, multisig)
+}
+
+/// True when a config transaction's actions are exactly the canonical rekey
+/// brick set for `members` (add the unsignable default member, drop the
+/// threshold to 1, remove every current member). Any other config change - an
+/// added member, a lowered threshold on its own - is not a rekey and must not
+/// be labeled one.
+fn is_canonical_rekey(actions: &[crate::squads::ConfigAction], members: &[Member]) -> bool {
+    match build_config_actions_for_kind(TransactionKind::Rekey, members) {
+        Ok(expected) => actions == expected.as_slice(),
+        Err(_) => false,
+    }
 }
 
 /// Program id, ordered account pubkeys, and raw data of one instruction - the
@@ -439,6 +461,49 @@ mod tests {
             classify_vault_message(&wrong_target, &multisig),
             ProposalKind::Other
         ));
+    }
+
+    #[test]
+    fn only_the_canonical_rekey_action_set_is_a_rekey() {
+        use crate::squads::{ConfigAction, Member, Permissions};
+
+        let members = vec![
+            Member {
+                key: Pubkey::new_unique(),
+                permissions: Permissions::all(),
+            },
+            Member {
+                key: Pubkey::new_unique(),
+                permissions: Permissions::all(),
+            },
+        ];
+
+        // The genuine brick set built for these members.
+        let canonical = build_config_actions_for_kind(TransactionKind::Rekey, &members).unwrap();
+        assert!(is_canonical_rekey(&canonical, &members));
+
+        // A member-adding config change is NOT a rekey.
+        let add_attacker = vec![ConfigAction::AddMember {
+            new_member: Member {
+                key: Pubkey::new_unique(),
+                permissions: Permissions::all(),
+            },
+        }];
+        assert!(!is_canonical_rekey(&add_attacker, &members));
+
+        // A lone threshold drop is NOT a rekey.
+        let lower_threshold = vec![ConfigAction::ChangeThreshold { new_threshold: 1 }];
+        assert!(!is_canonical_rekey(&lower_threshold, &members));
+
+        // The canonical set with an extra malicious action appended is NOT a rekey.
+        let mut tampered = canonical.clone();
+        tampered.push(ConfigAction::AddMember {
+            new_member: Member {
+                key: Pubkey::new_unique(),
+                permissions: Permissions::all(),
+            },
+        });
+        assert!(!is_canonical_rekey(&tampered, &members));
     }
 
     #[test]
