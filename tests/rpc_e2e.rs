@@ -43,7 +43,7 @@ use feature_gate_multisig_tool::squads::{
 };
 use feature_gate_multisig_tool::utils::Config;
 use feature_gate_multisig_tool::verification::{
-    is_autonomous, is_mainnet_cluster, verify_feature_gate, verify_squads_program,
+    is_autonomous, is_mainnet_cluster, is_rekeyed, verify_feature_gate, verify_squads_program,
     FeatureGateStatus,
 };
 
@@ -917,6 +917,10 @@ fn rpc_e2e_6_rekey_feature_gate_multisig() {
         multisig.members[0].key,
         Pubkey::default(),
         "remaining member should be the default pubkey (dummy owner)"
+    );
+    assert!(
+        is_rekeyed(&multisig),
+        "rekey detection should flag the post-rekey state"
     );
 
     println!("✅ Feature gate rekey E2E test completed successfully!");

@@ -86,6 +86,16 @@ The contributor key receives Initiate-only permissions, while additional members
     Show {
         #[arg(help = "The multisig address to inspect")]
         address: Option<String>,
+        #[arg(
+            long,
+            help = "Network to inspect: a configured network name (devnet/testnet/mainnet) or an RPC URL. Prompts when omitted and several networks are configured"
+        )]
+        network: Option<String>,
+        #[arg(
+            long,
+            help = "Print full transaction/proposal details (the debugging view) for this proposal index"
+        )]
+        index: Option<u64>,
     },
     #[command(
         about = "Verify a feature gate multisig: program authenticity, feature state, owners"
@@ -251,7 +261,11 @@ fn handle_command(command: Commands) -> Result<()> {
 
             create_command(&mut config, threshold_option, keypair)
         }
-        Commands::Show { address } => show_command(&config, address),
+        Commands::Show {
+            address,
+            network,
+            index,
+        } => show_command(&config, address, network, index),
         Commands::Verify { address } => verify_command(&config, address),
         Commands::Propose { args } => run_proposal(&config, ProposalCommand::Propose, args, None),
         Commands::Approve { args, index } => {

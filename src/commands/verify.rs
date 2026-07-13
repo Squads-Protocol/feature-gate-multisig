@@ -5,9 +5,9 @@ use crate::provision::{create_rpc_client, fetch_squads_multisig};
 use crate::squads::{Multisig, PERMISSION_VOTE};
 use crate::utils::{get_network_display, is_mainnet, validate_pubkey_with_retry, Config};
 use crate::verification::{
-    config_fingerprint, is_autonomous, is_mainnet_cluster, multisig_safety_warnings,
-    program_warnings, verify_feature_gate, verify_squads_program, FeatureVerification,
-    ProgramAuthenticity,
+    config_fingerprint, is_autonomous, is_mainnet_cluster, is_rekeyed, member_set_warnings,
+    multisig_safety_warnings, program_warnings, verify_feature_gate, verify_squads_program,
+    FeatureVerification, ProgramAuthenticity,
 };
 use eyre::Result;
 use solana_pubkey::Pubkey;
@@ -89,7 +89,7 @@ fn verify_on_network(rpc: &RpcClient, multisig: &Pubkey, is_mainnet: bool) -> Op
 /// Flag governance-config drift across networks. The tool deploys identical
 /// config everywhere, so any difference between the clusters where the multisig
 /// exists points to a tampered or stale deployment.
-fn report_cross_network_consistency(seen: &[(&str, Multisig)]) {
+pub(crate) fn report_cross_network_consistency(seen: &[(&str, Multisig)]) {
     if seen.len() < 2 {
         return;
     }
@@ -185,9 +185,17 @@ fn display_owners(ms: &Multisig) {
         &is_autonomous(ms).to_string(),
     );
     Output::field("Time lock", &format!("{}s", ms.time_lock));
+    if is_rekeyed(ms) {
+        Output::warning(
+            "This multisig has been rekeyed: its voting keys cannot meet the threshold, so no proposal can ever pass and the configuration is permanently frozen.",
+        );
+    }
     print_members_table(ms);
 
     for warning in multisig_safety_warnings(ms) {
+        Output::warning(&warning);
+    }
+    for warning in member_set_warnings(ms) {
         Output::warning(&warning);
     }
 }

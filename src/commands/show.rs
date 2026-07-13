@@ -1,23 +1,35 @@
-use crate::constants::*;
+use crate::commands::proposal::{describe_transaction, proposal_status_label, ProposalKind};
+use crate::commands::verify::report_cross_network_consistency;
+use crate::output::Output;
 use crate::provision::{create_rpc_client, fetch_squads_multisig, get_account_data_with_retry};
 use crate::squads::{
     deserialize_squads_account, get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction,
     ConfigTransaction, Multisig, Proposal, ProposalStatus, VaultTransaction,
-    CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR, PROPOSAL_ACCOUNT_DISCRIMINATOR,
+    CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR, PERMISSION_VOTE, PROPOSAL_ACCOUNT_DISCRIMINATOR,
     VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
 };
 use crate::utils::*;
+use crate::verification::{
+    is_autonomous, is_mainnet_cluster, is_rekeyed, known_signer_name, member_set_warnings,
+    multisig_safety_warnings, program_warnings, verify_feature_gate, verify_squads_program,
+    FeatureGateStatus,
+};
 use colored::*;
 use eyre::Result;
 use inquire::Select;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
+use std::io::IsTerminal;
 use std::str::FromStr;
 use tabled::{settings::Style, Table, Tabled};
 
-pub fn show_command(config: &Config, address: Option<String>) -> Result<()> {
+pub fn show_command(
+    config: &Config,
+    address: Option<String>,
+    network: Option<String>,
+    detail_index: Option<u64>,
+) -> Result<()> {
     let address = if let Some(addr) = address {
-        // Validate provided address
         match Pubkey::from_str(&addr) {
             Ok(_) => addr,
             Err(_) => {
@@ -30,57 +42,315 @@ pub fn show_command(config: &Config, address: Option<String>) -> Result<()> {
             }
         }
     } else {
-        validate_pubkey_with_retry("Enter multisig address:")?.to_string()
+        validate_pubkey_with_retry("Enter the feature gate multisig address:")?.to_string()
     };
-    show_multisig(config, &address)
+    let rpc_url = match network {
+        Some(arg) => resolve_network_arg(config, &arg)?,
+        None => choose_network_from_config(config)?,
+    };
+    show_multisig(config, &address, &rpc_url, detail_index)
 }
 
-fn show_multisig(config: &Config, address: &str) -> Result<()> {
-    // Parse the multisig address
+fn show_multisig(
+    config: &Config,
+    address: &str,
+    rpc_url: &str,
+    detail_index: Option<u64>,
+) -> Result<()> {
     let multisig_pubkey =
         Pubkey::from_str(address).map_err(|_| eyre::eyre!("Invalid multisig address format"))?;
-
-    println!(
-        "{}",
-        "🔍 Fetching multisig details...".bright_yellow().bold()
-    );
-    println!();
-
-    let networks_to_try = if !config.networks.is_empty() {
-        config.networks.clone()
-    } else {
-        vec![DEFAULT_DEVNET_URL.to_string()]
-    };
-
-    let rpc_url: String =
-        Select::new("Which network would you like to query?", networks_to_try).prompt()?;
-
-    println!("🌐 Trying network: {}", rpc_url.bright_white());
-
-    let rpc_client = create_rpc_client(&rpc_url);
+    let rpc_client = create_rpc_client(rpc_url);
     // fetch_squads_multisig validates owner == Squads program before deserializing,
     // so a spoofed look-alike account is rejected rather than rendered as a multisig.
     let multisig = fetch_squads_multisig(&rpc_client, &multisig_pubkey, "multisig")?;
+    let vault0 = get_vault_pda(&multisig_pubkey, 0).0;
 
+    // Classify every transaction up front: it feeds the proposals table and
+    // tells us what this multisig is. A parent (voting) multisig's proposals
+    // wrap actions on child multisigs; a feature gate multisig's proposals
+    // act on the feature account.
+    let kinds: Vec<ProposalKind> = (1..=multisig.transaction_index)
+        .map(|index| describe_transaction(&rpc_client, &multisig_pubkey, index))
+        .collect();
+    let looks_like_parent = kinds
+        .iter()
+        .any(|kind| matches!(kind, ProposalKind::ChildAction));
+
+    println!();
+    let networks = if config.networks.is_empty() {
+        vec![rpc_url.to_string()]
+    } else {
+        config.networks.clone()
+    };
+    let mut network_multisigs: Vec<(&str, Multisig)> = Vec::new();
+
+    if looks_like_parent {
+        // Vault 0 of a parent is its voting identity on child multisigs, not a
+        // feature gate; reporting a "feature state" for it would be misleading.
+        Output::header(&format!("📋 Squads Multisig {multisig_pubkey}"));
+        Output::info(
+            "This looks like a parent (voting) multisig: its proposals act on child multisigs.",
+        );
+        Output::field(
+            "Voting identity (vault 0)",
+            &format!("{vault0} (appears as a member on child multisigs)"),
+        );
+        for url in &networks {
+            let client = create_rpc_client(url);
+            if let Ok(ms) = fetch_squads_multisig(&client, &multisig_pubkey, "multisig") {
+                network_multisigs.push((get_network_display(url), ms));
+            }
+        }
+    } else {
+        Output::header(&format!("📋 Feature Gate Multisig {multisig_pubkey}"));
+        Output::field("Feature gate (vault 0)", &vault0.to_string());
+
+        // Per-network sweep: feature state (cheap, two RPC calls per network)
+        // and each network's multisig config for the drift check further down.
+        let mut states: Vec<String> = Vec::new();
+        for url in &networks {
+            let client = create_rpc_client(url);
+            let state = match verify_feature_gate(&client, &multisig_pubkey) {
+                Ok(v) => feature_status_label(&v.status),
+                Err(_) => "unreachable".to_string(),
+            };
+            states.push(format!("{}: {}", get_network_display(url), state));
+            if let Ok(ms) = fetch_squads_multisig(&client, &multisig_pubkey, "multisig") {
+                network_multisigs.push((get_network_display(url), ms));
+            }
+        }
+        Output::field("Feature state", &states.join(" | "));
+    }
+
+    let voting_members = multisig
+        .members
+        .iter()
+        .filter(|m| m.permissions.mask & PERMISSION_VOTE != 0)
+        .count();
+    Output::field(
+        "Threshold",
+        &format!(
+            "{} of {} voting members",
+            multisig.threshold, voting_members
+        ),
+    );
+    Output::field(
+        "Autonomous (config by vote)",
+        &is_autonomous(&multisig).to_string(),
+    );
+    Output::field("Time lock", &format!("{}s", multisig.time_lock));
+
+    // Rekey is per network: each cluster's multisig is independent state, so
+    // one can be frozen while the others remain active.
+    let rekeyed_on: Vec<&str> = network_multisigs
+        .iter()
+        .filter(|(_, ms)| is_rekeyed(ms))
+        .map(|(network, _)| *network)
+        .collect();
+    if !rekeyed_on.is_empty() {
+        let scope = if rekeyed_on.len() == network_multisigs.len() {
+            String::new()
+        } else {
+            "; the other networks remain active".to_string()
+        };
+        Output::warning(&format!(
+            "Rekeyed (permanently frozen) on {}: voting keys there cannot meet the threshold, so no proposal can ever pass{}.",
+            rekeyed_on.join(", "),
+            scope
+        ));
+    }
+    // The same program-authenticity check `verify` runs, on the inspected
+    // network (this is the expensive one: it downloads the program bytecode).
+    match verify_squads_program(&rpc_client) {
+        Ok(program) => {
+            let mainnet = is_mainnet_cluster(&rpc_client).unwrap_or_else(|_| is_mainnet(rpc_url));
+            let warnings = program_warnings(&program, mainnet);
+            if warnings.is_empty() {
+                let status = if mainnet {
+                    "authentic, immutable Squads v4 (bytecode verified)"
+                } else {
+                    "present; bytecode and immutability are asserted on mainnet only"
+                };
+                Output::field("Squads program", status);
+            } else {
+                for warning in warnings {
+                    Output::warning(&warning);
+                }
+            }
+        }
+        Err(e) => Output::warning(&format!("Could not verify Squads program: {e}")),
+    }
+    for warning in multisig_safety_warnings(&multisig) {
+        Output::warning(&warning);
+    }
+    for warning in member_set_warnings(&multisig) {
+        Output::warning(&warning);
+    }
+    println!();
+
+    print_members_table(&multisig);
+
+    display_proposals_summary(&rpc_client, &multisig_pubkey, &multisig, &kinds);
+
+    report_cross_network_consistency(&network_multisigs);
+
+    if let Some(index) = detail_index {
+        if index == 0 || index > multisig.transaction_index {
+            return Err(eyre::eyre!(
+                "Proposal index must be between 1 and {} for this multisig",
+                multisig.transaction_index
+            ));
+        }
+        display_full_details(&rpc_client, &multisig_pubkey, index);
+        return Ok(());
+    }
+    offer_detail_drilldown(&rpc_client, &multisig_pubkey, &multisig)
+}
+
+fn feature_status_label(status: &FeatureGateStatus) -> String {
+    match status {
+        FeatureGateStatus::Fresh => "Fresh (not activated)".to_string(),
+        FeatureGateStatus::Pending => "Pending activation".to_string(),
+        FeatureGateStatus::Activated { slot } => format!("Activated (slot {slot})"),
+        FeatureGateStatus::Unexpected { .. } => "Unexpected state".to_string(),
+    }
+}
+
+/// One row per proposal: what it does and where it stands, on the selected
+/// network. The instruction-level view stays available via the drill-down.
+fn display_proposals_summary(
+    rpc_client: &RpcClient,
+    multisig_pubkey: &Pubkey,
+    multisig: &Multisig,
+    kinds: &[ProposalKind],
+) {
+    println!("{}", "🔄 PROPOSALS".bright_yellow().bold());
+    println!();
+    if multisig.transaction_index == 0 {
+        println!("  No proposals yet.");
+        println!();
+        return;
+    }
+
+    #[derive(Tabled)]
+    struct ProposalRow {
+        #[tabled(rename = "#")]
+        index: u64,
+        #[tabled(rename = "Kind")]
+        kind: &'static str,
+        #[tabled(rename = "Status")]
+        status: String,
+        #[tabled(rename = "Approvals")]
+        approvals: String,
+        #[tabled(rename = "Rejections")]
+        rejections: String,
+    }
+
+    let mut rows = Vec::new();
+    for index in 1..=multisig.transaction_index {
+        let kind = kinds
+            .get(index as usize - 1)
+            .map_or("Unknown", |k| k.label());
+        let (proposal_pda, _) = get_proposal_pda(multisig_pubkey, index);
+        let proposal = rpc_client.get_account(&proposal_pda).ok().and_then(|acc| {
+            deserialize_squads_account::<Proposal>(
+                &acc.data,
+                PROPOSAL_ACCOUNT_DISCRIMINATOR,
+                "proposal",
+            )
+            .ok()
+        });
+        let (status, approvals, rejections) = match proposal {
+            Some(p) => (
+                proposal_status_label(&p.status).to_string(),
+                p.approved.len().to_string(),
+                p.rejected.len().to_string(),
+            ),
+            None => ("missing".to_string(), "-".to_string(), "-".to_string()),
+        };
+        rows.push(ProposalRow {
+            index,
+            kind,
+            status,
+            approvals,
+            rejections,
+        });
+    }
+    let mut table = Table::new(rows);
+    table.with(Style::rounded());
+    println!("{table}");
+    println!();
+}
+
+/// Full on-chain detail for one proposal index: PDAs, the decoded transaction
+/// at instruction level, and the raw proposal record. The debugging view.
+fn display_full_details(rpc_client: &RpcClient, multisig_pubkey: &Pubkey, tx_index: u64) {
     println!(
-        "✅ Found and verified multisig on: {}",
-        rpc_url.bright_green()
+        "{}",
+        format!("📋 TRANSACTION INDEX {}", tx_index)
+            .bright_cyan()
+            .bold()
+    );
+    println!("{}", "─".repeat(50).bright_cyan());
+    let (transaction_pda, _) = get_transaction_pda(multisig_pubkey, tx_index);
+    let (proposal_pda, _) = get_proposal_pda(multisig_pubkey, tx_index);
+    println!(
+        "🎯 Transaction PDA: {}",
+        transaction_pda.to_string().bright_white()
+    );
+    println!(
+        "🎯 Proposal PDA: {}",
+        proposal_pda.to_string().bright_white()
     );
     println!();
-    println!(
-        "🎯 Multisig address: {}",
-        multisig_pubkey.to_string().bright_white()
-    );
+    if let Err(e) = fetch_and_display_transaction(rpc_client, &transaction_pda, tx_index) {
+        println!(
+            "❌ Failed to fetch transaction {}: {}",
+            tx_index,
+            e.to_string().bright_red()
+        );
+    }
+    if let Err(e) = fetch_and_display_proposal(rpc_client, &proposal_pda, tx_index) {
+        println!(
+            "❌ Failed to fetch proposal {}: {}",
+            tx_index,
+            e.to_string().bright_red()
+        );
+    }
     println!();
+}
 
-    // Display the multisig details
-    display_multisig_details(&multisig, &multisig_pubkey)?;
-
-    // Fetch and display transaction and proposal details for all live indices.
-    let rpc_client = create_rpc_client(&rpc_url);
-    fetch_and_display_transactions_and_proposals(&rpc_client, &multisig_pubkey, &multisig)?;
-
-    Ok(())
+/// Offer the instruction-level view interactively. Skipped when not attached
+/// to a terminal or in non-interactive modes; `--index` reaches it directly.
+fn offer_detail_drilldown(
+    rpc_client: &RpcClient,
+    multisig_pubkey: &Pubkey,
+    multisig: &Multisig,
+) -> Result<()> {
+    if multisig.transaction_index == 0
+        || !std::io::stdin().is_terminal()
+        || is_e2e_test_mode()
+        || is_assume_yes()
+    {
+        return Ok(());
+    }
+    loop {
+        let mut options: Vec<String> = (1..=multisig.transaction_index)
+            .map(|i| format!("#{i}"))
+            .collect();
+        options.push("Done".to_string());
+        let selection = match Select::new("View full details for a proposal (debugging)?", options)
+            .raw_prompt()
+        {
+            Ok(selection) => selection,
+            Err(inquire::InquireError::OperationCanceled) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if selection.index as u64 >= multisig.transaction_index {
+            return Ok(());
+        }
+        display_full_details(rpc_client, multisig_pubkey, selection.index as u64 + 1);
+    }
 }
 
 /// Print the multisig members table (member index, pubkey, decoded permissions,
@@ -111,9 +381,13 @@ pub(crate) fn print_members_table(multisig: &Multisig) {
         .enumerate()
         .map(|(i, member)| {
             let perms = decode_permissions(member.permissions.mask);
+            let pubkey = match known_signer_name(&member.key) {
+                Some(name) => format!("{} ({name})", member.key),
+                None => member.key.to_string(),
+            };
             MemberInfo {
                 index: i + 1,
-                pubkey: member.key.to_string(),
+                pubkey,
                 permissions: if perms.is_empty() {
                     "None".to_string()
                 } else {
@@ -128,201 +402,6 @@ pub(crate) fn print_members_table(multisig: &Multisig) {
     members_table.with(Style::rounded());
     println!("{}", members_table);
     println!();
-}
-
-fn display_multisig_details(multisig: &Multisig, address: &Pubkey) -> Result<()> {
-    println!("{}", "📋 MULTISIG DETAILS".bright_green().bold());
-    println!("{}", "═".repeat(80).bright_green());
-    println!();
-
-    // Basic info table
-    #[derive(Tabled)]
-    struct MultisigInfo {
-        #[tabled(rename = "Property")]
-        property: String,
-        #[tabled(rename = "Value")]
-        value: String,
-    }
-
-    let info_data = vec![
-        MultisigInfo {
-            property: "Multisig Address".to_string(),
-            value: address.to_string(),
-        },
-        MultisigInfo {
-            property: "Create Key".to_string(),
-            value: multisig.create_key.to_string(),
-        },
-        MultisigInfo {
-            property: "Config Authority".to_string(),
-            value: multisig.config_authority.to_string(),
-        },
-        MultisigInfo {
-            property: "Threshold".to_string(),
-            value: {
-                let voting_members_count = multisig
-                    .members
-                    .iter()
-                    .filter(|member| member.permissions.mask & 2 != 0) // Check Vote permission (bit 1)
-                    .count();
-                format!(
-                    "{} of {} voting members",
-                    multisig.threshold, voting_members_count
-                )
-            },
-        },
-        MultisigInfo {
-            property: "Time Lock (seconds)".to_string(),
-            value: multisig.time_lock.to_string(),
-        },
-        MultisigInfo {
-            property: "Transaction Index".to_string(),
-            value: multisig.transaction_index.to_string(),
-        },
-        MultisigInfo {
-            property: "Stale Transaction Index".to_string(),
-            value: multisig.stale_transaction_index.to_string(),
-        },
-        MultisigInfo {
-            property: "Rent Collector".to_string(),
-            value: multisig
-                .rent_collector
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "None".to_string()),
-        },
-        MultisigInfo {
-            property: "PDA Bump".to_string(),
-            value: multisig.bump.to_string(),
-        },
-    ];
-
-    let mut info_table = Table::new(info_data);
-    info_table.with(Style::rounded());
-    println!("{}", info_table);
-    println!();
-
-    // Members table (shared with the `verify` command)
-    print_members_table(multisig);
-
-    // Calculate and display vault addresses for common indices
-    println!("{}", "🏦 VAULT ADDRESSES".bright_cyan().bold());
-    println!();
-
-    #[derive(Tabled)]
-    struct VaultInfo {
-        #[tabled(rename = "Index")]
-        index: u8,
-        #[tabled(rename = "Vault Address")]
-        address: String,
-        #[tabled(rename = "Description")]
-        description: String,
-    }
-
-    let vault_data = vec![
-        VaultInfo {
-            index: 0,
-            address: get_vault_pda(address, 0).0.to_string(),
-            description: "Default vault (commonly used for feature gates)".to_string(),
-        },
-        VaultInfo {
-            index: 1,
-            address: get_vault_pda(address, 1).0.to_string(),
-            description: "Vault #1".to_string(),
-        },
-        VaultInfo {
-            index: 2,
-            address: get_vault_pda(address, 2).0.to_string(),
-            description: "Vault #2".to_string(),
-        },
-    ];
-
-    let mut vault_table = Table::new(vault_data);
-    vault_table.with(Style::rounded());
-    println!("{}", vault_table);
-    println!();
-
-    println!(
-        "{}",
-        "✅ Multisig details retrieved successfully!".bright_green()
-    );
-
-    Ok(())
-}
-
-fn fetch_and_display_transactions_and_proposals(
-    rpc_client: &RpcClient,
-    multisig_pubkey: &Pubkey,
-    multisig: &Multisig,
-) -> Result<()> {
-    println!("{}", "🔄 TRANSACTIONS & PROPOSALS".bright_yellow().bold());
-    println!("{}", "═".repeat(80).bright_yellow());
-    println!();
-
-    // Check if there are any transactions to display
-    if multisig.transaction_index == 0 {
-        println!("🔍 No transactions found (transaction_index = 0)");
-        println!();
-        return Ok(());
-    }
-
-    println!(
-        "🔍 Fetching transaction and proposal data for {} transaction(s)...",
-        multisig.transaction_index
-    );
-    println!();
-
-    // Fetch data for all transactions
-    for tx_index in 1..=multisig.transaction_index {
-        println!(
-            "{}",
-            format!("📋 TRANSACTION INDEX {}", tx_index)
-                .bright_cyan()
-                .bold()
-        );
-        println!("{}", "─".repeat(50).bright_cyan());
-
-        // Generate PDAs for transaction and proposal
-        let (transaction_pda, _) = get_transaction_pda(multisig_pubkey, tx_index);
-        let (proposal_pda, _) = get_proposal_pda(multisig_pubkey, tx_index);
-
-        println!(
-            "🎯 Transaction PDA: {}",
-            transaction_pda.to_string().bright_white()
-        );
-        println!(
-            "🎯 Proposal PDA: {}",
-            proposal_pda.to_string().bright_white()
-        );
-        println!();
-
-        // Fetch transaction account
-        match fetch_and_display_transaction(rpc_client, &transaction_pda, tx_index) {
-            Ok(_) => {}
-            Err(e) => {
-                println!(
-                    "❌ Failed to fetch transaction {}: {}",
-                    tx_index,
-                    e.to_string().bright_red()
-                );
-            }
-        }
-
-        // Fetch proposal account
-        match fetch_and_display_proposal(rpc_client, &proposal_pda, tx_index) {
-            Ok(_) => {}
-            Err(e) => {
-                println!(
-                    "❌ Failed to fetch proposal {}: {}",
-                    tx_index,
-                    e.to_string().bright_red()
-                );
-            }
-        }
-
-        println!();
-    }
-
-    Ok(())
 }
 
 /// Enum to hold either transaction type

@@ -264,6 +264,99 @@ pub fn is_autonomous(ms: &Multisig) -> bool {
     ms.config_authority == Pubkey::default()
 }
 
+/// True when the multisig can never pass another proposal: its usable voting
+/// keys cannot meet the threshold. The rekey flow deliberately produces this
+/// state (a single `Pubkey::default()` member, which can never sign),
+/// permanently freezing the feature gate's configuration.
+pub fn is_rekeyed(ms: &Multisig) -> bool {
+    let usable_voters = ms
+        .members
+        .iter()
+        .filter(|m| {
+            m.key != Pubkey::default() && m.permissions.mask & crate::squads::PERMISSION_VOTE != 0
+        })
+        .count();
+    usable_voters < usize::from(ms.threshold)
+}
+
+/// The expected feature gate governance signers: each party's stable voting
+/// key (an EOA or, more likely, its parent multisig's vault-0 PDA), which
+/// recurs as a member across every feature gate multisig.
+///
+/// Vendored like [`SQUADS_V4_PROGRAM_HASH`]: expectations live in reviewed
+/// code, not editable config. Fill in once the parties' keys are known, e.g.:
+///
+/// ```text
+/// ("Org A", Pubkey::from_str_const("...")),
+/// ("Org B", Pubkey::from_str_const("...")),
+/// ("Org C", Pubkey::from_str_const("...")),
+/// ```
+///
+/// While empty, the member-set check is skipped.
+pub const KNOWN_SIGNERS: &[(&str, Pubkey)] = &[];
+
+/// The vendored name for a known governance signer key, if any.
+pub fn known_signer_name(key: &Pubkey) -> Option<&'static str> {
+    KNOWN_SIGNERS
+        .iter()
+        .find(|(_, known)| known == key)
+        .map(|(name, _)| *name)
+}
+
+/// Warnings when the multisig's voting members differ from the vendored
+/// expected signer set. Empty when [`KNOWN_SIGNERS`] is empty. Initiate-only
+/// members (the ephemeral contributor key) are ignored: only keys that can
+/// vote matter for governance.
+pub fn member_set_warnings(ms: &Multisig) -> Vec<String> {
+    member_set_warnings_against(ms, KNOWN_SIGNERS)
+}
+
+fn member_set_warnings_against(ms: &Multisig, known: &[(&str, Pubkey)]) -> Vec<String> {
+    use crate::squads::{PERMISSION_EXECUTE, PERMISSION_VOTE};
+
+    if known.is_empty() {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    for (name, key) in known {
+        let is_voting_member = ms
+            .members
+            .iter()
+            .any(|m| m.key == *key && m.permissions.mask & PERMISSION_VOTE != 0);
+        if !is_voting_member {
+            warnings.push(format!(
+                "Expected signer {name} ({key}) is not a voting member of this multisig."
+            ));
+        }
+    }
+
+    // Any extra member that can vote or execute is a party with power over
+    // governance; only pure Initiate-only members (the expected contributor
+    // pattern) are exempt.
+    for member in &ms.members {
+        if member.permissions.mask & (PERMISSION_VOTE | PERMISSION_EXECUTE) == 0 {
+            continue;
+        }
+        if known.iter().any(|(_, k)| k == &member.key) {
+            continue;
+        }
+        let abilities = match (
+            member.permissions.mask & PERMISSION_VOTE != 0,
+            member.permissions.mask & PERMISSION_EXECUTE != 0,
+        ) {
+            (true, true) => "vote and execute",
+            (true, false) => "vote",
+            (false, _) => "execute proposals",
+        };
+        warnings.push(format!(
+            "Member {} can {abilities} but is not one of the expected governance signers.",
+            member.key
+        ));
+    }
+    warnings
+}
+
 /// A canonical fingerprint of a multisig's governance-relevant config, for
 /// detecting drift across networks. Covers threshold, config authority, time
 /// lock, and the member set (key + permissions), order-independent.
@@ -475,6 +568,82 @@ mod tests {
         assert!(multisig_safety_warnings(&delayed)
             .iter()
             .any(|w| w.contains("time lock")));
+    }
+
+    #[test]
+    fn detects_rekeyed_multisigs() {
+        use crate::squads::{Member, Permissions};
+
+        // Healthy: one real voter, threshold 1.
+        let healthy = multisig_with(Pubkey::default(), 0, 1);
+        assert!(!is_rekeyed(&healthy));
+
+        // Canonical rekey shape: only the unsignable default-pubkey member.
+        let mut rekeyed = multisig_with(Pubkey::default(), 0, 1);
+        rekeyed.members = vec![Member {
+            key: Pubkey::default(),
+            permissions: Permissions::all(),
+        }];
+        assert!(is_rekeyed(&rekeyed));
+
+        // Quorum impossible more generally: threshold above the usable voters.
+        let stuck = multisig_with(Pubkey::default(), 0, 3);
+        assert!(is_rekeyed(&stuck));
+    }
+
+    #[test]
+    fn member_set_warnings_compare_voting_members_only() {
+        use crate::squads::{Member, Permissions};
+        let org_a = Pubkey::new_unique();
+        let org_b = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+        let contributor = Pubkey::new_unique();
+        let known = [("Org A", org_a), ("Org B", org_b)];
+
+        let mut ms = multisig_with(Pubkey::default(), 0, 2);
+        ms.members = vec![
+            Member {
+                key: org_a,
+                permissions: Permissions::all(),
+            },
+            Member {
+                key: org_b,
+                permissions: Permissions::all(),
+            },
+            // Initiate-only contributor must not trip the check.
+            Member {
+                key: contributor,
+                permissions: Permissions { mask: 1 },
+            },
+        ];
+        assert!(member_set_warnings_against(&ms, &known).is_empty());
+
+        // A missing expected signer and an unexpected voter both warn.
+        ms.members[1].key = stranger;
+        let warnings = member_set_warnings_against(&ms, &known);
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("Org B") && w.contains("not a voting member")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains(&stranger.to_string()) && w.contains("not one of the expected")));
+
+        // An unexpected executor (no vote) warns too; extra powers over
+        // governance are not limited to voting.
+        ms.members[1] = Member {
+            key: org_b,
+            permissions: Permissions::all(),
+        };
+        ms.members.push(Member {
+            key: stranger,
+            permissions: Permissions { mask: 4 },
+        });
+        let warnings = member_set_warnings_against(&ms, &known);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("execute proposals"));
+
+        // Empty registry (the current vendored state): check is skipped.
+        assert!(member_set_warnings_against(&ms, &[]).is_empty());
     }
 
     #[test]

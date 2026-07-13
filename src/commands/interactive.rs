@@ -1,15 +1,13 @@
+use crate::commands::proposal::{describe_transaction, proposal_status_label, ProposalKind};
 use crate::commands::{
     config_command, create_command, proposal_command, show_command, verify_command,
     ProposalCommand, ProposalCommandArgs, TransactionKind,
 };
-use crate::feature_gate_program::FEATURE_GATE_PROGRAM_ID;
 use crate::output::Output;
 use crate::provision::{create_rpc_client, fetch_squads_multisig};
 use crate::squads::{
-    deserialize_squads_account, get_proposal_pda, get_transaction_pda, get_vault_pda,
-    ConfigTransaction, Proposal, ProposalStatus, VaultTransaction,
-    CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR, PROPOSAL_ACCOUNT_DISCRIMINATOR,
-    SQUADS_MULTISIG_PROGRAM_ID, VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+    deserialize_squads_account, get_proposal_pda, get_vault_pda, Proposal, ProposalStatus,
+    PROPOSAL_ACCOUNT_DISCRIMINATOR,
 };
 use crate::utils::*;
 use eyre::Result;
@@ -50,7 +48,7 @@ pub fn interactive_mode() -> Result<()> {
                 Text::new("Enter the feature gate multisig address:")
                     .prompt()
                     .map_err(eyre::Report::from)
-                    .and_then(|address| show_command(&config, Some(address)))
+                    .and_then(|address| show_command(&config, Some(address), None, None))
             }
             "Verify feature gate multisig" => Text::new("Enter the feature gate multisig address:")
                 .prompt()
@@ -188,104 +186,6 @@ fn prompt_for_transaction_kind() -> Result<Option<TransactionKind>> {
         "Rekey Multisig (this will brick the multisig)" => Some(TransactionKind::Rekey),
         _ => None,
     })
-}
-
-/// What a proposal's companion transaction does, classified from its on-chain
-/// shape. The tool only creates three forms: activate (System-program
-/// allocate+assign), revoke (an instruction to the Feature Gate program), and
-/// rekey (a config transaction).
-#[derive(Clone, Copy)]
-enum ProposalKind {
-    Activate,
-    Revoke,
-    Rekey,
-    ChildAction,
-    Other,
-    Unknown,
-}
-
-impl ProposalKind {
-    fn label(self) -> &'static str {
-        match self {
-            ProposalKind::Activate => "Activate feature gate",
-            ProposalKind::Revoke => "Revoke feature gate",
-            ProposalKind::Rekey => "Rekey (config change)",
-            ProposalKind::ChildAction => "Child multisig action",
-            ProposalKind::Other => "Vault transaction",
-            ProposalKind::Unknown => "Unknown",
-        }
-    }
-
-    fn transaction_kind(self) -> Option<TransactionKind> {
-        match self {
-            ProposalKind::Activate => Some(TransactionKind::Activate),
-            ProposalKind::Revoke => Some(TransactionKind::Revoke),
-            ProposalKind::Rekey => Some(TransactionKind::Rekey),
-            ProposalKind::ChildAction | ProposalKind::Other | ProposalKind::Unknown => None,
-        }
-    }
-}
-
-fn describe_transaction(rpc_client: &RpcClient, multisig: &Pubkey, index: u64) -> ProposalKind {
-    let (transaction_pda, _) = get_transaction_pda(multisig, index);
-    let Ok(account) = rpc_client.get_account(&transaction_pda) else {
-        return ProposalKind::Unknown;
-    };
-
-    if deserialize_squads_account::<ConfigTransaction>(
-        &account.data,
-        CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
-        "config transaction",
-    )
-    .is_ok()
-    {
-        return ProposalKind::Rekey;
-    }
-
-    let Ok(vault_tx) = deserialize_squads_account::<VaultTransaction>(
-        &account.data,
-        VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
-        "vault transaction",
-    ) else {
-        return ProposalKind::Unknown;
-    };
-
-    let programs: Vec<&Pubkey> = vault_tx
-        .message
-        .instructions
-        .iter()
-        .filter_map(|ix| {
-            vault_tx
-                .message
-                .account_keys
-                .get(ix.program_id_index as usize)
-        })
-        .collect();
-
-    if programs.iter().any(|p| **p == FEATURE_GATE_PROGRAM_ID) {
-        ProposalKind::Revoke
-    } else if programs
-        .iter()
-        .all(|p| **p == solana_system_interface::program::ID)
-    {
-        ProposalKind::Activate
-    } else if programs.iter().any(|p| **p == SQUADS_MULTISIG_PROGRAM_ID) {
-        ProposalKind::ChildAction
-    } else {
-        ProposalKind::Other
-    }
-}
-
-fn proposal_status_label(status: &ProposalStatus) -> &'static str {
-    match status {
-        ProposalStatus::Draft { .. } => "Draft",
-        ProposalStatus::Active { .. } => "Active",
-        ProposalStatus::Rejected { .. } => "Rejected",
-        ProposalStatus::Approved { .. } => "Approved",
-        ProposalStatus::Executing => "Executing",
-        ProposalStatus::Executed { .. } => "Executed",
-        ProposalStatus::Cancelled { .. } => "Cancelled",
-    }
 }
 
 /// Whether `action` can still be performed on a proposal, given its status and
