@@ -36,7 +36,9 @@ use feature_gate_multisig_tool::commands::verify::verify_command;
 use feature_gate_multisig_tool::feature_gate_program::{
     FEATURE_ACCOUNT_SIZE, FEATURE_GATE_PROGRAM_ID,
 };
-use feature_gate_multisig_tool::provision::{create_multisig, fetch_squads_multisig};
+use feature_gate_multisig_tool::provision::{
+    create_multisig, fetch_squads_multisig, get_squads_account_data_with_retry,
+};
 use feature_gate_multisig_tool::squads::{
     get_proposal_pda, get_vault_pda, Member, Permissions, Proposal, ProposalStatus,
     PERMISSION_VOTE, SQUADS_MULTISIG_PROGRAM_ID,
@@ -1401,4 +1403,46 @@ fn rpc_e2e_10_proposal_subcommands() {
         "feature should be Fresh again after the subcommand-driven revoke"
     );
     println!("✅ proposal subcommands drove the full lifecycle end to end");
+}
+
+/// Test 11: Squads governance reads reject accounts the Squads program does not
+/// own, so a discriminator alone cannot pass bytes off as governance data. The
+/// feature gate account (vault 0) is a real account at a real address that is
+/// never Squads-owned, which makes it the natural negative case.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_11_non_squads_accounts_are_rejected() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (_config, multisig, vault, _eoa_pubkeys, _eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test11", 2);
+
+    // Fund the vault so it exists as a plain System-owned account.
+    let airdrop = client
+        .request_airdrop(&vault, 10_000_000)
+        .expect("airdrop to vault");
+    client
+        .confirm_transaction(&airdrop)
+        .expect("confirm vault airdrop");
+
+    let error = get_squads_account_data_with_retry(&client, &vault)
+        .expect_err("a non-Squads account must not be readable as governance data");
+    let message = error.to_string();
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("not owned by the Squads program"),
+        "error should name the ownership failure, got: {message}"
+    );
+
+    // And the multisig itself still reads fine, so the check is not blanket.
+    let state = fetch_squads_multisig(&client, &multisig, "multisig")
+        .expect("the real multisig must still be readable");
+    assert!(
+        !state.members.is_empty(),
+        "the multisig should have members"
+    );
+    println!("✅ Ownership check rejects foreign accounts and admits the real multisig");
 }

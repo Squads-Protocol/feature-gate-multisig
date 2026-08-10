@@ -339,7 +339,12 @@ pub fn send_and_confirm_transaction(
     }
 }
 
-pub fn get_account_data_with_retry(
+/// Fetch a Squads-owned account with retry, rejecting any account the Squads
+/// program does not own before returning its data. Callers decode by
+/// discriminator, which establishes shape but not provenance - a discriminator
+/// is a constant anyone can prepend to bytes. Validating the owner here keeps
+/// that check in one place for every consumer.
+pub fn get_squads_account_data_with_retry(
     rpc_client: &RpcClient,
     pubkey: &Pubkey,
 ) -> eyre::Result<Vec<u8>> {
@@ -354,8 +359,18 @@ pub fn get_account_data_with_retry(
             std::thread::sleep(Duration::from_millis(delay));
         }
 
-        match rpc_client.get_account_data(pubkey) {
-            Ok(data) => return Ok(data),
+        match rpc_client.get_account(pubkey) {
+            Ok(account) => {
+                if account.owner != SQUADS_MULTISIG_PROGRAM_ID {
+                    return Err(eyre!(
+                        "Account {} is not owned by the Squads program (owner: {}); \
+                         refusing to decode it as Squads governance data",
+                        pubkey,
+                        account.owner
+                    ));
+                }
+                return Ok(account.data);
+            }
             Err(err) => {
                 let is_retryable = match &*err.kind {
                     ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
@@ -715,11 +730,31 @@ pub fn get_proposal_status_and_threshold(
     // Multisig threshold
     let ms = fetch_squads_multisig(rpc_client, multisig_address, "multisig")?;
 
-    // Proposal approved count and status
+    // Proposal approved count and status. These decide whether a quorum exists
+    // and whether execution may proceed, so the record has to be attributable to
+    // the Squads program and to this multisig - not merely decodable.
     let (proposal_pda, _) = get_proposal_pda(multisig_address, proposal_index);
     let prop_acc = rpc_client.get_account(&proposal_pda)?;
+    if prop_acc.owner != SQUADS_MULTISIG_PROGRAM_ID {
+        return Err(eyre!(
+            "Proposal {} is not owned by the Squads program (owner: {})",
+            proposal_pda,
+            prop_acc.owner
+        ));
+    }
     let prop: Proposal =
         deserialize_squads_account(&prop_acc.data, PROPOSAL_ACCOUNT_DISCRIMINATOR, "proposal")?;
+    if prop.multisig != *multisig_address || prop.transaction_index != proposal_index {
+        return Err(eyre!(
+            "Proposal {} records multisig {} index {}, but was read as multisig {} index {}. \
+             Refusing to trust its approval count or status.",
+            proposal_pda,
+            prop.multisig,
+            prop.transaction_index,
+            multisig_address,
+            proposal_index
+        ));
+    }
 
     Ok((prop.approved.len(), ms.threshold, prop.status))
 }
