@@ -34,6 +34,9 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
     Output::header(&format!("🔎 Verifying feature gate multisig {multisig}"));
 
     let mut seen = Vec::new();
+    // Warn-and-exit-0 reads as "verified" to anything checking the exit code,
+    // so an incomplete check has to fail the command.
+    let mut incomplete = false;
     for network in &networks {
         println!();
         Output::header(&format!(
@@ -52,36 +55,57 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
                     "Could not detect cluster from genesis hash ({e}); \
                      falling back to URL heuristic (mainnet: {fallback})."
                 ));
+                incomplete = true;
                 fallback
             }
         };
-        if let Some(ms) = verify_on_network(&rpc, &multisig, mainnet) {
+        let (found, failed) = verify_on_network(&rpc, &multisig, mainnet);
+        incomplete |= failed;
+        if let Some(ms) = found {
             seen.push((get_network_display(network), ms));
         }
     }
 
     report_cross_network_consistency(&seen);
 
+    if incomplete {
+        return Err(eyre::eyre!(
+            "Verification did not complete on every network; see the warnings above. \
+             The multisig has not been shown to be correct."
+        ));
+    }
     Ok(())
 }
 
-fn verify_on_network(rpc: &RpcClient, multisig: &Pubkey, is_mainnet: bool) -> Option<Multisig> {
+/// Returns the multisig if readable, and whether any check failed.
+fn verify_on_network(
+    rpc: &RpcClient,
+    multisig: &Pubkey,
+    is_mainnet: bool,
+) -> (Option<Multisig>, bool) {
+    let mut failed = false;
     match verify_squads_program(rpc) {
         Ok(p) => display_program_authenticity(&p, is_mainnet),
-        Err(e) => Output::warning(&format!("Could not verify Squads program: {e}")),
+        Err(e) => {
+            Output::warning(&format!("Could not verify Squads program: {e}"));
+            failed = true;
+        }
     }
     match verify_feature_gate(rpc, multisig) {
         Ok(v) => display_feature(&v),
-        Err(e) => Output::warning(&format!("Could not read feature gate account: {e}")),
+        Err(e) => {
+            Output::warning(&format!("Could not read feature gate account: {e}"));
+            failed = true;
+        }
     }
     match fetch_squads_multisig(rpc, multisig, "multisig") {
         Ok(ms) => {
             display_owners(&ms);
-            Some(ms)
+            (Some(ms), failed)
         }
         Err(e) => {
             Output::warning(&format!("Multisig not readable on this network: {e}"));
-            None
+            (None, true)
         }
     }
 }

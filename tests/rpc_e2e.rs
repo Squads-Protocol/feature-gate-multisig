@@ -1330,6 +1330,22 @@ fn rpc_e2e_9_verify_checks() {
     verify_command(&config, Some(child_multisig.to_string()))
         .expect("verify command should run cleanly against the activated multisig");
     println!("✅ verify command ran end to end");
+
+    // The checks warn and continue so every problem shows at once; that must
+    // not leave the command exiting 0 as though the multisig were verified.
+    let unreachable = Config {
+        networks: vec!["http://127.0.0.1:1".to_string()],
+        ..config.clone()
+    };
+    let error = verify_command(&unreachable, Some(child_multisig.to_string()))
+        .expect_err("verify must fail when its checks cannot be completed");
+    println!("✅ Refused with: {error}");
+    assert!(
+        error
+            .to_string()
+            .contains("has not been shown to be correct"),
+        "error should say verification did not complete, got: {error}"
+    );
 }
 
 /// Test 10: the non-interactive proposal subcommands drive a full feature gate

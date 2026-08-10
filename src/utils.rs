@@ -231,6 +231,26 @@ pub fn review_and_collect_configuration(
                 "Saved config has no valid voting members; at least one is required"
             ));
         }
+        // An explicit --threshold wins over the saved value, but must still be
+        // reachable with the saved members.
+        if let Some(requested) = threshold {
+            if usize::from(requested) > parsed_members.len() {
+                return Err(eyre::eyre!(
+                    "Requested threshold {} exceeds the {} voting member(s) in the saved configuration",
+                    requested,
+                    parsed_members.len()
+                ));
+            }
+            if requested != config.threshold {
+                println!(
+                    "  {} Using threshold {} from the command line instead of the saved {}",
+                    "ℹ️".bright_cyan(),
+                    requested,
+                    config.threshold
+                );
+            }
+            return Ok((requested, parsed_members));
+        }
         if config.threshold == 0 || usize::from(config.threshold) > parsed_members.len() {
             println!(
                 "  {} Saved threshold ({}) is invalid for {} voting member(s), prompting for new value",

@@ -212,7 +212,9 @@ fn resolve_voting_key(config: &Config, flag: Option<&str>) -> Result<Pubkey> {
             .prompt()
             .unwrap_or(false)
     {
-        let mut updated = config.clone();
+        // Save against the on-disk config: `--network` has already narrowed
+        // this one, so saving it would drop the other networks.
+        let mut updated = crate::utils::load_config().unwrap_or_else(|_| config.clone());
         updated.voting_key = Some(key.to_string());
         save_config(&updated)?;
         Output::success("Voting key saved to config.");
