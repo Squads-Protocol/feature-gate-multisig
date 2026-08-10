@@ -79,7 +79,29 @@ pub fn fetch_squads_multisig(
             acc.owner
         ));
     }
-    deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, account_kind)
+    let multisig: crate::squads::Multisig =
+        deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, account_kind)?;
+
+    // Owner and discriminator only prove "some Squads multisig". Binding
+    // create_key back through the PDA derivation is what proves it is *this*
+    // one, and the Squads program enforces that same derivation at creation, so
+    // a genuine account always satisfies it. Without the check, an account body
+    // served for the requested address could carry an attacker-chosen member set
+    // and threshold - which the rekey classifier, `verify_member_permission`,
+    // and the approval-quorum math all trust as ground truth.
+    let (derived, derived_bump) = crate::squads::get_multisig_pda(&multisig.create_key);
+    if derived != *address || derived_bump != multisig.bump {
+        return Err(eyre!(
+            "{} {} does not match the account it was read from: its create_key {} derives to {}. \
+             Refusing to trust its members or threshold.",
+            account_kind,
+            address,
+            multisig.create_key,
+            derived
+        ));
+    }
+
+    Ok(multisig)
 }
 
 /// Best-effort reverse lookup from a feature gate account to its multisig.

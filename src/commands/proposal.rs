@@ -229,21 +229,38 @@ pub(crate) fn describe_transaction(
     let Ok(account) = rpc_client.get_account(&transaction_pda) else {
         return ProposalKind::Unknown;
     };
+    // Every kind below becomes the reassuring label a signer approves on, so it
+    // has to describe an account the Squads program actually owns - not merely
+    // bytes that happen to decode. Decoding alone is not authentication.
+    if account.owner != SQUADS_MULTISIG_PROGRAM_ID {
+        return ProposalKind::Unknown;
+    }
 
     if let Ok(config_tx) = deserialize_squads_account::<ConfigTransaction>(
         &account.data,
         CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
         "config transaction",
     ) {
+        // A decoded body must also claim the multisig and index that were asked
+        // for; otherwise a transaction from elsewhere could be classified as
+        // though it belonged to this proposal.
+        if config_tx.multisig != *multisig || config_tx.index != index {
+            return ProposalKind::Unknown;
+        }
         // Classify a config transaction as Rekey only when its actions are the
         // canonical brick set, not merely because it is a config transaction.
         // A config change that adds a member or lowers the threshold must not
         // wear the benign "Rekey" label. Compared against the current members,
         // which equal the rekey's targets until it executes.
-        let members = fetch_squads_multisig(rpc_client, multisig, "multisig")
-            .map(|ms| ms.members)
-            .unwrap_or_default();
-        return if is_canonical_rekey(&config_tx.actions, &members) {
+        //
+        // Fail closed when they can't be read: `build_config_actions_for_kind`
+        // emits exactly [AddMember(default), ChangeThreshold(1)] for an empty
+        // member list, which is byte-identical to a pure threshold weakening, so
+        // a defaulted baseline would certify that attack as a benign "Rekey".
+        let Ok(current) = fetch_squads_multisig(rpc_client, multisig, "multisig") else {
+            return ProposalKind::Unknown;
+        };
+        return if is_canonical_rekey(&config_tx.actions, &current.members) {
             ProposalKind::Rekey
         } else {
             ProposalKind::Other
@@ -257,6 +274,12 @@ pub(crate) fn describe_transaction(
     ) else {
         return ProposalKind::Unknown;
     };
+    // `classify_vault_message` binds the message to vault 0's feature gate, so a
+    // transaction that spends from a different vault must not be matched against
+    // it either.
+    if vault_tx.multisig != *multisig || vault_tx.index != index || vault_tx.vault_index != 0 {
+        return ProposalKind::Unknown;
+    }
 
     classify_vault_message(&vault_tx.message, multisig)
 }
@@ -267,6 +290,13 @@ pub(crate) fn describe_transaction(
 /// added member, a lowered threshold on its own - is not a rekey and must not
 /// be labeled one.
 fn is_canonical_rekey(actions: &[crate::squads::ConfigAction], members: &[Member]) -> bool {
+    // A real multisig always has at least one member, and an empty baseline
+    // collapses the canonical set to a bare AddMember + ChangeThreshold(1) pair
+    // that a threshold-weakening config change matches exactly. Never certify a
+    // rekey against one, whatever the caller passed.
+    if members.is_empty() {
+        return false;
+    }
     match build_config_actions_for_kind(TransactionKind::Rekey, members) {
         Ok(expected) => actions == expected.as_slice(),
         Err(_) => false,
@@ -504,6 +534,41 @@ mod tests {
             },
         });
         assert!(!is_canonical_rekey(&tampered, &members));
+    }
+
+    /// An unreadable multisig used to default to an empty member list. The
+    /// canonical action set for zero members has no RemoveMember entries, so it
+    /// collapses to exactly the two actions of a pure threshold weakening -
+    /// which would then be certified as a benign "Rekey".
+    #[test]
+    fn threshold_weakening_is_not_a_rekey_against_an_empty_member_set() {
+        use crate::squads::{ConfigAction, Member, Permissions};
+
+        let attack = vec![
+            ConfigAction::AddMember {
+                new_member: Member {
+                    key: Pubkey::default(),
+                    permissions: Permissions::all(),
+                },
+            },
+            ConfigAction::ChangeThreshold { new_threshold: 1 },
+        ];
+
+        // The collapse this guards against: with no members, the "canonical"
+        // set and the attack are byte-identical.
+        let collapsed = build_config_actions_for_kind(TransactionKind::Rekey, &[]).unwrap();
+        assert_eq!(collapsed, attack);
+
+        // So an empty baseline must never certify a rekey.
+        assert!(!is_canonical_rekey(&attack, &[]));
+
+        // Against the real members it is plainly not the canonical set, because
+        // that set has to remove each of them.
+        let members = vec![Member {
+            key: Pubkey::new_unique(),
+            permissions: Permissions::all(),
+        }];
+        assert!(!is_canonical_rekey(&attack, &members));
     }
 
     #[test]
