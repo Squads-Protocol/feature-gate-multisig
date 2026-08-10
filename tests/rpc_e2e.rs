@@ -2038,3 +2038,72 @@ fn rpc_e2e_16_transaction_from_another_index_is_rejected() {
     );
     println!("✅ Substituted transaction body rejected end to end");
 }
+
+/// Test 17: a canonical rekey adds an unsignable member, drops the threshold to
+/// 1, and removes everyone who can sign. Authorizing that is irreversible, so
+/// `--yes` must not stand in for the decision - and must not exit 0 having
+/// silently done nothing, which would read as success to a script.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_17_rekey_is_not_authorized_by_assume_yes() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test17", 2);
+
+    // Index 1 is the pre-created activation; the rekey lands at index 2.
+    proposal_command(
+        &config,
+        ProposalCommand::Propose,
+        ProposalCommandArgs {
+            multisig: multisig.to_string(),
+            kind: TransactionKind::Rekey,
+            voting_key: Some(eoa_pubkeys[0].to_string()),
+            keypair: Some(eoa_keypaths[0].clone()),
+            index: None,
+        },
+    )
+    .expect("propose rekey at index 2");
+
+    let approve_rekey = || {
+        proposal_command(
+            &config,
+            ProposalCommand::Approve,
+            ProposalCommandArgs {
+                multisig: multisig.to_string(),
+                kind: TransactionKind::Rekey,
+                voting_key: Some(eoa_pubkeys[0].to_string()),
+                keypair: Some(eoa_keypaths[0].clone()),
+                index: Some(2),
+            },
+        )
+    };
+
+    let error = with_assume_yes(|| approve_rekey().expect_err("--yes must not authorize a rekey"));
+    let message = error.to_string();
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("--yes"),
+        "the error should explain that --yes cannot authorize this, got: {message}"
+    );
+
+    let proposal = proposal_at(&client, &multisig, 2);
+    assert!(
+        proposal.approved.is_empty(),
+        "no rekey approval should have landed, got {:?}",
+        proposal.approved
+    );
+
+    // An operator who does decide is still able to approve it.
+    approve_rekey().expect("an explicit approval should still work");
+    let proposal = proposal_at(&client, &multisig, 2);
+    assert_eq!(
+        proposal.approved,
+        vec![eoa_pubkeys[0]],
+        "the explicit approval should have landed"
+    );
+    println!("✅ Rekey refused under --yes, accepted on an explicit decision");
+}

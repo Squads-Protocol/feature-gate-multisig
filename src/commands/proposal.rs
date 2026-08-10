@@ -239,7 +239,7 @@ impl ProposalKind {
         match self {
             ProposalKind::Activate => "Activate feature gate",
             ProposalKind::Revoke => "Revoke feature gate",
-            ProposalKind::Rekey => "Rekey (config change)",
+            ProposalKind::Rekey => "Rekey - PERMANENTLY DISABLES VOTING",
             ProposalKind::ChildAction => "Child multisig action",
             ProposalKind::Other => "Vault transaction",
             ProposalKind::Unknown => "Unknown",
