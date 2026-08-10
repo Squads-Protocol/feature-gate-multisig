@@ -1,7 +1,9 @@
 use crate::commands::proposal::{describe_transaction, proposal_status_label, ProposalKind};
 use crate::commands::verify::report_cross_network_consistency;
 use crate::output::Output;
-use crate::provision::{create_rpc_client, fetch_squads_multisig, get_account_data_with_retry};
+use crate::provision::{
+    create_rpc_client, fetch_squads_multisig, get_squads_account_data_with_retry,
+};
 use crate::squads::{
     deserialize_squads_account, get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction,
     ConfigTransaction, Multisig, Proposal, ProposalStatus, VaultTransaction,
@@ -77,11 +79,14 @@ fn show_multisig(
         .any(|kind| matches!(kind, ProposalKind::ChildAction));
 
     println!();
-    let networks = if config.networks.is_empty() {
-        vec![rpc_url.to_string()]
-    } else {
-        config.networks.clone()
-    };
+    // Always sweep the endpoint being inspected. Reading proposals from it but
+    // feature state only from the saved list meant a `--network <url>` outside
+    // that list reported another cluster's state, and skipped the rekey check
+    // for the one on screen.
+    let mut networks = config.networks.clone();
+    if !networks.iter().any(|n| n == rpc_url) {
+        networks.insert(0, rpc_url.to_string());
+    }
     let mut network_multisigs: Vec<(&str, Multisig)> = Vec::new();
 
     if looks_like_parent {
@@ -303,14 +308,17 @@ fn display_full_details(rpc_client: &RpcClient, multisig_pubkey: &Pubkey, tx_ind
         proposal_pda.to_string().bright_white()
     );
     println!();
-    if let Err(e) = fetch_and_display_transaction(rpc_client, &transaction_pda, tx_index) {
+    if let Err(e) =
+        fetch_and_display_transaction(rpc_client, multisig_pubkey, &transaction_pda, tx_index)
+    {
         println!(
             "❌ Failed to fetch transaction {}: {}",
             tx_index,
             e.to_string().bright_red()
         );
     }
-    if let Err(e) = fetch_and_display_proposal(rpc_client, &proposal_pda, tx_index) {
+    if let Err(e) = fetch_and_display_proposal(rpc_client, multisig_pubkey, &proposal_pda, tx_index)
+    {
         println!(
             "❌ Failed to fetch proposal {}: {}",
             tx_index,
@@ -412,13 +420,14 @@ enum TransactionType {
 
 fn fetch_and_display_transaction(
     rpc_client: &RpcClient,
+    multisig_pubkey: &Pubkey,
     transaction_pda: &Pubkey,
     tx_index: u64,
 ) -> Result<()> {
     println!("📦 Transaction Account Data:");
 
     // Fetch the transaction account
-    let account_data = match get_account_data_with_retry(rpc_client, transaction_pda) {
+    let account_data = match get_squads_account_data_with_retry(rpc_client, transaction_pda) {
         Ok(data) => data,
         Err(e) => {
             if e.to_string().contains("AccountNotFound") {
@@ -461,6 +470,21 @@ fn fetch_and_display_transaction(
             return Ok(());
         }
     };
+
+    // This view exists so an operator can inspect a proposal the classifier
+    // could not vouch for, so it must not render a record that belongs to some
+    // other multisig or index as though it were this one.
+    let (claimed_multisig, claimed_index) = match &transaction {
+        TransactionType::Vault(tx) => (tx.multisig, tx.index),
+        TransactionType::Config(tx) => (tx.multisig, tx.index),
+    };
+    if claimed_multisig != *multisig_pubkey || claimed_index != tx_index {
+        println!(
+            "  ❌ Account records multisig {} index {}, not multisig {} index {}; not displaying it",
+            claimed_multisig, claimed_index, multisig_pubkey, tx_index
+        );
+        return Ok(());
+    }
 
     match transaction {
         TransactionType::Vault(transaction) => {
@@ -686,27 +710,19 @@ fn display_vault_transaction(transaction: &VaultTransaction, tx_index: u64) {
                         .join(", ")
                 };
 
-                // Format instruction data as hex bytes
+                // Print data in full. Truncating hid the tail of an `assign`,
+                // whose last 32 bytes are the new owner - the field that tells a
+                // hijack from a real activation, in the view meant for judging
+                // exactly that.
                 let data_str = if instruction.data.is_empty() {
                     "Empty".to_string()
-                } else if instruction.data.len() <= 32 {
-                    // Show full data for small instructions
+                } else {
                     instruction
                         .data
                         .iter()
                         .map(|b| format!("{:02x}", b))
                         .collect::<Vec<_>>()
                         .join(" ")
-                } else {
-                    // Show first 16 bytes + length for large instructions
-                    let preview = instruction
-                        .data
-                        .iter()
-                        .take(16)
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    format!("{} ... ({} bytes total)", preview, instruction.data.len())
                 };
 
                 InstructionDetails {
@@ -779,13 +795,14 @@ fn display_vault_transaction(transaction: &VaultTransaction, tx_index: u64) {
 
 fn fetch_and_display_proposal(
     rpc_client: &RpcClient,
+    multisig_pubkey: &Pubkey,
     proposal_pda: &Pubkey,
     tx_index: u64,
 ) -> Result<()> {
     println!("🗳️  Proposal Account Data:");
 
     // Fetch the proposal account
-    let account_data = match get_account_data_with_retry(rpc_client, proposal_pda) {
+    let account_data = match get_squads_account_data_with_retry(rpc_client, proposal_pda) {
         Ok(data) => data,
         Err(e) => {
             if e.to_string().contains("AccountNotFound") {
@@ -811,6 +828,16 @@ fn fetch_and_display_proposal(
                 return Ok(());
             }
         };
+
+    // The approval and rejection rosters below are what an operator counts votes
+    // from, so the record has to belong to the multisig and index being viewed.
+    if proposal.multisig != *multisig_pubkey || proposal.transaction_index != tx_index {
+        println!(
+            "  ❌ Proposal records multisig {} index {}, not multisig {} index {}; not displaying it",
+            proposal.multisig, proposal.transaction_index, multisig_pubkey, tx_index
+        );
+        return Ok(());
+    }
 
     // Display proposal details in a table
     #[derive(Tabled)]

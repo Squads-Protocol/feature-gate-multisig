@@ -79,7 +79,29 @@ pub fn fetch_squads_multisig(
             acc.owner
         ));
     }
-    deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, account_kind)
+    let multisig: crate::squads::Multisig =
+        deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, account_kind)?;
+
+    // Owner and discriminator only prove "some Squads multisig". Binding
+    // create_key back through the PDA derivation is what proves it is *this*
+    // one, and the Squads program enforces that same derivation at creation, so
+    // a genuine account always satisfies it. Without the check, an account body
+    // served for the requested address could carry an attacker-chosen member set
+    // and threshold - which the rekey classifier, `verify_member_permission`,
+    // and the approval-quorum math all trust as ground truth.
+    let (derived, derived_bump) = crate::squads::get_multisig_pda(&multisig.create_key);
+    if derived != *address || derived_bump != multisig.bump {
+        return Err(eyre!(
+            "{} {} does not match the account it was read from: its create_key {} derives to {}. \
+             Refusing to trust its members or threshold.",
+            account_kind,
+            address,
+            multisig.create_key,
+            derived
+        ));
+    }
+
+    Ok(multisig)
 }
 
 /// Best-effort reverse lookup from a feature gate account to its multisig.
@@ -307,8 +329,11 @@ pub fn send_and_confirm_transaction(
         }
 
         if confirmation_start.elapsed().as_millis() as u64 > CONFIRMATION_TIMEOUT_MS {
+            // A timeout is not a rejection - the transaction may still land.
+            // Rerunning blindly would allocate a second proposal at the next index.
             return Err(eyre!(
-                "Transaction {} not confirmed within {}ms",
+                "Transaction {} was not confirmed within {}ms. It may still have landed: \
+                 check the signature before rerunning, or a repeat will create a duplicate.",
                 signature,
                 CONFIRMATION_TIMEOUT_MS
             ));
@@ -317,7 +342,12 @@ pub fn send_and_confirm_transaction(
     }
 }
 
-pub fn get_account_data_with_retry(
+/// Fetch a Squads-owned account with retry, rejecting any account the Squads
+/// program does not own before returning its data. Callers decode by
+/// discriminator, which establishes shape but not provenance - a discriminator
+/// is a constant anyone can prepend to bytes. Validating the owner here keeps
+/// that check in one place for every consumer.
+pub fn get_squads_account_data_with_retry(
     rpc_client: &RpcClient,
     pubkey: &Pubkey,
 ) -> eyre::Result<Vec<u8>> {
@@ -332,8 +362,18 @@ pub fn get_account_data_with_retry(
             std::thread::sleep(Duration::from_millis(delay));
         }
 
-        match rpc_client.get_account_data(pubkey) {
-            Ok(data) => return Ok(data),
+        match rpc_client.get_account(pubkey) {
+            Ok(account) => {
+                if account.owner != SQUADS_MULTISIG_PROGRAM_ID {
+                    return Err(eyre!(
+                        "Account {} is not owned by the Squads program (owner: {}); \
+                         refusing to decode it as Squads governance data",
+                        pubkey,
+                        account.owner
+                    ));
+                }
+                return Ok(account.data);
+            }
             Err(err) => {
                 let is_retryable = match &*err.kind {
                     ClientErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
@@ -693,11 +733,31 @@ pub fn get_proposal_status_and_threshold(
     // Multisig threshold
     let ms = fetch_squads_multisig(rpc_client, multisig_address, "multisig")?;
 
-    // Proposal approved count and status
+    // Proposal approved count and status. These decide whether a quorum exists
+    // and whether execution may proceed, so the record has to be attributable to
+    // the Squads program and to this multisig - not merely decodable.
     let (proposal_pda, _) = get_proposal_pda(multisig_address, proposal_index);
     let prop_acc = rpc_client.get_account(&proposal_pda)?;
+    if prop_acc.owner != SQUADS_MULTISIG_PROGRAM_ID {
+        return Err(eyre!(
+            "Proposal {} is not owned by the Squads program (owner: {})",
+            proposal_pda,
+            prop_acc.owner
+        ));
+    }
     let prop: Proposal =
         deserialize_squads_account(&prop_acc.data, PROPOSAL_ACCOUNT_DISCRIMINATOR, "proposal")?;
+    if prop.multisig != *multisig_address || prop.transaction_index != proposal_index {
+        return Err(eyre!(
+            "Proposal {} records multisig {} index {}, but was read as multisig {} index {}. \
+             Refusing to trust its approval count or status.",
+            proposal_pda,
+            prop.multisig,
+            prop.transaction_index,
+            multisig_address,
+            proposal_index
+        ));
+    }
 
     Ok((prop.approved.len(), ms.threshold, prop.status))
 }
@@ -958,7 +1018,7 @@ pub fn create_execute_transaction_message(
 
     // All accounts from the stored message are passed through to the Squads program,
     // including the parent multisig needed for vault PDA derivation during CPI.
-    let execution_account_metas = transaction_message.execution_account_metas();
+    let execution_account_metas = transaction_message.execution_account_metas()?;
 
     let account_keys = MultisigExecuteTransactionAccounts {
         multisig: *multisig_address,

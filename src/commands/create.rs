@@ -184,6 +184,7 @@ fn deploy_to_saved_networks(
     threshold: u16,
 ) -> Result<Vec<DeploymentResult>> {
     let mut deployments = Vec::new();
+    let mut failed = Vec::new();
 
     for (i, rpc_url) in networks.iter().enumerate() {
         match deploy_to_single_network(
@@ -204,6 +205,7 @@ fn deploy_to_saved_networks(
                     rpc_url.bright_white(),
                     e.to_string().red()
                 );
+                failed.push(rpc_url.clone());
             }
         }
 
@@ -211,6 +213,17 @@ fn deploy_to_saved_networks(
             println!("\n{} Proceeding to next network...", "⏳".bright_yellow());
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+    }
+
+    // A per-network error scrolls past above the summary, so restate it here:
+    // the multisig exists on some clusters and not others.
+    if !failed.is_empty() {
+        Output::warning(&format!(
+            "Deployed to {} of {} networks. Missing on: {}. The governance address is not usable there until it is deployed.",
+            deployments.len(),
+            networks.len(),
+            failed.join(", ")
+        ));
     }
 
     Ok(deployments)
@@ -284,17 +297,18 @@ fn print_deployment_summary(
     println!();
     Output::header("👀 Deployment Complete");
 
-    // Show which networks were deployed to
-    if deployments.len() > 1 {
-        println!();
-        Output::field("Networks deployed", &deployments.len().to_string());
-        for d in deployments {
-            println!(
-                "  {} {}",
-                "✓".bright_green(),
-                get_network_display(&d.rpc_url).bright_white()
-            );
-        }
+    // Always name the networks. Listing them only for multi-network runs meant a
+    // partial deployment printed no cluster at all, leaving no way to tell from
+    // the summary where the multisig actually exists.
+    println!();
+    Output::field("Networks deployed", &deployments.len().to_string());
+    for d in deployments {
+        println!(
+            "  {} {} ({})",
+            "✓".bright_green(),
+            get_network_display(&d.rpc_url).bright_white(),
+            d.rpc_url
+        );
     }
 
     // Feature Gate ID is the vault address (index 0)

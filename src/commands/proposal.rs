@@ -4,9 +4,9 @@
 
 use crate::commands::transaction_generation::{
     approve_common_config_change, approve_common_feature_gate_proposal,
-    build_config_actions_for_kind, create_feature_gate_proposal, execute_common_config_change,
-    execute_common_feature_gate_proposal, reject_common_feature_gate_proposal,
-    rekey_multisig_feature_gate, TransactionKind,
+    build_config_actions_for_kind, confirm_action, create_feature_gate_proposal,
+    execute_common_config_change, execute_common_feature_gate_proposal,
+    reject_common_feature_gate_proposal, rekey_multisig_feature_gate, TransactionKind,
 };
 use crate::feature_gate_program::{activate_feature_funded, revoke_pending_activation};
 use crate::output::Output;
@@ -123,13 +123,30 @@ pub fn proposal_command(
     }
 }
 
+/// The error for a proposal whose transaction account could not be
+/// authenticated. Shared with the interactive picker so both entry points refuse
+/// it for the same stated reason.
+pub(crate) fn unverifiable_proposal_error(index: u64) -> eyre::Report {
+    eyre::eyre!(
+        "Proposal #{index} could not be verified: its transaction account could not be read, \
+         is not owned by the Squads program, or does not record this multisig and index. \
+         Refusing to act on it. If the endpoint is unreliable, retry; if it persists, read the \
+         multisig from a different RPC endpoint before acting."
+    )
+}
+
 /// Guard an approve/reject/execute against acting on a mismatched or disguised
 /// transaction. The on-chain transaction at `index` is classified structurally
-/// (see [`classify_vault_message`]):
+/// (see [`classify_vault_message`]), and the three outcomes are treated
+/// differently because they carry different amounts of information:
 /// - a recognized kind that differs from `requested` is a hard error;
-/// - an unrecognized transaction (one this tool did not build) is not blocked -
-///   another Squads client may have created it - but the user is warned that its
-///   contents can't be verified and pointed at the full `show --index` view.
+/// - [`ProposalKind::Unknown`] means nothing could be established - the account
+///   was unreadable, foreign-owned, or recorded a different multisig or index -
+///   so there is nothing for a signer to consent to and the action is refused;
+/// - an authenticated transaction whose shape this tool did not build is not
+///   blocked, since another Squads client may legitimately have created it, but
+///   it takes an explicit decision. `--yes` resolves this confirmation to its
+///   `false` default and therefore aborts rather than force-approving.
 fn reconcile_requested_kind(
     rpc_client: &RpcClient,
     multisig: &Pubkey,
@@ -137,21 +154,40 @@ fn reconcile_requested_kind(
     requested: TransactionKind,
 ) -> Result<()> {
     let on_chain = describe_transaction(rpc_client, multisig, index);
-    match on_chain.transaction_kind() {
-        Some(actual) if actual == requested => Ok(()),
-        Some(actual) => Err(eyre::eyre!(
-            "Proposal #{index} is a {} on-chain, but you specified {}. Refusing to act on a different transaction than intended.",
-            actual.label(),
-            requested.label(),
-        )),
-        None => {
-            Output::warning(&format!(
-                "Proposal #{index} is \"{}\": this tool cannot verify what it does from its on-chain instructions. Inspect it with `show <multisig> --index {index}` and only proceed if you independently trust it.",
-                on_chain.label()
-            ));
+    if let Some(actual) = on_chain.transaction_kind() {
+        return if actual == requested {
             Ok(())
-        }
+        } else {
+            Err(eyre::eyre!(
+                "Proposal #{index} is a {} on-chain, but you specified {}. Refusing to act on a different transaction than intended.",
+                actual.label(),
+                requested.label(),
+            ))
+        };
     }
+
+    if on_chain.is_unverifiable() {
+        return Err(unverifiable_proposal_error(index));
+    }
+
+    Output::warning(&format!(
+        "Proposal #{index} is \"{}\": this tool cannot verify what it does from its on-chain instructions. Inspect it with `show <multisig> --index {index}` and only proceed if you independently trust it.",
+        on_chain.label()
+    ));
+    if !confirm_action(
+        &format!("Act on unverified proposal #{index} anyway?"),
+        false,
+    ) {
+        return Err(eyre::eyre!(
+            "Aborted: proposal #{index} was not verified and was not explicitly approved.{}",
+            if is_assume_yes() {
+                " --yes does not stand in for that decision; re-run without it to review and confirm."
+            } else {
+                ""
+            }
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the voting key: explicit flag, then the config default, then a prompt.
@@ -176,7 +212,9 @@ fn resolve_voting_key(config: &Config, flag: Option<&str>) -> Result<Pubkey> {
             .prompt()
             .unwrap_or(false)
     {
-        let mut updated = config.clone();
+        // Save against the on-disk config: `--network` has already narrowed
+        // this one, so saving it would drop the other networks.
+        let mut updated = crate::utils::load_config().unwrap_or_else(|_| config.clone());
         updated.voting_key = Some(key.to_string());
         save_config(&updated)?;
         Output::success("Voting key saved to config.");
@@ -203,7 +241,7 @@ impl ProposalKind {
         match self {
             ProposalKind::Activate => "Activate feature gate",
             ProposalKind::Revoke => "Revoke feature gate",
-            ProposalKind::Rekey => "Rekey (config change)",
+            ProposalKind::Rekey => "Rekey - PERMANENTLY DISABLES VOTING",
             ProposalKind::ChildAction => "Child multisig action",
             ProposalKind::Other => "Vault transaction",
             ProposalKind::Unknown => "Unknown",
@@ -218,6 +256,22 @@ impl ProposalKind {
             ProposalKind::ChildAction | ProposalKind::Other | ProposalKind::Unknown => None,
         }
     }
+
+    /// True when nothing at all could be established about the transaction: it
+    /// was unreadable, not owned by the Squads program, or recorded a different
+    /// multisig or index. Distinct from a transaction that was authenticated but
+    /// simply isn't a shape this tool builds - that one a signer can still
+    /// inspect and decide on, whereas this one offers nothing to decide from.
+    pub(crate) fn is_unverifiable(self) -> bool {
+        match self {
+            ProposalKind::Unknown => true,
+            ProposalKind::Activate
+            | ProposalKind::Revoke
+            | ProposalKind::Rekey
+            | ProposalKind::ChildAction
+            | ProposalKind::Other => false,
+        }
+    }
 }
 
 pub(crate) fn describe_transaction(
@@ -229,21 +283,38 @@ pub(crate) fn describe_transaction(
     let Ok(account) = rpc_client.get_account(&transaction_pda) else {
         return ProposalKind::Unknown;
     };
+    // Every kind below becomes the reassuring label a signer approves on, so it
+    // has to describe an account the Squads program actually owns - not merely
+    // bytes that happen to decode. Decoding alone is not authentication.
+    if account.owner != SQUADS_MULTISIG_PROGRAM_ID {
+        return ProposalKind::Unknown;
+    }
 
     if let Ok(config_tx) = deserialize_squads_account::<ConfigTransaction>(
         &account.data,
         CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
         "config transaction",
     ) {
+        // A decoded body must also claim the multisig and index that were asked
+        // for; otherwise a transaction from elsewhere could be classified as
+        // though it belonged to this proposal.
+        if config_tx.multisig != *multisig || config_tx.index != index {
+            return ProposalKind::Unknown;
+        }
         // Classify a config transaction as Rekey only when its actions are the
         // canonical brick set, not merely because it is a config transaction.
         // A config change that adds a member or lowers the threshold must not
         // wear the benign "Rekey" label. Compared against the current members,
         // which equal the rekey's targets until it executes.
-        let members = fetch_squads_multisig(rpc_client, multisig, "multisig")
-            .map(|ms| ms.members)
-            .unwrap_or_default();
-        return if is_canonical_rekey(&config_tx.actions, &members) {
+        //
+        // Fail closed when they can't be read: `build_config_actions_for_kind`
+        // emits exactly [AddMember(default), ChangeThreshold(1)] for an empty
+        // member list, which is byte-identical to a pure threshold weakening, so
+        // a defaulted baseline would certify that attack as a benign "Rekey".
+        let Ok(current) = fetch_squads_multisig(rpc_client, multisig, "multisig") else {
+            return ProposalKind::Unknown;
+        };
+        return if is_canonical_rekey(&config_tx.actions, &current.members) {
             ProposalKind::Rekey
         } else {
             ProposalKind::Other
@@ -257,6 +328,12 @@ pub(crate) fn describe_transaction(
     ) else {
         return ProposalKind::Unknown;
     };
+    // `classify_vault_message` binds the message to vault 0's feature gate, so a
+    // transaction that spends from a different vault must not be matched against
+    // it either.
+    if vault_tx.multisig != *multisig || vault_tx.index != index || vault_tx.vault_index != 0 {
+        return ProposalKind::Unknown;
+    }
 
     classify_vault_message(&vault_tx.message, multisig)
 }
@@ -267,6 +344,13 @@ pub(crate) fn describe_transaction(
 /// added member, a lowered threshold on its own - is not a rekey and must not
 /// be labeled one.
 fn is_canonical_rekey(actions: &[crate::squads::ConfigAction], members: &[Member]) -> bool {
+    // A real multisig always has at least one member, and an empty baseline
+    // collapses the canonical set to a bare AddMember + ChangeThreshold(1) pair
+    // that a threshold-weakening config change matches exactly. Never certify a
+    // rekey against one, whatever the caller passed.
+    if members.is_empty() {
+        return false;
+    }
     match build_config_actions_for_kind(TransactionKind::Rekey, members) {
         Ok(expected) => actions == expected.as_slice(),
         Err(_) => false,
@@ -504,6 +588,76 @@ mod tests {
             },
         });
         assert!(!is_canonical_rekey(&tampered, &members));
+    }
+
+    /// An unreadable multisig used to default to an empty member list. The
+    /// canonical action set for zero members has no RemoveMember entries, so it
+    /// collapses to exactly the two actions of a pure threshold weakening -
+    /// which would then be certified as a benign "Rekey".
+    #[test]
+    fn threshold_weakening_is_not_a_rekey_against_an_empty_member_set() {
+        use crate::squads::{ConfigAction, Member, Permissions};
+
+        let attack = vec![
+            ConfigAction::AddMember {
+                new_member: Member {
+                    key: Pubkey::default(),
+                    permissions: Permissions::all(),
+                },
+            },
+            ConfigAction::ChangeThreshold { new_threshold: 1 },
+        ];
+
+        // The collapse this guards against: with no members, the "canonical"
+        // set and the attack are byte-identical.
+        let collapsed = build_config_actions_for_kind(TransactionKind::Rekey, &[]).unwrap();
+        assert_eq!(collapsed, attack);
+
+        // So an empty baseline must never certify a rekey.
+        assert!(!is_canonical_rekey(&attack, &[]));
+
+        // Against the real members it is plainly not the canonical set, because
+        // that set has to remove each of them.
+        let members = vec![Member {
+            key: Pubkey::new_unique(),
+            permissions: Permissions::all(),
+        }];
+        assert!(!is_canonical_rekey(&attack, &members));
+    }
+
+    /// Pins which classifications block an action. `Unknown` is the only one
+    /// that establishes nothing, so it is the only one refused outright; the
+    /// others were authenticated and a signer can still inspect and decide. A
+    /// new variant added without a deliberate choice here fails this test.
+    #[test]
+    fn only_unverifiable_classifications_block_an_action() {
+        let all = [
+            ProposalKind::Activate,
+            ProposalKind::Revoke,
+            ProposalKind::Rekey,
+            ProposalKind::ChildAction,
+            ProposalKind::Other,
+            ProposalKind::Unknown,
+        ];
+
+        for kind in all {
+            // A kind that maps to a TransactionKind was positively identified,
+            // so it must never be treated as unverifiable.
+            if kind.transaction_kind().is_some() {
+                assert!(
+                    !kind.is_unverifiable(),
+                    "{} was identified but reports unverifiable",
+                    kind.label()
+                );
+            }
+        }
+
+        assert!(ProposalKind::Unknown.is_unverifiable());
+
+        // Authenticated but unrecognized: warned about and gated on an explicit
+        // decision, not refused - another Squads client may have created it.
+        assert!(!ProposalKind::Other.is_unverifiable());
+        assert!(!ProposalKind::ChildAction.is_unverifiable());
     }
 
     #[test]

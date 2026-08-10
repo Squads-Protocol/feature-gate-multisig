@@ -1,4 +1,6 @@
-use crate::commands::proposal::{describe_transaction, proposal_status_label, ProposalKind};
+use crate::commands::proposal::{
+    describe_transaction, proposal_status_label, unverifiable_proposal_error, ProposalKind,
+};
 use crate::commands::{
     config_command, create_command, proposal_command, show_command, verify_command,
     ProposalCommand, ProposalCommandArgs, TransactionKind,
@@ -96,7 +98,7 @@ fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
     let network_config = Config {
-        networks: vec![rpc_url],
+        networks: vec![rpc_url.clone()],
         ..config.clone()
     };
 
@@ -122,6 +124,12 @@ fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -
         };
 
         let (index, proposal_kind) = prompt_for_proposal_index(&rpc_client, &multisig, command)?;
+        // Nothing could be established about an Unknown proposal, and the flow
+        // below refuses it anyway - so say so here rather than walking the user
+        // through choosing a type for a proposal that cannot be acted on.
+        if proposal_kind.is_unverifiable() {
+            return Err(unverifiable_proposal_error(index));
+        }
         let kind = match proposal_kind.transaction_kind() {
             Some(kind) => kind,
             // Not a shape this tool creates; the user has to say how to route it.
@@ -136,12 +144,16 @@ fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -
             }
         };
 
+        // Name the endpoint: the same governance address exists on several
+        // clusters, so which one is being signed against is part of the decision.
         let confirmed = Confirm::new(&format!(
-            "You're about to {} proposal #{} ({}) on feature gate {}. Continue?",
+            "You're about to {} proposal #{} ({}) on feature gate {} via {} ({}). Continue?",
             action_choice.to_lowercase(),
             index,
             proposal_kind.label(),
             feature_gate_id,
+            get_network_display(&rpc_url),
+            rpc_url,
         ))
         .with_default(true)
         .prompt()?;

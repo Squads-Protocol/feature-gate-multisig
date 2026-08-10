@@ -71,7 +71,9 @@ The contributor key receives Initiate-only permissions, while additional members
             long,
             help = "Number of required signatures (will be prompted if not provided)"
         )]
-        threshold: Option<u32>,
+        // Parse at the on-chain width so clap rejects out-of-range values;
+        // a wider type truncated instead, turning 65537 into 1.
+        threshold: Option<u16>,
         #[arg(
             short = 'k',
             long,
@@ -255,7 +257,7 @@ fn handle_command(command: Commands) -> Result<()> {
                     );
                     None
                 } else {
-                    Some(t as u16)
+                    Some(t)
                 }
             });
 

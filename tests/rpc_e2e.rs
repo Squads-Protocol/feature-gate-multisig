@@ -36,16 +36,21 @@ use feature_gate_multisig_tool::commands::verify::verify_command;
 use feature_gate_multisig_tool::feature_gate_program::{
     FEATURE_ACCOUNT_SIZE, FEATURE_GATE_PROGRAM_ID,
 };
-use feature_gate_multisig_tool::provision::{create_multisig, fetch_squads_multisig};
-use feature_gate_multisig_tool::squads::{
-    get_proposal_pda, get_vault_pda, Member, Permissions, Proposal, ProposalStatus,
-    PERMISSION_VOTE, SQUADS_MULTISIG_PROGRAM_ID,
+use feature_gate_multisig_tool::provision::{
+    build_squads_transaction_message, create_multisig, create_transaction_and_proposal_message,
+    fetch_squads_multisig, get_squads_account_data_with_retry, send_and_confirm_transaction,
 };
-use feature_gate_multisig_tool::utils::Config;
+use feature_gate_multisig_tool::squads::{
+    get_proposal_pda, get_transaction_pda, get_vault_pda, Member, Permissions, Proposal,
+    ProposalStatus, PERMISSION_VOTE, SQUADS_MULTISIG_PROGRAM_ID,
+};
+use feature_gate_multisig_tool::utils::{load_signer, Config, ASSUME_YES_ENV};
 use feature_gate_multisig_tool::verification::{
     is_autonomous, is_mainnet_cluster, is_rekeyed, verify_feature_gate, verify_squads_program,
     FeatureGateStatus,
 };
+use solana_message::VersionedMessage;
+use solana_transaction::versioned::VersionedTransaction;
 
 fn rpc_url() -> String {
     env::var("RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string())
@@ -1325,6 +1330,22 @@ fn rpc_e2e_9_verify_checks() {
     verify_command(&config, Some(child_multisig.to_string()))
         .expect("verify command should run cleanly against the activated multisig");
     println!("✅ verify command ran end to end");
+
+    // The checks warn and continue so every problem shows at once; that must
+    // not leave the command exiting 0 as though the multisig were verified.
+    let unreachable = Config {
+        networks: vec!["http://127.0.0.1:1".to_string()],
+        ..config.clone()
+    };
+    let error = verify_command(&unreachable, Some(child_multisig.to_string()))
+        .expect_err("verify must fail when its checks cannot be completed");
+    println!("✅ Refused with: {error}");
+    assert!(
+        error
+            .to_string()
+            .contains("has not been shown to be correct"),
+        "error should say verification did not complete, got: {error}"
+    );
 }
 
 /// Test 10: the non-interactive proposal subcommands drive a full feature gate
@@ -1401,4 +1422,704 @@ fn rpc_e2e_10_proposal_subcommands() {
         "feature should be Fresh again after the subcommand-driven revoke"
     );
     println!("✅ proposal subcommands drove the full lifecycle end to end");
+}
+
+/// Test 11: Squads governance reads reject accounts the Squads program does not
+/// own, so a discriminator alone cannot pass bytes off as governance data. The
+/// feature gate account (vault 0) is a real account at a real address that is
+/// never Squads-owned, which makes it the natural negative case.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_11_non_squads_accounts_are_rejected() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (_config, multisig, vault, _eoa_pubkeys, _eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test11", 2);
+
+    // Fund the vault so it exists as a plain System-owned account.
+    let airdrop = client
+        .request_airdrop(&vault, 10_000_000)
+        .expect("airdrop to vault");
+    client
+        .confirm_transaction(&airdrop)
+        .expect("confirm vault airdrop");
+
+    let error = get_squads_account_data_with_retry(&client, &vault)
+        .expect_err("a non-Squads account must not be readable as governance data");
+    let message = error.to_string();
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("not owned by the Squads program"),
+        "error should name the ownership failure, got: {message}"
+    );
+
+    // And the multisig itself still reads fine, so the check is not blanket.
+    let state = fetch_squads_multisig(&client, &multisig, "multisig")
+        .expect("the real multisig must still be readable");
+    assert!(
+        !state.members.is_empty(),
+        "the multisig should have members"
+    );
+    println!("✅ Ownership check rejects foreign accounts and admits the real multisig");
+}
+
+/// Create a real Squads vault proposal at the multisig's next index carrying
+/// `instructions`, signed by the member at `keypair_path`. Used to plant
+/// transactions this tool would never build, so the classifier and the guards
+/// around it can be tested against genuine on-chain accounts.
+fn propose_raw_vault_transaction(
+    client: &RpcClient,
+    multisig: &Pubkey,
+    vault: &Pubkey,
+    keypair_path: &str,
+    instructions: &[solana_instruction::Instruction],
+) -> u64 {
+    let signer = load_signer(keypair_path, "proposer").expect("load proposer keypair");
+    let state = fetch_squads_multisig(client, multisig, "multisig").expect("fetch multisig");
+    let index = state.transaction_index + 1;
+
+    let inner = build_squads_transaction_message(vault, instructions, &[])
+        .expect("compile inner vault message");
+    let blockhash = client.get_latest_blockhash().expect("blockhash");
+    let (message, _tx_pda, _proposal_pda) = create_transaction_and_proposal_message(
+        &signer.pubkey(),
+        &signer.pubkey(),
+        multisig,
+        index,
+        0,
+        inner,
+        None,
+        None,
+        blockhash,
+    )
+    .expect("build create-transaction-and-proposal message");
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*signer]).expect("sign");
+    send_and_confirm_transaction(&transaction, client).expect("create raw vault proposal");
+    index
+}
+
+/// Run `body` with the confirmation layer behaving as it does under `--yes`
+/// rather than under E2E auto-confirm, then restore E2E mode.
+///
+/// `confirm_action` short-circuits to `true` when `E2E_TEST_MODE` is set, which
+/// is what lets the other tests drive prompts unattended - but it also bypasses
+/// the safety gates entirely. Exercising a gate therefore means standing in the
+/// shoes of a real `--yes` operator. Tests run with `--test-threads=1`, so
+/// swapping process-global env here is safe.
+fn with_assume_yes<T>(body: impl FnOnce() -> T) -> T {
+    std::env::remove_var("E2E_TEST_MODE");
+    std::env::set_var(ASSUME_YES_ENV, "1");
+    let result = body();
+    std::env::remove_var(ASSUME_YES_ENV);
+    std::env::set_var("E2E_TEST_MODE", "1");
+    result
+}
+
+fn proposal_at(client: &RpcClient, multisig: &Pubkey, index: u64) -> Proposal {
+    let (proposal_pda, _) = get_proposal_pda(multisig, index);
+    let account = client
+        .get_account(&proposal_pda)
+        .expect("proposal account should exist");
+    BorshDeserialize::deserialize(&mut &account.data[8..]).expect("deserialize proposal")
+}
+
+/// Test 12: a genuine Squads vault proposal this tool did not build - a plain
+/// System transfer draining the feature gate vault - must not be actionable as
+/// an activation.
+///
+/// This is the look-alike the byte-exact classifier exists for: every program id
+/// in the message is the System program, which a program-id-only classifier
+/// labelled `Activate`. It must classify as an unrecognized vault transaction,
+/// and `--yes` must refuse to stand in for the operator's decision about it.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_12_system_lookalike_is_not_actionable_as_activate() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test12", 2);
+
+    // Fund the vault so the proposed transfer is actually payable; the point is
+    // that the tool refuses to act on it, not that it would fail on-chain.
+    let airdrop = client
+        .request_airdrop(&vault, 100_000_000)
+        .expect("airdrop to vault");
+    client
+        .confirm_transaction(&airdrop)
+        .expect("confirm vault airdrop");
+
+    let destination = Keypair::new().pubkey();
+    let index = propose_raw_vault_transaction(
+        &client,
+        &multisig,
+        &vault,
+        &eoa_keypaths[0],
+        &[solana_system_interface::instruction::transfer(
+            &vault,
+            &destination,
+            1_000_000,
+        )],
+    );
+    println!("✅ Planted an all-System vault proposal at index {index}");
+
+    let approve_as_activate = |voter: usize| {
+        proposal_command(
+            &config,
+            ProposalCommand::Approve,
+            ProposalCommandArgs {
+                multisig: multisig.to_string(),
+                kind: TransactionKind::Activate,
+                voting_key: Some(eoa_pubkeys[voter].to_string()),
+                keypair: Some(eoa_keypaths[voter].clone()),
+                index: Some(index),
+            },
+        )
+    };
+
+    // Under `--yes`, the unverified-proposal gate resolves to its `false`
+    // default and the action aborts instead of being force-approved.
+    let error = with_assume_yes(|| approve_as_activate(0).expect_err("approve must be refused"));
+    let message = error.to_string();
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("not verified") || message.contains("could not be verified"),
+        "error should say the proposal was not verified, got: {message}"
+    );
+    // Had it been mistaken for a recognized kind, the refusal would have been the
+    // kind-mismatch error instead - or there would have been no refusal at all.
+    assert!(
+        !message.contains("Refusing to act on a different transaction"),
+        "the look-alike should be unrecognized, not classified as another kind, got: {message}"
+    );
+
+    // Nothing was signed: the proposal carries no approvals.
+    let proposal = proposal_at(&client, &multisig, index);
+    assert!(
+        proposal.approved.is_empty(),
+        "no approval should have landed, got {:?}",
+        proposal.approved
+    );
+    assert!(
+        matches!(proposal.status, ProposalStatus::Active { .. }),
+        "proposal should still be Active"
+    );
+    println!("✅ All-System look-alike was refused and left unapproved");
+}
+
+/// Test 13: a proposal whose transaction account cannot be read establishes
+/// nothing, so it is refused outright rather than warned about. Unlike the
+/// unrecognized case this is not a decision the operator can be offered - there
+/// is no information to decide from - so E2E auto-confirm does not bypass it.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_13_unreadable_proposal_is_refused() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test13", 2);
+
+    // No transaction account exists at this index.
+    let missing_index = 9_999;
+    let error = proposal_command(
+        &config,
+        ProposalCommand::Approve,
+        ProposalCommandArgs {
+            multisig: multisig.to_string(),
+            kind: TransactionKind::Activate,
+            voting_key: Some(eoa_pubkeys[0].to_string()),
+            keypair: Some(eoa_keypaths[0].clone()),
+            index: Some(missing_index),
+        },
+    )
+    .expect_err("an unreadable proposal must be refused");
+
+    let message = error.to_string();
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("could not be verified"),
+        "error should name the verification failure, got: {message}"
+    );
+    println!("✅ Unreadable proposal was refused without prompting");
+}
+
+/// Test 14: the pre-created activation at index 1 must not be actionable as a
+/// revocation. A recognized kind that differs from the requested one is a hard
+/// error, and no signature may land.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_14_kind_mismatch_is_refused() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test14", 2);
+
+    // The create flow pre-creates the activation proposal at index 1.
+    let error = proposal_command(
+        &config,
+        ProposalCommand::Approve,
+        ProposalCommandArgs {
+            multisig: multisig.to_string(),
+            kind: TransactionKind::Revoke,
+            voting_key: Some(eoa_pubkeys[0].to_string()),
+            keypair: Some(eoa_keypaths[0].clone()),
+            index: Some(1),
+        },
+    )
+    .expect_err("approving an activation as a revocation must be refused");
+
+    let message = error.to_string();
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("Refusing to act on a different transaction"),
+        "error should be the kind-mismatch refusal, got: {message}"
+    );
+    assert!(
+        message.contains("Activate") && message.contains("Revoke"),
+        "error should name both the on-chain and requested kinds, got: {message}"
+    );
+
+    let proposal = proposal_at(&client, &multisig, 1);
+    assert!(
+        proposal.approved.is_empty(),
+        "no approval should have landed on the mismatched proposal, got {:?}",
+        proposal.approved
+    );
+
+    // The same proposal approves fine as what it actually is.
+    proposal_command(
+        &config,
+        ProposalCommand::Approve,
+        ProposalCommandArgs {
+            multisig: multisig.to_string(),
+            kind: TransactionKind::Activate,
+            voting_key: Some(eoa_pubkeys[0].to_string()),
+            keypair: Some(eoa_keypaths[0].clone()),
+            index: Some(1),
+        },
+    )
+    .expect("approving it as an activation should succeed");
+    let proposal = proposal_at(&client, &multisig, 1);
+    assert_eq!(
+        proposal.approved,
+        vec![eoa_pubkeys[0]],
+        "the correctly-labelled approval should have landed"
+    );
+    println!("✅ Mismatched kind refused; correct kind accepted");
+}
+
+// --- Substituting RPC proxy -------------------------------------------------
+//
+// The account-identity checks only fire when an endpoint returns data that is
+// genuine but belongs to a different account, so they cannot be reached by any
+// test that talks to an honest validator. These tests put a proxy in front of
+// surfpool that answers `getAccountInfo(<from>)` with the chain's own data for
+// `<to>`.
+//
+// The substitution rewrites the *request* rather than the response: the
+// validator still encodes the bytes, so the forged reply is real, correctly
+// owned, correctly discriminated Squads data that simply belongs to another
+// account. That is precisely the threat being modelled, and it keeps base64 and
+// hand-built account bodies out of the test.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+struct SubstitutingRpcProxy {
+    url: String,
+    shutdown: Arc<AtomicBool>,
+    substitutions: Arc<AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SubstitutingRpcProxy {
+    fn start(from: Pubkey, to: Pubkey) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let port = listener.local_addr().expect("proxy addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("set proxy non-blocking");
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let substitutions = Arc::new(AtomicUsize::new(0));
+        let backend = rpc_url()
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+
+        let stop = Arc::clone(&shutdown);
+        let count = Arc::clone(&substitutions);
+        let thread = std::thread::spawn(move || {
+            let from = from.to_string();
+            let to = to.to_string();
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let (backend, from, to, count) = (
+                            backend.clone(),
+                            from.clone(),
+                            to.clone(),
+                            Arc::clone(&count),
+                        );
+                        std::thread::spawn(move || {
+                            proxy_one_request(stream, &backend, &from, &to, &count);
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            url: format!("http://127.0.0.1:{port}"),
+            shutdown,
+            substitutions,
+            thread: Some(thread),
+        }
+    }
+
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    fn substitutions(&self) -> usize {
+        self.substitutions.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for SubstitutingRpcProxy {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Read one HTTP request, returning its body. Handles a body split across reads.
+fn read_http_body(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .ok()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let header_end = loop {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+    };
+    let length: usize = String::from_utf8_lossy(&buf[..header_end])
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0);
+    while buf.len() < header_end + length {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+    }
+    Some(buf[header_end..].to_vec())
+}
+
+/// Swap the queried pubkey when the request is `getAccountInfo(<from>)`.
+fn substitute_account_query(body: &[u8], from: &str, to: &str, count: &AtomicUsize) -> Vec<u8> {
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    if json.get("method").and_then(|m| m.as_str()) != Some("getAccountInfo") {
+        return body.to_vec();
+    }
+    let Some(target) = json
+        .get_mut("params")
+        .and_then(|p| p.get_mut(0))
+        .filter(|t| t.as_str() == Some(from))
+    else {
+        return body.to_vec();
+    };
+    *target = serde_json::Value::String(to.to_string());
+    count.fetch_add(1, Ordering::Relaxed);
+    serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec())
+}
+
+fn proxy_one_request(
+    mut client: TcpStream,
+    backend: &str,
+    from: &str,
+    to: &str,
+    count: &AtomicUsize,
+) {
+    let Some(body) = read_http_body(&mut client) else {
+        return;
+    };
+    let body = substitute_account_query(&body, from, to, count);
+
+    let Ok(mut upstream) = TcpStream::connect(backend) else {
+        return;
+    };
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {backend}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if upstream.write_all(request.as_bytes()).is_err() || upstream.write_all(&body).is_err() {
+        return;
+    }
+    let mut response = Vec::new();
+    if upstream.read_to_end(&mut response).is_ok() {
+        let _ = client.write_all(&response);
+    }
+}
+
+/// Test 15: a multisig account body is only trustworthy at the address it
+/// derives to. An endpoint that answers with a real, correctly owned, correctly
+/// discriminated multisig belonging to a *different* create_key must be
+/// rejected, because its member set and threshold are what the rekey classifier,
+/// the permission checks, and the quorum math all read as ground truth.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_15_multisig_body_from_another_address_is_rejected() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test15", 2);
+
+    // A second, unrelated multisig whose account is served in place of the first.
+    let impostor_creator = Keypair::new();
+    let sig = client
+        .request_airdrop(&impostor_creator.pubkey(), 10_000_000_000)
+        .expect("airdrop impostor creator");
+    client.confirm_transaction(&sig).expect("confirm airdrop");
+    let (impostor, _) = create_multisig(
+        rpc_url(),
+        &impostor_creator,
+        &Keypair::new(),
+        vec![Member {
+            key: impostor_creator.pubkey(),
+            permissions: full_permissions(),
+        }],
+        1,
+        None,
+    )
+    .expect("create impostor multisig");
+    assert_ne!(multisig, impostor);
+
+    let proxy = SubstitutingRpcProxy::start(multisig, impostor);
+    let proxied = RpcClient::new_with_commitment(proxy.url(), CommitmentConfig::confirmed());
+
+    // The forged reply is genuine Squads data - it simply belongs elsewhere.
+    let message = match fetch_squads_multisig(&proxied, &multisig, "multisig") {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a body that does not derive to this address must be rejected"),
+    };
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("does not match the account it was read from"),
+        "error should name the derivation mismatch, got: {message}"
+    );
+    assert!(
+        proxy.substitutions() > 0,
+        "the proxy never substituted, so the check was not actually exercised"
+    );
+
+    // And the whole action path refuses rather than acting on the wrong members.
+    let proxied_config = Config {
+        networks: vec![proxy.url()],
+        ..config.clone()
+    };
+    let action = proposal_command(
+        &proxied_config,
+        ProposalCommand::Approve,
+        ProposalCommandArgs {
+            multisig: multisig.to_string(),
+            kind: TransactionKind::Activate,
+            voting_key: Some(eoa_pubkeys[0].to_string()),
+            keypair: Some(eoa_keypaths[0].clone()),
+            index: Some(1),
+        },
+    );
+    assert!(
+        action.is_err(),
+        "the action path must refuse a substituted multisig"
+    );
+
+    let proposal = proposal_at(&client, &multisig, 1);
+    assert!(
+        proposal.approved.is_empty(),
+        "no approval should have landed, got {:?}",
+        proposal.approved
+    );
+    println!("✅ Substituted multisig body rejected end to end");
+}
+
+/// Test 16: a transaction account must record the multisig and index it was
+/// read for. Serving proposal 2's transaction when proposal 1 is requested
+/// would otherwise let a signer approve the activation at index 1 while the
+/// tool describes it as the revocation at index 2 - the label and the vote
+/// pointing at different transactions.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_16_transaction_from_another_index_is_rejected() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test16", 2);
+
+    // Index 1 is the pre-created activation; add a revocation at index 2.
+    proposal_command(
+        &config,
+        ProposalCommand::Propose,
+        ProposalCommandArgs {
+            multisig: multisig.to_string(),
+            kind: TransactionKind::Revoke,
+            voting_key: Some(eoa_pubkeys[0].to_string()),
+            keypair: Some(eoa_keypaths[0].clone()),
+            index: None,
+        },
+    )
+    .expect("propose revoke at index 2");
+
+    let (activation_tx, _) = get_transaction_pda(&multisig, 1);
+    let (revocation_tx, _) = get_transaction_pda(&multisig, 2);
+    let proxy = SubstitutingRpcProxy::start(activation_tx, revocation_tx);
+
+    // Asking to approve index 1 as a revocation: without the identity binding
+    // the substituted body classifies as Revoke, matches the requested kind, and
+    // the vote lands on the *activation* proposal.
+    let proxied_config = Config {
+        networks: vec![proxy.url()],
+        ..config.clone()
+    };
+    let error = proposal_command(
+        &proxied_config,
+        ProposalCommand::Approve,
+        ProposalCommandArgs {
+            multisig: multisig.to_string(),
+            kind: TransactionKind::Revoke,
+            voting_key: Some(eoa_pubkeys[0].to_string()),
+            keypair: Some(eoa_keypaths[0].clone()),
+            index: Some(1),
+        },
+    )
+    .expect_err("a transaction recorded at another index must be refused");
+
+    let message = error.to_string();
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("could not be verified"),
+        "error should be the unverifiable refusal, got: {message}"
+    );
+    assert!(
+        proxy.substitutions() > 0,
+        "the proxy never substituted, so the check was not actually exercised"
+    );
+
+    let proposal = proposal_at(&client, &multisig, 1);
+    assert!(
+        proposal.approved.is_empty(),
+        "no approval should have landed on the activation, got {:?}",
+        proposal.approved
+    );
+    println!("✅ Substituted transaction body rejected end to end");
+}
+
+/// Test 17: a canonical rekey adds an unsignable member, drops the threshold to
+/// 1, and removes everyone who can sign. Authorizing that is irreversible, so
+/// `--yes` must not stand in for the decision - and must not exit 0 having
+/// silently done nothing, which would read as success to a script.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_17_rekey_is_not_authorized_by_assume_yes() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test17", 2);
+
+    // Index 1 is the pre-created activation; the rekey lands at index 2.
+    proposal_command(
+        &config,
+        ProposalCommand::Propose,
+        ProposalCommandArgs {
+            multisig: multisig.to_string(),
+            kind: TransactionKind::Rekey,
+            voting_key: Some(eoa_pubkeys[0].to_string()),
+            keypair: Some(eoa_keypaths[0].clone()),
+            index: None,
+        },
+    )
+    .expect("propose rekey at index 2");
+
+    let approve_rekey = || {
+        proposal_command(
+            &config,
+            ProposalCommand::Approve,
+            ProposalCommandArgs {
+                multisig: multisig.to_string(),
+                kind: TransactionKind::Rekey,
+                voting_key: Some(eoa_pubkeys[0].to_string()),
+                keypair: Some(eoa_keypaths[0].clone()),
+                index: Some(2),
+            },
+        )
+    };
+
+    let error = with_assume_yes(|| approve_rekey().expect_err("--yes must not authorize a rekey"));
+    let message = error.to_string();
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("--yes"),
+        "the error should explain that --yes cannot authorize this, got: {message}"
+    );
+
+    let proposal = proposal_at(&client, &multisig, 2);
+    assert!(
+        proposal.approved.is_empty(),
+        "no rekey approval should have landed, got {:?}",
+        proposal.approved
+    );
+
+    // An operator who does decide is still able to approve it.
+    approve_rekey().expect("an explicit approval should still work");
+    let proposal = proposal_at(&client, &multisig, 2);
+    assert_eq!(
+        proposal.approved,
+        vec![eoa_pubkeys[0]],
+        "the explicit approval should have landed"
+    );
+    println!("✅ Rekey refused under --yes, accepted on an explicit decision");
 }

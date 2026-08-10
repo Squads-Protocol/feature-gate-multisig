@@ -200,7 +200,7 @@ fn require_eoa_voting_key_matches_fee_payer(voting_key: &Pubkey, fee_payer: &Pub
 /// Interactive confirmation - auto-confirms in E2E test mode. With `--yes`,
 /// resolves to the prompt's default answer, so safety prompts that default to
 /// "no" still abort rather than being force-approved.
-fn confirm_action(prompt: &str, default: bool) -> bool {
+pub(crate) fn confirm_action(prompt: &str, default: bool) -> bool {
     if crate::utils::is_e2e_test_mode() {
         return true;
     }
@@ -211,6 +211,140 @@ fn confirm_action(prompt: &str, default: bool) -> bool {
         .with_default(default)
         .prompt()
         .unwrap_or(false)
+}
+
+/// Warn when the newest proposal is already the one about to be created. A send
+/// whose confirmation timed out may still have landed, and a rerun allocates the
+/// next index rather than noticing.
+fn warn_on_duplicate_proposal(
+    rpc_client: &solana_rpc_client::rpc_client::RpcClient,
+    multisig: &Pubkey,
+    latest_index: u64,
+    kind: TransactionKind,
+) {
+    if latest_index == 0 {
+        return;
+    }
+    let existing =
+        crate::commands::proposal::describe_transaction(rpc_client, multisig, latest_index);
+    if existing.transaction_kind() != Some(kind) {
+        return;
+    }
+    // Only a proposal that can still be acted on is a duplicate worth flagging.
+    let still_open = matches!(
+        get_proposal_status_and_threshold(multisig, latest_index, rpc_client),
+        Ok((_, _, crate::squads::ProposalStatus::Draft { .. }))
+            | Ok((_, _, crate::squads::ProposalStatus::Active { .. }))
+            | Ok((_, _, crate::squads::ProposalStatus::Approved { .. }))
+    );
+    if still_open {
+        output::Output::warning(&format!(
+            "Proposal #{latest_index} is already an unexecuted {}. If a previous run timed out it may have landed; creating another leaves two.",
+            kind.label()
+        ));
+    }
+}
+
+/// Disclose what a pending config change does to the multisig, then take an
+/// explicit decision on it. Returns false if the operator declines.
+///
+/// A canonical rekey is irreversible: it adds an unsignable member, drops the
+/// threshold to 1, and removes everyone who can actually sign. Until now that
+/// was disclosed only when *creating* one - the point where it is approved and
+/// executed showed a bare label. So this states the resulting threshold and the
+/// count of members who could still cast a vote, rather than leaving a signer to
+/// derive them from the action list, and defaults to no. Defaulting to no also
+/// means `--yes` aborts here instead of resolving it to a silent yes.
+fn confirm_config_change(
+    rpc_client: &solana_rpc_client::rpc_client::RpcClient,
+    multisig_address: &Pubkey,
+    transaction_index: u64,
+    verb: &str,
+) -> Result<bool> {
+    use crate::squads::{
+        get_transaction_pda, ConfigAction, ConfigTransaction,
+        CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+    };
+
+    let multisig = fetch_squads_multisig(rpc_client, multisig_address, "multisig")?;
+    let (transaction_pda, _) = get_transaction_pda(multisig_address, transaction_index);
+    let account = rpc_client.get_account(&transaction_pda)?;
+    let config_tx: ConfigTransaction = deserialize_squads_account(
+        &account.data,
+        CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+        "config transaction",
+    )?;
+
+    output::Output::header(&format!(
+        "Config change at index {transaction_index} on multisig {multisig_address}"
+    ));
+
+    // Replay the actions over the current members to state the end result
+    // instead of only the steps that get there.
+    let mut members = multisig.members.clone();
+    let mut threshold = multisig.threshold;
+    for (i, action) in config_tx.actions.iter().enumerate() {
+        match action {
+            ConfigAction::AddMember { new_member } => {
+                let unsignable = if new_member.key == Pubkey::default() {
+                    " (unsignable placeholder key)"
+                } else {
+                    ""
+                };
+                output::Output::numbered_field(
+                    i + 1,
+                    "Add member",
+                    &format!("{}{}", new_member.key, unsignable),
+                );
+                members.push(new_member.clone());
+            }
+            ConfigAction::RemoveMember { old_member } => {
+                output::Output::numbered_field(i + 1, "Remove member", &old_member.to_string());
+                members.retain(|m| m.key != *old_member);
+            }
+            ConfigAction::ChangeThreshold { new_threshold } => {
+                output::Output::numbered_field(i + 1, "Set threshold", &new_threshold.to_string());
+                threshold = *new_threshold;
+            }
+        }
+    }
+
+    // A member whose key is the default pubkey holds no private key, so it can
+    // never sign - it counts towards Squads' invariants but not towards anyone
+    // being able to govern the multisig afterwards.
+    let usable_voters = members
+        .iter()
+        .filter(|m| m.key != Pubkey::default() && (m.permissions.mask & PERMISSION_VOTE) != 0)
+        .count();
+
+    output::Output::field("Resulting threshold", &threshold.to_string());
+    output::Output::field(
+        "Members able to vote afterwards",
+        &usable_voters.to_string(),
+    );
+
+    if usable_voters == 0 {
+        output::Output::warning(
+            "No remaining member can sign. This permanently disables voting on this multisig, and it cannot be undone.",
+        );
+    } else if usable_voters < usize::from(threshold) {
+        output::Output::warning(&format!(
+            "Only {usable_voters} member(s) can sign but the threshold is {threshold}; the multisig will be unable to reach quorum."
+        ));
+    }
+
+    let approved = confirm_action(&format!("{verb} this config change?"), false);
+    // Declining interactively is an ordinary "not now". Declining because `--yes`
+    // resolved this to its `false` default is different: the caller asked not to
+    // be prompted and the tool refused to answer on their behalf, so it must not
+    // exit 0 as though the config change had been handled.
+    if !approved && crate::utils::is_assume_yes() {
+        return Err(eyre::eyre!(
+            "Refusing to {} a config change under --yes: it permanently changes who governs this multisig. Re-run without --yes to review the actions above and decide.",
+            verb.to_lowercase()
+        ));
+    }
+    Ok(approved)
 }
 
 /// Pre-flight check before acting on a feature gate: surface any state warnings
@@ -534,7 +668,22 @@ fn handle_parent_multisig_flow(
     output::Output::field("Child Multisig", &feature_gate_multisig_address.to_string());
     output::Output::field("Parent Transaction Index", &parent_next_index.to_string());
     output::Output::field("Child Proposal Index", &proposal_index.to_string());
-    output::Output::field("Transaction Type", kind.label());
+    // Describe the child by what it is on-chain, not by the kind the caller
+    // named. For an existing proposal those can differ - the caller's kind is
+    // unverified input - and this line is what parent members read before
+    // voting. Creation is the one case with nothing yet to classify, so there
+    // the requested kind is the truth.
+    let type_label = match operation {
+        ProposalAction::Create => kind.label().to_string(),
+        _ => crate::commands::proposal::describe_transaction(
+            &rpc_client,
+            &feature_gate_multisig_address,
+            proposal_index,
+        )
+        .label()
+        .to_string(),
+    };
+    output::Output::field("Transaction Type", &type_label);
     output::Output::field("Action", &action_description);
 
     // Ask for confirmation before creating the parent multisig proposal
@@ -546,7 +695,18 @@ fn handle_parent_multisig_flow(
             "Create parent multisig proposal to create a new child transaction/proposal?"
         }
     };
-    if !confirm_action(confirmation_prompt, true) {
+    // Authorizing a config change on the child is the irreversible class of
+    // action, so the parent's vote on it is an explicit decision rather than a
+    // default yes. Rejecting one is the safe direction and stays easy - a
+    // default of no there would just make it harder to stop a rekey.
+    let default_answer = !matches!(
+        (child_flavor, operation),
+        (
+            ChildTransactionFlavor::Config,
+            ProposalAction::Approve | ProposalAction::Execute
+        )
+    );
+    if !confirm_action(confirmation_prompt, default_answer) {
         output::Output::info("Parent multisig proposal creation cancelled.");
         return Ok(());
     }
@@ -768,7 +928,7 @@ pub fn execute_common_feature_gate_proposal(
         let child_transaction_message = child_transaction_contents.message;
 
         // Build execution account metas from the child transaction.
-        let child_execution_account_metas = child_transaction_message.execution_account_metas();
+        let child_execution_account_metas = child_transaction_message.execution_account_metas()?;
 
         return handle_parent_multisig_flow(
             voting_key,
@@ -838,6 +998,12 @@ pub fn create_feature_gate_proposal(
     )?;
 
     let next_tx_index = feature_gate_ms.transaction_index + 1;
+    warn_on_duplicate_proposal(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        feature_gate_ms.transaction_index,
+        kind,
+    );
 
     // Feature ID is the child vault address (vault 0)
     let feature_id = get_vault_pda(&feature_gate_multisig_address, 0).0;
@@ -925,6 +1091,13 @@ pub fn create_feature_gate_proposal(
     )?;
     let transaction =
         VersionedTransaction::try_new(VersionedMessage::V0(message), &[fee_payer_signer.as_ref()])?;
+
+    // Every other send path confirms first; this one submitted straight away.
+    if !confirm_action("Send this create transaction now?", true) {
+        output::Output::hint("Skipped sending. Rerun to create the proposal.");
+        return Ok(());
+    }
+
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to create {} proposal: {}", kind.label(), e))?;
 
@@ -978,21 +1151,26 @@ pub fn rekey_multisig_feature_gate(
         }
     }
 
-    // Final confirmation
-    if !crate::utils::is_e2e_test_mode() {
-        let confirm =
-            Confirm::new("This will permanently disable voting on this multisig. Are you sure?")
-                .with_default(false)
-                .prompt()?;
-
-        if !confirm {
-            output::Output::hint("Rekey cancelled.");
-            return Ok(());
-        }
+    // Final confirmation. Routed through `confirm_action` so this prompt obeys
+    // the same rules as every other one: auto-confirmed under E2E, and resolved
+    // to its `false` default under `--yes` so automation cannot start a rekey
+    // without a person deciding to.
+    if !confirm_action(
+        "This will permanently disable voting on this multisig. Are you sure?",
+        false,
+    ) {
+        output::Output::hint("Rekey cancelled.");
+        return Ok(());
     }
 
     // Fetch next transaction index (child)
     let next_tx_index = feature_gate_ms.transaction_index + 1;
+    warn_on_duplicate_proposal(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        feature_gate_ms.transaction_index,
+        TransactionKind::Rekey,
+    );
 
     // Detect if voting_key is itself a Squads multisig (parent)
     let is_parent_multisig = load_multisig_if_any(&rpc_client, &voting_key)?.is_some();
@@ -1048,12 +1226,11 @@ pub fn rekey_multisig_feature_gate(
         next_tx_index,
     )?;
 
-    // Confirm before sending
-    let should_send = Confirm::new("Send rekey proposal now?")
-        .with_default(true)
-        .prompt()
-        .unwrap_or(false);
-    if !should_send {
+    // Confirm before sending. A raw prompt here resolved to `false` whenever no
+    // terminal was attached, so this path silently returned success having
+    // created nothing; `confirm_action` gives it the same E2E and `--yes`
+    // handling as every other send prompt.
+    if !confirm_action("Send rekey proposal now?", true) {
         output::Output::hint("Skipped sending. You can rerun to send.");
         return Ok(());
     }
@@ -1186,7 +1363,15 @@ fn approve_common_proposal(
         &[fee_payer_signer.as_ref()],
     )?;
 
-    if !confirm_action("Send this approve transaction now?", true) {
+    // A config change is disclosed in full and confirmed on its own terms; a
+    // feature gate action keeps the routine send prompt.
+    let confirmed = match flavor {
+        ProposalFlavor::Config => {
+            confirm_config_change(&rpc_client, &multisig_address, proposal_index, "Approve")?
+        }
+        ProposalFlavor::Vault(_) => confirm_action("Send this approve transaction now?", true),
+    };
+    if !confirmed {
         output::Output::hint(
             "Skipped sending. You can submit the above encoded transaction manually or rerun to send.",
         );
@@ -1269,8 +1454,9 @@ pub fn execute_common_config_change(
         &[fee_payer_signer.as_ref()],
     )?;
 
-    // Confirm before sending on-chain (EOA execute path)
-    if !confirm_action("Send this execute transaction now?", true) {
+    // Execution is the irreversible step, so disclose the full effect here too
+    // rather than relying on whatever was shown at approval time.
+    if !confirm_config_change(&rpc_client, &multisig_address, transaction_index, "Execute")? {
         output::Output::hint("Skipped sending. You can submit the above encoded transaction manually or rerun to send.");
         return Ok(());
     }

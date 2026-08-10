@@ -29,6 +29,8 @@ pub const SQUADS_V4_PROGRAM_HASH: &str =
 /// Fixed size of the upgradeable-loader ProgramData metadata header that
 /// precedes the ELF: 4-byte enum tag + 8-byte slot + 1-byte option + 32-byte authority.
 const PROGRAMDATA_HEADER_LEN: usize = 45;
+/// Borsh discriminant for `UpgradeableLoaderState::ProgramData`.
+const PROGRAMDATA_ENUM_TAG: [u8; 4] = [3, 0, 0, 0];
 
 /// Genesis hash of Solana mainnet-beta.
 pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
@@ -388,11 +390,24 @@ fn parse_programdata(data: &[u8]) -> Result<(Option<Pubkey>, &[u8])> {
     }
     // Layout: [0..4] enum tag (3 = ProgramData), [4..12] slot, [12] Option tag,
     // [13..45] authority pubkey (meaningful only when the Option tag is 1).
+    if data[0..4] != PROGRAMDATA_ENUM_TAG {
+        return Err(eyre!(
+            "account is not a ProgramData record (enum tag {:?})",
+            &data[0..4]
+        ));
+    }
+    // Only 0 and 1 are valid Option tags. Treating anything else as None
+    // reported a malformed record as an immutable program.
     let upgrade_authority = match data[12] {
+        0 => None,
         1 => Some(Pubkey::new_from_array(
             data[13..45].try_into().unwrap_or([0u8; 32]),
         )),
-        _ => None,
+        tag => {
+            return Err(eyre!(
+                "programdata upgrade-authority option tag is {tag}, expected 0 or 1"
+            ))
+        }
     };
     Ok((upgrade_authority, &data[PROGRAMDATA_HEADER_LEN..]))
 }
@@ -687,5 +702,24 @@ mod tests {
         mutable[13..45].copy_from_slice(key.as_ref());
         let (auth, _) = parse_programdata(&mutable).unwrap();
         assert_eq!(auth, Some(key));
+    }
+
+    /// Malformed bytes must not be read as an immutable program: "no upgrade
+    /// authority" is the reassuring answer, so it has to come from a record that
+    /// actually says so.
+    #[test]
+    fn malformed_programdata_is_rejected_not_read_as_immutable() {
+        // Wrong enum tag: some other upgradeable-loader account.
+        let mut wrong_kind = vec![0u8; PROGRAMDATA_HEADER_LEN];
+        wrong_kind[0] = 2;
+        let err = parse_programdata(&wrong_kind).unwrap_err().to_string();
+        assert!(err.contains("not a ProgramData record"), "got: {err}");
+
+        // Option tag outside {0, 1}: previously fell through to None.
+        let mut bad_option = vec![0u8; PROGRAMDATA_HEADER_LEN];
+        bad_option[0] = 3;
+        bad_option[12] = 7;
+        let err = parse_programdata(&bad_option).unwrap_err().to_string();
+        assert!(err.contains("option tag is 7"), "got: {err}");
     }
 }
