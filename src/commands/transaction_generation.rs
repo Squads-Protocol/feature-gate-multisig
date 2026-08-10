@@ -200,7 +200,7 @@ fn require_eoa_voting_key_matches_fee_payer(voting_key: &Pubkey, fee_payer: &Pub
 /// Interactive confirmation - auto-confirms in E2E test mode. With `--yes`,
 /// resolves to the prompt's default answer, so safety prompts that default to
 /// "no" still abort rather than being force-approved.
-fn confirm_action(prompt: &str, default: bool) -> bool {
+pub(crate) fn confirm_action(prompt: &str, default: bool) -> bool {
     if crate::utils::is_e2e_test_mode() {
         return true;
     }
