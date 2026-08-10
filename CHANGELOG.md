@@ -5,7 +5,61 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - Unreleased
+## [0.3.1] - 2026-08-10
+
+Hardens the path that decides what a proposal is and what a signer is told it
+does. Supersedes 0.3.0, whose transaction classifier labels any decodable config
+transaction a rekey and any all-System vault message an activation.
+
+### Changed
+
+- `--yes` no longer authorizes an action the tool cannot vouch for. It aborts on
+  an unrecognized proposal, and refuses a config change outright rather than
+  resolving the confirmation on the operator's behalf. Recognized activate,
+  revoke, and rekey proposals are unaffected.
+- `verify` exits non-zero when a check could not be completed. It still reports
+  every problem in one run; only the exit code changed.
+- An ambiguous `--network` name is an error naming the candidates, instead of
+  resolving to whichever endpoint was configured first.
+- `--threshold` parses at the on-chain width, so out-of-range values are
+  rejected rather than truncated (65537 previously became 1, 65536 became 0).
+- An explicit `--threshold` is honoured when the saved configuration is reused,
+  instead of being silently discarded.
+- Canonical rekeys are labelled as permanently disabling voting, and approving
+  or executing one prints the resulting threshold and the number of members able
+  to vote afterwards before asking.
+
+### Fixed
+
+- Squads accounts are authenticated, not just decoded: transaction, proposal,
+  and multisig reads now require Squads ownership and a record naming the
+  multisig and index being read. A multisig is bound to its address through the
+  `create_key` PDA derivation.
+- A failed multisig read no longer defaults the member list to empty. That
+  baseline made a config change which only weakens the threshold identical to a
+  canonical rekey, so it was certified as one.
+- Proposal classification fails closed. A transaction that cannot be read or
+  authenticated is refused rather than warned about.
+- The parent multisig flow describes a child by what it is on-chain, rather than
+  by the kind the caller passed.
+- `show` sweeps the endpoint being inspected, so feature state and the rekey
+  warning describe the cluster on screen rather than the saved network list.
+- `show --index` prints instruction data in full. Truncation cut the owner
+  pubkey out of a System `assign`, which is the field distinguishing an
+  activation from a hijack.
+- Proposal creation asks before sending, matching every other send path.
+- Partial multi-network deployments name the networks that succeeded and warn
+  about the ones that did not, instead of reporting completion without naming a
+  cluster.
+- Executing a proposal that loads accounts from address lookup tables reports
+  why this tool cannot, instead of failing on-chain.
+- Malformed ProgramData is rejected rather than read as an immutable program.
+- A confirmation timeout says the transaction may still have landed, and
+  creating a proposal warns when the newest one already matches it.
+- Saving a voting key no longer drops the other configured networks when
+  `--network` was passed.
+
+## [0.3.0] - 2026-07-13
 
 ### Added
 
