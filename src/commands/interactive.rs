@@ -98,7 +98,7 @@ fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -
     let rpc_url = choose_network_from_config(config)?;
     let rpc_client = create_rpc_client(&rpc_url);
     let network_config = Config {
-        networks: vec![rpc_url],
+        networks: vec![rpc_url.clone()],
         ..config.clone()
     };
 
@@ -144,12 +144,16 @@ fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -
             }
         };
 
+        // Name the endpoint: the same governance address exists on several
+        // clusters, so which one is being signed against is part of the decision.
         let confirmed = Confirm::new(&format!(
-            "You're about to {} proposal #{} ({}) on feature gate {}. Continue?",
+            "You're about to {} proposal #{} ({}) on feature gate {} via {} ({}). Continue?",
             action_choice.to_lowercase(),
             index,
             proposal_kind.label(),
             feature_gate_id,
+            get_network_display(&rpc_url),
+            rpc_url,
         ))
         .with_default(true)
         .prompt()?;

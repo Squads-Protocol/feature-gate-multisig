@@ -329,8 +329,11 @@ pub fn send_and_confirm_transaction(
         }
 
         if confirmation_start.elapsed().as_millis() as u64 > CONFIRMATION_TIMEOUT_MS {
+            // A timeout is not a rejection - the transaction may still land.
+            // Rerunning blindly would allocate a second proposal at the next index.
             return Err(eyre!(
-                "Transaction {} not confirmed within {}ms",
+                "Transaction {} was not confirmed within {}ms. It may still have landed: \
+                 check the signature before rerunning, or a repeat will create a duplicate.",
                 signature,
                 CONFIRMATION_TIMEOUT_MS
             ));

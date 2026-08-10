@@ -213,6 +213,38 @@ pub(crate) fn confirm_action(prompt: &str, default: bool) -> bool {
         .unwrap_or(false)
 }
 
+/// Warn when the newest proposal is already the one about to be created. A send
+/// whose confirmation timed out may still have landed, and a rerun allocates the
+/// next index rather than noticing.
+fn warn_on_duplicate_proposal(
+    rpc_client: &solana_rpc_client::rpc_client::RpcClient,
+    multisig: &Pubkey,
+    latest_index: u64,
+    kind: TransactionKind,
+) {
+    if latest_index == 0 {
+        return;
+    }
+    let existing =
+        crate::commands::proposal::describe_transaction(rpc_client, multisig, latest_index);
+    if existing.transaction_kind() != Some(kind) {
+        return;
+    }
+    // Only a proposal that can still be acted on is a duplicate worth flagging.
+    let still_open = matches!(
+        get_proposal_status_and_threshold(multisig, latest_index, rpc_client),
+        Ok((_, _, crate::squads::ProposalStatus::Draft { .. }))
+            | Ok((_, _, crate::squads::ProposalStatus::Active { .. }))
+            | Ok((_, _, crate::squads::ProposalStatus::Approved { .. }))
+    );
+    if still_open {
+        output::Output::warning(&format!(
+            "Proposal #{latest_index} is already an unexecuted {}. If a previous run timed out it may have landed; creating another leaves two.",
+            kind.label()
+        ));
+    }
+}
+
 /// Disclose what a pending config change does to the multisig, then take an
 /// explicit decision on it. Returns false if the operator declines.
 ///
@@ -966,6 +998,12 @@ pub fn create_feature_gate_proposal(
     )?;
 
     let next_tx_index = feature_gate_ms.transaction_index + 1;
+    warn_on_duplicate_proposal(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        feature_gate_ms.transaction_index,
+        kind,
+    );
 
     // Feature ID is the child vault address (vault 0)
     let feature_id = get_vault_pda(&feature_gate_multisig_address, 0).0;
@@ -1127,6 +1165,12 @@ pub fn rekey_multisig_feature_gate(
 
     // Fetch next transaction index (child)
     let next_tx_index = feature_gate_ms.transaction_index + 1;
+    warn_on_duplicate_proposal(
+        &rpc_client,
+        &feature_gate_multisig_address,
+        feature_gate_ms.transaction_index,
+        TransactionKind::Rekey,
+    );
 
     // Detect if voting_key is itself a Squads multisig (parent)
     let is_parent_multisig = load_multisig_if_any(&rpc_client, &voting_key)?.is_some();
