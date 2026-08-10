@@ -1015,7 +1015,7 @@ pub fn create_execute_transaction_message(
 
     // All accounts from the stored message are passed through to the Squads program,
     // including the parent multisig needed for vault PDA derivation during CPI.
-    let execution_account_metas = transaction_message.execution_account_metas();
+    let execution_account_metas = transaction_message.execution_account_metas()?;
 
     let account_keys = MultisigExecuteTransactionAccounts {
         multisig: *multisig_address,

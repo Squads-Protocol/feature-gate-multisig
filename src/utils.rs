@@ -379,11 +379,27 @@ pub fn resolve_network_arg(config: &Config, arg: &str) -> Result<String> {
     if let Some(url) = configured.iter().find(|url| url.as_str() == arg) {
         return Ok(url.clone());
     }
-    if let Some(url) = configured
+    // Names come from substring matching, so several configured URLs can share
+    // one. Picking the first silently sends a governance action to whichever was
+    // listed earliest, so make the caller disambiguate by URL.
+    let by_name: Vec<&String> = configured
         .iter()
-        .find(|url| get_network_display(url).eq_ignore_ascii_case(arg))
-    {
-        return Ok(url.clone());
+        .filter(|url| get_network_display(url).eq_ignore_ascii_case(arg))
+        .collect();
+    if by_name.len() > 1 {
+        return Err(eyre::eyre!(
+            "'{}' matches {} configured networks: {}. Pass the full RPC URL instead.",
+            arg,
+            by_name.len(),
+            by_name
+                .iter()
+                .map(|u| u.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(url) = by_name.first() {
+        return Ok((*url).clone());
     }
     if arg.starts_with("http://") || arg.starts_with("https://") {
         return Ok(arg.to_string());
@@ -992,5 +1008,30 @@ mod tests {
             .to_string();
         assert!(err.contains("Unknown network"));
         assert!(err.contains("https://api.devnet.solana.com"));
+    }
+
+    /// Names come from substring matching, so two endpoints can share one. The
+    /// action must not silently go to whichever was configured first.
+    #[test]
+    fn ambiguous_network_name_is_rejected() {
+        let config = Config {
+            networks: vec![
+                "https://rpc.provider.example/mainnet-tenant".to_string(),
+                "https://api.mainnet.solana.com".to_string(),
+            ],
+            ..Config::default()
+        };
+
+        let err = resolve_network_arg(&config, "mainnet")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matches 2 configured networks"), "got: {err}");
+        assert!(err.contains("https://api.mainnet.solana.com"), "got: {err}");
+
+        // An exact URL is still unambiguous even when the name is not.
+        assert_eq!(
+            resolve_network_arg(&config, "https://api.mainnet.solana.com").unwrap(),
+            "https://api.mainnet.solana.com"
+        );
     }
 }

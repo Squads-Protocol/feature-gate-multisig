@@ -207,8 +207,19 @@ impl VaultTransactionMessage {
     /// None are marked as signers on purpose: the Squads program derives the
     /// required signer PDA(s) from the stored message during CPI, and marking
     /// them as signers in the outer instruction breaks account grouping.
-    pub fn execution_account_metas(&self) -> Vec<AccountMeta> {
-        self.account_keys
+    /// Errors on a message that loads accounts from address lookup tables: those
+    /// accounts are absent from `account_keys`, so the metas below would be
+    /// incomplete and Squads would reject the execution on-chain. This tool never
+    /// builds such a message, so one can only come from another Squads client.
+    pub fn execution_account_metas(&self) -> Result<Vec<AccountMeta>> {
+        if !self.address_table_lookups.is_empty() {
+            return Err(eyre::eyre!(
+                "This transaction loads accounts from {} address lookup table(s), which this tool cannot resolve. Execute it with a Squads client that supports them.",
+                self.address_table_lookups.len()
+            ));
+        }
+        Ok(self
+            .account_keys
             .iter()
             .enumerate()
             .map(|(i, key)| {
@@ -218,7 +229,7 @@ impl VaultTransactionMessage {
                     AccountMeta::new_readonly(*key, false)
                 }
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -695,4 +706,42 @@ fn serialize_slice<T: BorshSerialize, W: Write>(data: &[T], writer: &mut W) -> s
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message_with_lookups(
+        lookups: Vec<MultisigMessageAddressTableLookup>,
+    ) -> VaultTransactionMessage {
+        VaultTransactionMessage {
+            num_signers: 1,
+            num_writable_signers: 1,
+            num_writable_non_signers: 0,
+            account_keys: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            instructions: Vec::new(),
+            address_table_lookups: lookups,
+        }
+    }
+
+    /// Accounts loaded from a lookup table are absent from `account_keys`, so the
+    /// metas would be incomplete. Refuse with a clear message rather than letting
+    /// Squads reject the execution on-chain.
+    #[test]
+    fn execution_metas_reject_address_table_lookups() {
+        let plain = message_with_lookups(Vec::new());
+        assert_eq!(plain.execution_account_metas().unwrap().len(), 2);
+
+        let with_lookups = message_with_lookups(vec![MultisigMessageAddressTableLookup {
+            account_key: Pubkey::new_unique(),
+            writable_indexes: vec![0],
+            readonly_indexes: vec![1],
+        }]);
+        let err = with_lookups
+            .execution_account_metas()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("address lookup table"), "got: {err}");
+    }
 }

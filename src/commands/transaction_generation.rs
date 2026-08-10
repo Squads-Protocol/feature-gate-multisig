@@ -896,7 +896,7 @@ pub fn execute_common_feature_gate_proposal(
         let child_transaction_message = child_transaction_contents.message;
 
         // Build execution account metas from the child transaction.
-        let child_execution_account_metas = child_transaction_message.execution_account_metas();
+        let child_execution_account_metas = child_transaction_message.execution_account_metas()?;
 
         return handle_parent_multisig_flow(
             voting_key,
@@ -1053,6 +1053,13 @@ pub fn create_feature_gate_proposal(
     )?;
     let transaction =
         VersionedTransaction::try_new(VersionedMessage::V0(message), &[fee_payer_signer.as_ref()])?;
+
+    // Every other send path confirms first; this one submitted straight away.
+    if !confirm_action("Send this create transaction now?", true) {
+        output::Output::hint("Skipped sending. Rerun to create the proposal.");
+        return Ok(());
+    }
+
     let signature = crate::provision::send_and_confirm_transaction(&transaction, &rpc_client)
         .map_err(|e| eyre::eyre!("Failed to create {} proposal: {}", kind.label(), e))?;
 

@@ -79,11 +79,14 @@ fn show_multisig(
         .any(|kind| matches!(kind, ProposalKind::ChildAction));
 
     println!();
-    let networks = if config.networks.is_empty() {
-        vec![rpc_url.to_string()]
-    } else {
-        config.networks.clone()
-    };
+    // Always sweep the endpoint being inspected. Reading proposals from it but
+    // feature state only from the saved list meant a `--network <url>` outside
+    // that list reported another cluster's state, and skipped the rekey check
+    // for the one on screen.
+    let mut networks = config.networks.clone();
+    if !networks.iter().any(|n| n == rpc_url) {
+        networks.insert(0, rpc_url.to_string());
+    }
     let mut network_multisigs: Vec<(&str, Multisig)> = Vec::new();
 
     if looks_like_parent {
@@ -707,27 +710,19 @@ fn display_vault_transaction(transaction: &VaultTransaction, tx_index: u64) {
                         .join(", ")
                 };
 
-                // Format instruction data as hex bytes
+                // Print data in full. Truncating hid the tail of an `assign`,
+                // whose last 32 bytes are the new owner - the field that tells a
+                // hijack from a real activation, in the view meant for judging
+                // exactly that.
                 let data_str = if instruction.data.is_empty() {
                     "Empty".to_string()
-                } else if instruction.data.len() <= 32 {
-                    // Show full data for small instructions
+                } else {
                     instruction
                         .data
                         .iter()
                         .map(|b| format!("{:02x}", b))
                         .collect::<Vec<_>>()
                         .join(" ")
-                } else {
-                    // Show first 16 bytes + length for large instructions
-                    let preview = instruction
-                        .data
-                        .iter()
-                        .take(16)
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    format!("{} ... ({} bytes total)", preview, instruction.data.len())
                 };
 
                 InstructionDetails {
