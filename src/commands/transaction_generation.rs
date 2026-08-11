@@ -299,7 +299,8 @@ fn confirm_config_change(
     let multisig = fetch_squads_multisig(rpc_client, multisig_address, "multisig")?;
 
     output::Output::header(&format!(
-        "Config change at index {transaction_index} on multisig {multisig_address}"
+        "Config change at index {transaction_index} on multisig {multisig_address} via {}",
+        rpc_client.url()
     ));
 
     // Replay the actions over the current members to state the end result

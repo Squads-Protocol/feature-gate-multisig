@@ -12,8 +12,8 @@ use crate::squads::{
 };
 use crate::utils::*;
 use crate::verification::{
-    is_autonomous, is_mainnet_cluster, is_rekeyed, known_signer_name, member_set_warnings,
-    multisig_safety_warnings, program_warnings, verify_feature_gate, verify_squads_program,
+    is_autonomous, is_rekeyed, known_signer_name, member_set_warnings, multisig_safety_warnings,
+    program_warnings, resolve_cluster, verify_feature_gate, verify_squads_program,
     FeatureGateStatus,
 };
 use colored::*;
@@ -182,7 +182,15 @@ fn show_multisig(
     // network (this is the expensive one: it downloads the program bytecode).
     match verify_squads_program(&rpc_client) {
         Ok(program) => {
-            let mainnet = is_mainnet_cluster(&rpc_client).unwrap_or_else(|_| is_mainnet(rpc_url));
+            // Same cross-check as `verify`: the endpoint must not be able to
+            // pick how strictly its own program is checked.
+            let mainnet = match resolve_cluster(&rpc_client, rpc_url) {
+                Ok((mainnet, _)) => mainnet,
+                Err(e) => {
+                    Output::error(&e.to_string());
+                    return Err(e);
+                }
+            };
             let warnings = program_warnings(&program, mainnet);
             if warnings.is_empty() {
                 let status = if mainnet {

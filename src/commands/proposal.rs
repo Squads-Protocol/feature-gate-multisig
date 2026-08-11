@@ -70,6 +70,19 @@ pub fn proposal_command(
     };
     let config = &dispatch_config;
 
+    // Solana has no chain id, so a signed vote is bound to a cluster only by the
+    // blockhash the endpoint hands out - and this tool reuses one create_key
+    // everywhere, making the multisig, proposal and transaction PDAs identical on
+    // every network. Establish the cluster before signing so a rehearsal cannot
+    // be forwarded to mainnet as a real governance action.
+    match crate::verification::resolve_cluster(&create_rpc_client(&rpc_url), &rpc_url) {
+        Ok((_, true)) => {}
+        Ok((_, false)) => Output::warning(
+            "Could not confirm which cluster this endpoint serves; the signature below is not bound to the network you selected.",
+        ),
+        Err(e) => return Err(e),
+    }
+
     // Acting on an existing proposal: confirm the on-chain transaction actually
     // matches the kind the caller specified, so an approve/reject/execute can
     // never be applied to a different (or disguised) transaction than intended.
