@@ -41,8 +41,8 @@ use feature_gate_multisig_tool::provision::{
     fetch_squads_multisig, get_squads_account_data_with_retry, send_and_confirm_transaction,
 };
 use feature_gate_multisig_tool::squads::{
-    get_proposal_pda, get_transaction_pda, get_vault_pda, Member, Permissions, Proposal,
-    ProposalStatus, PERMISSION_VOTE, SQUADS_MULTISIG_PROGRAM_ID,
+    get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction, Member, Permissions,
+    Proposal, ProposalStatus, PERMISSION_VOTE, SQUADS_MULTISIG_PROGRAM_ID,
 };
 use feature_gate_multisig_tool::utils::{load_signer, Config, ASSUME_YES_ENV};
 use feature_gate_multisig_tool::verification::{
@@ -2122,4 +2122,154 @@ fn rpc_e2e_17_rekey_is_not_authorized_by_assume_yes() {
         "the explicit approval should have landed"
     );
     println!("✅ Rekey refused under --yes, accepted on an explicit decision");
+}
+
+/// Plant a real Squads ConfigTransaction (plus its proposal) at the multisig's
+/// next index, signed by the member at `keypair_path`. Models a member using an
+/// out-of-band Squads client to propose a membership change.
+fn propose_raw_config_transaction(
+    client: &RpcClient,
+    multisig: &Pubkey,
+    keypair_path: &str,
+    actions: Vec<ConfigAction>,
+) -> u64 {
+    use feature_gate_multisig_tool::squads::{
+        ConfigTransactionCreateArgs, ConfigTransactionCreateData, InstructionData,
+        MultisigCreateProposalAccounts, MultisigCreateProposalArgs, MultisigCreateProposalData,
+    };
+
+    let signer = load_signer(keypair_path, "proposer").expect("load proposer keypair");
+    let state = fetch_squads_multisig(client, multisig, "multisig").expect("fetch multisig");
+    let index = state.transaction_index + 1;
+    let (transaction_pda, _) = get_transaction_pda(multisig, index);
+    let (proposal_pda, _) = get_proposal_pda(multisig, index);
+
+    let create = solana_instruction::Instruction::new_with_bytes(
+        SQUADS_MULTISIG_PROGRAM_ID,
+        &ConfigTransactionCreateData {
+            args: ConfigTransactionCreateArgs {
+                actions,
+                memo: None,
+            },
+        }
+        .data()
+        .expect("serialize config create"),
+        vec![
+            solana_instruction::AccountMeta::new(*multisig, false),
+            solana_instruction::AccountMeta::new(transaction_pda, false),
+            solana_instruction::AccountMeta::new_readonly(signer.pubkey(), true),
+            solana_instruction::AccountMeta::new(signer.pubkey(), true),
+            solana_instruction::AccountMeta::new_readonly(
+                solana_system_interface::program::ID,
+                false,
+            ),
+        ],
+    );
+    let propose = solana_instruction::Instruction::new_with_bytes(
+        SQUADS_MULTISIG_PROGRAM_ID,
+        &MultisigCreateProposalData {
+            args: MultisigCreateProposalArgs {
+                transaction_index: index,
+                is_draft: false,
+            },
+        }
+        .data()
+        .expect("serialize proposal create"),
+        MultisigCreateProposalAccounts {
+            multisig: *multisig,
+            proposal: proposal_pda,
+            creator: signer.pubkey(),
+            rent_payer: signer.pubkey(),
+            system_program: solana_system_interface::program::ID,
+        }
+        .to_account_metas(),
+    );
+
+    let message = solana_message::v0::Message::try_compile(
+        &signer.pubkey(),
+        &[create, propose],
+        &[],
+        client.get_latest_blockhash().expect("blockhash"),
+    )
+    .expect("compile config create");
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*signer]).expect("sign");
+    send_and_confirm_transaction(&transaction, client).expect("create config proposal");
+    index
+}
+
+/// Test 18: a config transaction can rewrite membership; a vault transaction
+/// cannot touch governance. Naming a config transaction `--kind activate` must
+/// not let it be approved as a routine vault send with its actions unseen.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_18_config_change_is_not_approvable_as_a_vault_transaction() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test18", 2);
+
+    // A member proposes adding an attacker key with full permissions - a
+    // governance rewrite, not the canonical rekey.
+    let attacker = Keypair::new().pubkey();
+    let index = propose_raw_config_transaction(
+        &client,
+        &multisig,
+        &eoa_keypaths[0],
+        vec![ConfigAction::AddMember {
+            new_member: Member {
+                key: attacker,
+                permissions: Permissions::all(),
+            },
+        }],
+    );
+    println!("✅ Planted an AddMember config proposal at index {index}");
+
+    // Under `--yes`, approving it as an activation must not go through: the
+    // unverified-proposal gate resolves to its false default and aborts.
+    let error = with_assume_yes(|| {
+        proposal_command(
+            &config,
+            ProposalCommand::Approve,
+            ProposalCommandArgs {
+                multisig: multisig.to_string(),
+                kind: TransactionKind::Activate,
+                voting_key: Some(eoa_pubkeys[0].to_string()),
+                keypair: Some(eoa_keypaths[0].clone()),
+                index: Some(index),
+            },
+        )
+        .expect_err("a config change must not be approvable as an activation under --yes")
+    });
+    let message = error.to_string();
+    println!("✅ Refused with: {message}");
+
+    // The refusal has to name it as a config change. "Vault transaction" was the
+    // old label and implies it cannot alter governance at all.
+    assert!(
+        message.contains("Config change"),
+        "the refusal must name it as a config change, got: {message}"
+    );
+    assert!(
+        !message.contains("Vault transaction"),
+        "a config change must not be labelled a vault transaction, got: {message}"
+    );
+
+    let proposal = proposal_at(&client, &multisig, index);
+    assert!(
+        proposal.approved.is_empty(),
+        "no approval should have landed on the config change, got {:?}",
+        proposal.approved
+    );
+
+    // The attacker is not a member.
+    let state = fetch_squads_multisig(&client, &multisig, "multisig").expect("refetch multisig");
+    assert!(
+        !state.members.iter().any(|m| m.key == attacker),
+        "attacker must not have been added"
+    );
+    println!("✅ Config change refused and left unapproved");
 }

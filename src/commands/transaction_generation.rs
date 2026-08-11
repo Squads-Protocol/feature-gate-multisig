@@ -8,7 +8,6 @@ use crate::squads::{
     deserialize_squads_account, get_vault_pda, Multisig as SquadsMultisig, TransactionMessage,
     MULTISIG_ACCOUNT_DISCRIMINATOR, PERMISSION_EXECUTE, PERMISSION_INITIATE, PERMISSION_VOTE,
     PROPOSAL_APPROVE_DISCRIMINATOR, PROPOSAL_REJECT_DISCRIMINATOR, SQUADS_MULTISIG_PROGRAM_ID,
-    VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
 };
 use crate::{
     output,
@@ -255,28 +254,53 @@ fn warn_on_duplicate_proposal(
 /// count of members who could still cast a vote, rather than leaving a signer to
 /// derive them from the action list, and defaults to no. Defaulting to no also
 /// means `--yes` aborts here instead of resolving it to a silent yes.
+/// Authenticated read of the transaction at `index`. Returns None when the
+/// account is a vault transaction rather than a config one, so callers select
+/// the disclosure from the account discriminator instead of a caller-supplied
+/// `--kind`. One read both decides and discloses, so a substituting endpoint
+/// cannot answer the classification honestly and the disclosure differently.
+fn read_config_transaction(
+    rpc_client: &solana_rpc_client::rpc_client::RpcClient,
+    multisig_address: &Pubkey,
+    transaction_index: u64,
+) -> Result<Option<crate::squads::ConfigTransaction>> {
+    use crate::squads::{
+        get_transaction_pda, ConfigTransaction, CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+    };
+
+    let (transaction_pda, _) = get_transaction_pda(multisig_address, transaction_index);
+    let data = crate::provision::get_squads_account_data_with_retry(rpc_client, &transaction_pda)?;
+    let Ok(config_tx) = deserialize_squads_account::<ConfigTransaction>(
+        &data,
+        CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+        "config transaction",
+    ) else {
+        return Ok(None);
+    };
+    if config_tx.multisig != *multisig_address || config_tx.index != transaction_index {
+        return Err(eyre::eyre!(
+            "Config transaction at index {transaction_index} records multisig {} index {}. Refusing to disclose or act on it.",
+            config_tx.multisig,
+            config_tx.index
+        ));
+    }
+    Ok(Some(config_tx))
+}
+
 fn confirm_config_change(
     rpc_client: &solana_rpc_client::rpc_client::RpcClient,
     multisig_address: &Pubkey,
     transaction_index: u64,
+    config_tx: &crate::squads::ConfigTransaction,
     verb: &str,
 ) -> Result<bool> {
-    use crate::squads::{
-        get_transaction_pda, ConfigAction, ConfigTransaction,
-        CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
-    };
+    use crate::squads::ConfigAction;
 
     let multisig = fetch_squads_multisig(rpc_client, multisig_address, "multisig")?;
-    let (transaction_pda, _) = get_transaction_pda(multisig_address, transaction_index);
-    let account = rpc_client.get_account(&transaction_pda)?;
-    let config_tx: ConfigTransaction = deserialize_squads_account(
-        &account.data,
-        CONFIG_TRANSACTION_ACCOUNT_DISCRIMINATOR,
-        "config transaction",
-    )?;
 
     output::Output::header(&format!(
-        "Config change at index {transaction_index} on multisig {multisig_address}"
+        "Config change at index {transaction_index} on multisig {multisig_address} via {}",
+        rpc_client.url()
     ));
 
     // Replay the actions over the current members to state the end result
@@ -323,6 +347,12 @@ fn confirm_config_change(
         &usable_voters.to_string(),
     );
 
+    let voters_before = multisig
+        .members
+        .iter()
+        .filter(|m| m.key != Pubkey::default() && (m.permissions.mask & PERMISSION_VOTE) != 0)
+        .count();
+
     if usable_voters == 0 {
         output::Output::warning(
             "No remaining member can sign. This permanently disables voting on this multisig, and it cannot be undone.",
@@ -330,6 +360,17 @@ fn confirm_config_change(
     } else if usable_voters < usize::from(threshold) {
         output::Output::warning(&format!(
             "Only {usable_voters} member(s) can sign but the threshold is {threshold}; the multisig will be unable to reach quorum."
+        ));
+    } else if usable_voters == 1 {
+        // Between "nobody can sign" and "quorum unreachable" sits the case that
+        // actually hands over control: exactly one signer left, and a threshold
+        // it can meet alone.
+        output::Output::warning(&format!(
+            "This leaves a single member able to sign, with a threshold of {threshold}: that member would control this multisig alone."
+        ));
+    } else if usable_voters < voters_before {
+        output::Output::warning(&format!(
+            "This reduces the members able to sign from {voters_before} to {usable_voters}."
         ));
     }
 
@@ -673,15 +714,17 @@ fn handle_parent_multisig_flow(
     // unverified input - and this line is what parent members read before
     // voting. Creation is the one case with nothing yet to classify, so there
     // the requested kind is the truth.
-    let type_label = match operation {
-        ProposalAction::Create => kind.label().to_string(),
-        _ => crate::commands::proposal::describe_transaction(
+    let on_chain_kind = match operation {
+        ProposalAction::Create => None,
+        _ => Some(crate::commands::proposal::describe_transaction(
             &rpc_client,
             &feature_gate_multisig_address,
             proposal_index,
-        )
-        .label()
-        .to_string(),
+        )),
+    };
+    let type_label = match on_chain_kind {
+        Some(on_chain) => on_chain.label().to_string(),
+        None => kind.label().to_string(),
     };
     output::Output::field("Transaction Type", &type_label);
     output::Output::field("Action", &action_description);
@@ -699,12 +742,14 @@ fn handle_parent_multisig_flow(
     // action, so the parent's vote on it is an explicit decision rather than a
     // default yes. Rejecting one is the safe direction and stays easy - a
     // default of no there would just make it harder to stop a rekey.
+    //
+    // Keyed off the on-chain class, not the caller's `--kind`: naming a config
+    // transaction `--kind activate` previously restored the default yes.
+    let child_is_config = matches!(child_flavor, ChildTransactionFlavor::Config)
+        || on_chain_kind.is_some_and(|kind| kind.is_config_transaction());
     let default_answer = !matches!(
-        (child_flavor, operation),
-        (
-            ChildTransactionFlavor::Config,
-            ProposalAction::Approve | ProposalAction::Execute
-        )
+        (child_is_config, operation),
+        (true, ProposalAction::Approve | ProposalAction::Execute)
     );
     if !confirm_action(confirmation_prompt, default_answer) {
         output::Output::info("Parent multisig proposal creation cancelled.");
@@ -851,7 +896,7 @@ pub fn reject_common_feature_gate_proposal(
     )?;
 
     if !confirm_action("Send this reject transaction now?", true) {
-        output::Output::hint("Skipped sending. You can submit the above encoded transaction manually or rerun to send.");
+        output::Output::hint("Skipped sending. Rerun to send.");
         return Ok(());
     }
 
@@ -913,21 +958,15 @@ pub fn execute_common_feature_gate_proposal(
             );
         }
 
-        // Vault transaction execute path
-        use crate::squads::{get_transaction_pda, VaultTransaction};
-        let (child_transaction_pda, _) =
-            get_transaction_pda(&feature_gate_multisig_address, proposal_index);
-        let child_transaction_account_data = rpc_client
-            .get_account_data(&child_transaction_pda)
-            .map_err(|e| eyre::eyre!("Failed to fetch child transaction account: {}", e))?;
-        let child_transaction_contents: VaultTransaction = deserialize_squads_account(
-            &child_transaction_account_data,
-            VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
-            "child vault transaction",
-        )?;
-        let child_transaction_message = child_transaction_contents.message;
-
-        // Build execution account metas from the child transaction.
+        // Vault transaction execute path. These metas are committed on-chain
+        // inside a parent proposal other members ratify, so the record they come
+        // from has to be authenticated rather than merely decodable.
+        let child_transaction_message = crate::provision::fetch_vault_transaction(
+            &rpc_client,
+            &feature_gate_multisig_address,
+            proposal_index,
+        )?
+        .message;
         let child_execution_account_metas = child_transaction_message.execution_account_metas()?;
 
         return handle_parent_multisig_flow(
@@ -967,7 +1006,7 @@ pub fn execute_common_feature_gate_proposal(
 
     // Confirm before sending on-chain (EOA execute path)
     if !confirm_action("Send this execute transaction now?", true) {
-        output::Output::hint("Skipped sending. You can submit the above encoded transaction manually or rerun to send.");
+        output::Output::hint("Skipped sending. Rerun to send.");
         return Ok(());
     }
 
@@ -1127,6 +1166,32 @@ pub fn rekey_multisig_feature_gate(
         &feature_gate_multisig_address,
         "feature gate multisig",
     )?;
+
+    // A rekey removes one member per member the endpoint reported, so an endpoint
+    // that omits one produces a "brick" that instead leaves that member in sole
+    // control. The PDA binding only proves create_key and bump, not the member
+    // vector, so corroborate against the roster saved locally at creation.
+    let reported: std::collections::HashSet<String> = feature_gate_ms
+        .members
+        .iter()
+        .map(|m| m.key.to_string())
+        .collect();
+    let missing: Vec<&String> = config
+        .members
+        .iter()
+        .filter(|saved| !reported.contains(*saved))
+        .collect();
+    if !missing.is_empty() {
+        return Err(eyre::eyre!(
+            "This endpoint reports a member set missing {} saved member(s): {}. A rekey built from it would leave them in control instead of removing them. Refusing to continue.",
+            missing.len(),
+            missing
+                .iter()
+                .map(|m| m.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     // Build config actions for rekey
     let actions = build_config_actions_for_kind(TransactionKind::Rekey, &feature_gate_ms.members)?;
@@ -1365,16 +1430,22 @@ fn approve_common_proposal(
 
     // A config change is disclosed in full and confirmed on its own terms; a
     // feature gate action keeps the routine send prompt.
-    let confirmed = match flavor {
-        ProposalFlavor::Config => {
-            confirm_config_change(&rpc_client, &multisig_address, proposal_index, "Approve")?
-        }
-        ProposalFlavor::Vault(_) => confirm_action("Send this approve transaction now?", true),
+    // Select the disclosure from the on-chain account type, not from `flavor`,
+    // which is the unverified `--kind` the caller passed. Approving a config
+    // transaction as `--kind activate` previously took the vault arm and its
+    // member and threshold changes were never shown.
+    let confirmed = match read_config_transaction(&rpc_client, &multisig_address, proposal_index)? {
+        Some(config_tx) => confirm_config_change(
+            &rpc_client,
+            &multisig_address,
+            proposal_index,
+            &config_tx,
+            "Approve",
+        )?,
+        None => confirm_action("Send this approve transaction now?", true),
     };
     if !confirmed {
-        output::Output::hint(
-            "Skipped sending. You can submit the above encoded transaction manually or rerun to send.",
-        );
+        output::Output::hint("Skipped sending. Rerun to send.");
         return Ok(());
     }
 
@@ -1456,8 +1527,21 @@ pub fn execute_common_config_change(
 
     // Execution is the irreversible step, so disclose the full effect here too
     // rather than relying on whatever was shown at approval time.
-    if !confirm_config_change(&rpc_client, &multisig_address, transaction_index, "Execute")? {
-        output::Output::hint("Skipped sending. You can submit the above encoded transaction manually or rerun to send.");
+    let Some(config_tx) =
+        read_config_transaction(&rpc_client, &multisig_address, transaction_index)?
+    else {
+        return Err(eyre::eyre!(
+            "Proposal #{transaction_index} is not a config transaction; refusing to execute it as one."
+        ));
+    };
+    if !confirm_config_change(
+        &rpc_client,
+        &multisig_address,
+        transaction_index,
+        &config_tx,
+        "Execute",
+    )? {
+        output::Output::hint("Skipped sending. Rerun to send.");
         return Ok(());
     }
 

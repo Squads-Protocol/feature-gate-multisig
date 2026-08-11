@@ -1,8 +1,9 @@
 use crate::commands::proposal::{describe_transaction, proposal_status_label, ProposalKind};
 use crate::commands::verify::report_cross_network_consistency;
+use crate::constants::MAX_LISTED_PROPOSALS;
 use crate::output::Output;
 use crate::provision::{
-    create_rpc_client, fetch_squads_multisig, get_squads_account_data_with_retry,
+    create_rpc_client, fetch_proposal, fetch_squads_multisig, get_squads_account_data_with_retry,
 };
 use crate::squads::{
     deserialize_squads_account, get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction,
@@ -12,8 +13,8 @@ use crate::squads::{
 };
 use crate::utils::*;
 use crate::verification::{
-    is_autonomous, is_mainnet_cluster, is_rekeyed, known_signer_name, member_set_warnings,
-    multisig_safety_warnings, program_warnings, verify_feature_gate, verify_squads_program,
+    is_autonomous, is_rekeyed, known_signer_name, member_set_warnings, multisig_safety_warnings,
+    program_warnings, resolve_cluster, verify_feature_gate, verify_squads_program,
     FeatureGateStatus,
 };
 use colored::*;
@@ -53,6 +54,19 @@ pub fn show_command(
     show_multisig(config, &address, &rpc_url, detail_index)
 }
 
+/// The newest proposal indices a listing walks, capped. `transaction_index` is
+/// unbounded data from the endpoint, so it must not size an allocation or drive
+/// one network round trip per unit.
+fn listed_indices(transaction_index: u64) -> Vec<u64> {
+    if transaction_index == 0 {
+        return Vec::new();
+    }
+    let oldest = transaction_index
+        .saturating_sub(MAX_LISTED_PROPOSALS - 1)
+        .max(1);
+    (oldest..=transaction_index).collect()
+}
+
 fn show_multisig(
     config: &Config,
     address: &str,
@@ -71,8 +85,20 @@ fn show_multisig(
     // tells us what this multisig is. A parent (voting) multisig's proposals
     // wrap actions on child multisigs; a feature gate multisig's proposals
     // act on the feature account.
-    let kinds: Vec<ProposalKind> = (1..=multisig.transaction_index)
-        .map(|index| describe_transaction(&rpc_client, &multisig_pubkey, index))
+    // transaction_index is unbounded remote data and the PDA binding does not
+    // constrain it, so cap the sweep instead of allocating and fetching per the
+    // endpoint's count. Same window the interactive picker uses.
+    let shown = listed_indices(multisig.transaction_index);
+    if let Some(oldest) = shown.first().filter(|oldest| **oldest > 1) {
+        Output::info(&format!(
+            "Showing proposals {oldest}-{}; {} older ones are not listed.",
+            multisig.transaction_index,
+            oldest - 1
+        ));
+    }
+    let kinds: Vec<ProposalKind> = shown
+        .iter()
+        .map(|index| describe_transaction(&rpc_client, &multisig_pubkey, *index))
         .collect();
     let looks_like_parent = kinds
         .iter()
@@ -90,8 +116,6 @@ fn show_multisig(
     let mut network_multisigs: Vec<(&str, Multisig)> = Vec::new();
 
     if looks_like_parent {
-        // Vault 0 of a parent is its voting identity on child multisigs, not a
-        // feature gate; reporting a "feature state" for it would be misleading.
         Output::header(&format!("📋 Squads Multisig {multisig_pubkey}"));
         Output::info(
             "This looks like a parent (voting) multisig: its proposals act on child multisigs.",
@@ -100,32 +124,43 @@ fn show_multisig(
             "Voting identity (vault 0)",
             &format!("{vault0} (appears as a member on child multisigs)"),
         );
-        for url in &networks {
-            let client = create_rpc_client(url);
-            if let Ok(ms) = fetch_squads_multisig(&client, &multisig_pubkey, "multisig") {
-                network_multisigs.push((get_network_display(url), ms));
-            }
-        }
     } else {
         Output::header(&format!("📋 Feature Gate Multisig {multisig_pubkey}"));
         Output::field("Feature gate (vault 0)", &vault0.to_string());
+    }
 
-        // Per-network sweep: feature state (cheap, two RPC calls per network)
-        // and each network's multisig config for the drift check further down.
-        let mut states: Vec<String> = Vec::new();
-        for url in &networks {
-            let client = create_rpc_client(url);
-            let state = match verify_feature_gate(&client, &multisig_pubkey) {
-                Ok(v) => feature_status_label(&v.status),
-                Err(_) => "unreachable".to_string(),
-            };
-            states.push(format!("{}: {}", get_network_display(url), state));
-            if let Ok(ms) = fetch_squads_multisig(&client, &multisig_pubkey, "multisig") {
-                network_multisigs.push((get_network_display(url), ms));
+    // One sweep for both layouts. Keeping it out of the branch above means vault
+    // 0's on-chain state is always reported: the parent layout is chosen by a
+    // heuristic any member can trip with a single unapproved proposal, and it
+    // used to suppress this line entirely.
+    let mut states: Vec<String> = Vec::new();
+    let mut unreadable: Vec<&str> = Vec::new();
+    for url in &networks {
+        let client = create_rpc_client(url);
+        let state = match verify_feature_gate(&client, &multisig_pubkey) {
+            Ok(v) => feature_status_label(&v.status),
+            Err(_) => "unreachable".to_string(),
+        };
+        states.push(format!("{}: {}", get_network_display(url), state));
+        // Name a network that drops out. Silently omitting it shrank the
+        // denominator behind the consistency and rekey verdicts below.
+        match fetch_squads_multisig(&client, &multisig_pubkey, "multisig") {
+            Ok(ms) => network_multisigs.push((get_network_display(url), ms)),
+            Err(e) => {
+                Output::warning(&format!(
+                    "Multisig not readable on {}: {e}",
+                    get_network_display(url)
+                ));
+                unreadable.push(get_network_display(url));
             }
         }
-        Output::field("Feature state", &states.join(" | "));
     }
+    let state_label = if looks_like_parent {
+        "Vault 0 state"
+    } else {
+        "Feature state"
+    };
+    Output::field(state_label, &states.join(" | "));
 
     let voting_members = multisig
         .members
@@ -153,8 +188,13 @@ fn show_multisig(
         .map(|(network, _)| *network)
         .collect();
     if !rekeyed_on.is_empty() {
-        let scope = if rekeyed_on.len() == network_multisigs.len() {
+        let scope = if rekeyed_on.len() == network_multisigs.len() && unreadable.is_empty() {
             String::new()
+        } else if !unreadable.is_empty() {
+            format!(
+                "; {} was not readable and has not been checked",
+                unreadable.join(", ")
+            )
         } else {
             "; the other networks remain active".to_string()
         };
@@ -168,7 +208,15 @@ fn show_multisig(
     // network (this is the expensive one: it downloads the program bytecode).
     match verify_squads_program(&rpc_client) {
         Ok(program) => {
-            let mainnet = is_mainnet_cluster(&rpc_client).unwrap_or_else(|_| is_mainnet(rpc_url));
+            // Same cross-check as `verify`: the endpoint must not be able to
+            // pick how strictly its own program is checked.
+            let mainnet = match resolve_cluster(&rpc_client, rpc_url) {
+                Ok((mainnet, _)) => mainnet,
+                Err(e) => {
+                    Output::error(&e.to_string());
+                    return Err(e);
+                }
+            };
             let warnings = program_warnings(&program, mainnet);
             if warnings.is_empty() {
                 let status = if mainnet {
@@ -198,6 +246,13 @@ fn show_multisig(
     display_proposals_summary(&rpc_client, &multisig_pubkey, &multisig, &kinds);
 
     report_cross_network_consistency(&network_multisigs);
+    if !unreadable.is_empty() {
+        Output::warning(&format!(
+            "This sweep is incomplete: {} could not be read, so nothing above accounts for {}.",
+            unreadable.join(", "),
+            if unreadable.len() == 1 { "it" } else { "them" }
+        ));
+    }
 
     if let Some(index) = detail_index {
         if index == 0 || index > multisig.transaction_index {
@@ -252,19 +307,11 @@ fn display_proposals_summary(
     }
 
     let mut rows = Vec::new();
-    for index in 1..=multisig.transaction_index {
+    for index in listed_indices(multisig.transaction_index) {
         let kind = kinds
             .get(index as usize - 1)
             .map_or("Unknown", |k| k.label());
-        let (proposal_pda, _) = get_proposal_pda(multisig_pubkey, index);
-        let proposal = rpc_client.get_account(&proposal_pda).ok().and_then(|acc| {
-            deserialize_squads_account::<Proposal>(
-                &acc.data,
-                PROPOSAL_ACCOUNT_DISCRIMINATOR,
-                "proposal",
-            )
-            .ok()
-        });
+        let proposal = fetch_proposal(rpc_client, multisig_pubkey, index).ok();
         let (status, approvals, rejections) = match proposal {
             Some(p) => (
                 proposal_status_label(&p.status).to_string(),
@@ -343,7 +390,8 @@ fn offer_detail_drilldown(
         return Ok(());
     }
     loop {
-        let mut options: Vec<String> = (1..=multisig.transaction_index)
+        let mut options: Vec<String> = listed_indices(multisig.transaction_index)
+            .into_iter()
             .map(|i| format!("#{i}"))
             .collect();
         options.push("Done".to_string());
@@ -466,7 +514,7 @@ fn fetch_and_display_transaction(
     let transaction = match result {
         Ok(tx) => tx,
         Err(e) => {
-            println!("  ❌ {}", e);
+            println!("  ❌ {}", crate::output::scrub(&e.to_string()));
             return Ok(());
         }
     };
@@ -746,7 +794,7 @@ fn display_vault_transaction(transaction: &VaultTransaction, tx_index: u64) {
             #[derive(Tabled)]
             struct AccountKeyInfo {
                 #[tabled(rename = "Index")]
-                index: u8,
+                index: usize,
                 #[tabled(rename = "Public Key")]
                 pubkey: String,
                 #[tabled(rename = "Role")]
@@ -759,24 +807,22 @@ fn display_vault_transaction(transaction: &VaultTransaction, tx_index: u64) {
                 .iter()
                 .enumerate()
                 .map(|(i, pubkey)| {
-                    let role = if i < transaction.message.num_signers as usize {
-                        if i < transaction.message.num_writable_signers as usize {
-                            "Writable Signer"
-                        } else {
-                            "Read-only Signer"
-                        }
-                    } else if i
-                        < (transaction.message.num_signers
-                            + transaction.message.num_writable_non_signers)
-                            as usize
-                    {
-                        "Writable Non-signer"
-                    } else {
-                        "Read-only Non-signer"
+                    // Writability comes from the same function that builds the
+                    // real execution metas, so the displayed role always matches
+                    // what Squads applies. Computing it here summed two u8 header
+                    // fields before widening, which wrapped above 255 and showed
+                    // writable accounts as read-only.
+                    let signer = i < usize::from(transaction.message.num_signers);
+                    let writable = transaction.message.is_static_writable_index(i);
+                    let role = match (signer, writable) {
+                        (true, true) => "Writable Signer",
+                        (true, false) => "Read-only Signer",
+                        (false, true) => "Writable Non-signer",
+                        (false, false) => "Read-only Non-signer",
                     };
 
                     AccountKeyInfo {
-                        index: i as u8,
+                        index: i,
                         pubkey: pubkey.to_string(),
                         role: role.to_string(),
                     }
@@ -824,7 +870,7 @@ fn fetch_and_display_proposal(
         {
             Ok(prop) => prop,
             Err(e) => {
-                println!("  ❌ {}", e);
+                println!("  ❌ {}", crate::output::scrub(&e.to_string()));
                 return Ok(());
             }
         };

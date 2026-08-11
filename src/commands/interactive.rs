@@ -6,11 +6,8 @@ use crate::commands::{
     ProposalCommand, ProposalCommandArgs, TransactionKind,
 };
 use crate::output::Output;
-use crate::provision::{create_rpc_client, fetch_squads_multisig};
-use crate::squads::{
-    deserialize_squads_account, get_proposal_pda, get_vault_pda, Proposal, ProposalStatus,
-    PROPOSAL_ACCOUNT_DISCRIMINATOR,
-};
+use crate::provision::{create_rpc_client, fetch_proposal, fetch_squads_multisig};
+use crate::squads::{get_vault_pda, ProposalStatus};
 use crate::utils::*;
 use eyre::Result;
 use inquire::{Confirm, Select, Text};
@@ -234,7 +231,7 @@ fn prompt_for_proposal_index(
     multisig: &Pubkey,
     action: ProposalCommand,
 ) -> Result<(u64, ProposalKind)> {
-    const MAX_LISTED: u64 = 10;
+    const MAX_LISTED: u64 = crate::constants::MAX_LISTED_PROPOSALS;
 
     let mut entries: Vec<(u64, ProposalKind)> = Vec::new();
     let mut options: Vec<String> = Vec::new();
@@ -251,9 +248,11 @@ fn prompt_for_proposal_index(
                 ));
             }
             for index in first..=ms.transaction_index {
-                let (proposal_pda, _) = get_proposal_pda(multisig, index);
-                let account = match rpc_client.get_account(&proposal_pda) {
-                    Ok(account) => account,
+                // Authenticated: the status below decides whether this proposal
+                // is offered at all, so an unauthenticated record could hide a
+                // live one or invent a vote count next to a trustworthy label.
+                let proposal = match fetch_proposal(rpc_client, multisig, index) {
+                    Ok(proposal) => proposal,
                     Err(e) => {
                         let msg = e.to_string();
                         // Missing accounts are normal (closed/reclaimed); only a
@@ -266,13 +265,6 @@ fn prompt_for_proposal_index(
                         }
                         continue;
                     }
-                };
-                let Ok(proposal) = deserialize_squads_account::<Proposal>(
-                    &account.data,
-                    PROPOSAL_ACCOUNT_DISCRIMINATOR,
-                    "proposal",
-                ) else {
-                    continue;
                 };
                 let kind = describe_transaction(rpc_client, multisig, index);
                 if !is_actionable(

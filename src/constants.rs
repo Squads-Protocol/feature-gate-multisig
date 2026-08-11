@@ -19,3 +19,8 @@ pub const BASE_ACCOUNT_RETRY_DELAY_MS: u64 = 500;
 
 // Default network URLs
 pub const DEFAULT_DEVNET_URL: &str = "https://api.devnet.solana.com";
+
+/// How many of the newest proposals a listing walks. `transaction_index` is
+/// unbounded data from the endpoint, so it must not drive allocation or
+/// per-item network work.
+pub const MAX_LISTED_PROPOSALS: u64 = 10;

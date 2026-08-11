@@ -3,10 +3,10 @@ use crate::constants::DEFAULT_DEVNET_URL;
 use crate::output::Output;
 use crate::provision::{create_rpc_client, fetch_squads_multisig};
 use crate::squads::{Multisig, PERMISSION_VOTE};
-use crate::utils::{get_network_display, is_mainnet, validate_pubkey_with_retry, Config};
+use crate::utils::{get_network_display, validate_pubkey_with_retry, Config};
 use crate::verification::{
-    config_fingerprint, is_autonomous, is_mainnet_cluster, is_rekeyed, member_set_warnings,
-    multisig_safety_warnings, program_warnings, verify_feature_gate, verify_squads_program,
+    config_fingerprint, is_autonomous, is_rekeyed, member_set_warnings, multisig_safety_warnings,
+    program_warnings, resolve_cluster, verify_feature_gate, verify_squads_program,
     FeatureVerification, ProgramAuthenticity,
 };
 use eyre::Result;
@@ -34,8 +34,8 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
     Output::header(&format!("🔎 Verifying feature gate multisig {multisig}"));
 
     let mut seen = Vec::new();
-    // Warn-and-exit-0 reads as "verified" to anything checking the exit code,
-    // so an incomplete check has to fail the command.
+    // Warn-and-exit-0 reads as "verified" to anything checking the exit code, so
+    // a check that could not run - or ran and reported a problem - has to fail.
     let mut incomplete = false;
     for network in &networks {
         println!();
@@ -45,18 +45,23 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
             network
         ));
         let rpc = create_rpc_client(network);
-        // Identify the cluster from its genesis hash rather than trusting the URL;
-        // fall back to the URL heuristic only if the RPC call fails.
-        let mainnet = match is_mainnet_cluster(&rpc) {
-            Ok(mainnet) => mainnet,
-            Err(e) => {
-                let fallback = is_mainnet(network);
+        // Cluster identity decides how strictly the program is checked, so the
+        // endpoint's self-report is cross-checked against the URL and any
+        // disagreement stops the run rather than relaxing the audit.
+        let mainnet = match resolve_cluster(&rpc, network) {
+            Ok((mainnet, true)) => mainnet,
+            Ok((fallback, false)) => {
                 Output::warning(&format!(
-                    "Could not detect cluster from genesis hash ({e}); \
-                     falling back to URL heuristic (mainnet: {fallback})."
+                    "Could not detect the cluster from its genesis hash; using the URL \
+                     heuristic (mainnet: {fallback}). The cluster is unverified."
                 ));
                 incomplete = true;
                 fallback
+            }
+            Err(e) => {
+                Output::error(&e.to_string());
+                incomplete = true;
+                continue;
             }
         };
         let (found, failed) = verify_on_network(&rpc, &multisig, mainnet);
@@ -66,18 +71,20 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
         }
     }
 
-    report_cross_network_consistency(&seen);
+    // Drift between clusters means at least one deployment is tampered or stale.
+    incomplete |= report_cross_network_consistency(&seen);
 
     if incomplete {
         return Err(eyre::eyre!(
-            "Verification did not complete on every network; see the warnings above. \
-             The multisig has not been shown to be correct."
+            "Verification failed: see the warnings above. The multisig has not been shown to be correct."
         ));
     }
     Ok(())
 }
 
-/// Returns the multisig if readable, and whether any check failed.
+/// Returns the multisig if readable, and whether any check failed - either
+/// because it could not run, or because it ran and reported a problem. The
+/// latter is the stronger negative of the two, so it fails the command too.
 fn verify_on_network(
     rpc: &RpcClient,
     multisig: &Pubkey,
@@ -85,14 +92,14 @@ fn verify_on_network(
 ) -> (Option<Multisig>, bool) {
     let mut failed = false;
     match verify_squads_program(rpc) {
-        Ok(p) => display_program_authenticity(&p, is_mainnet),
+        Ok(p) => failed |= display_program_authenticity(&p, is_mainnet),
         Err(e) => {
             Output::warning(&format!("Could not verify Squads program: {e}"));
             failed = true;
         }
     }
     match verify_feature_gate(rpc, multisig) {
-        Ok(v) => display_feature(&v),
+        Ok(v) => failed |= display_feature(&v),
         Err(e) => {
             Output::warning(&format!("Could not read feature gate account: {e}"));
             failed = true;
@@ -100,7 +107,7 @@ fn verify_on_network(
     }
     match fetch_squads_multisig(rpc, multisig, "multisig") {
         Ok(ms) => {
-            display_owners(&ms);
+            failed |= display_owners(&ms);
             (Some(ms), failed)
         }
         Err(e) => {
@@ -113,9 +120,10 @@ fn verify_on_network(
 /// Flag governance-config drift across networks. The tool deploys identical
 /// config everywhere, so any difference between the clusters where the multisig
 /// exists points to a tampered or stale deployment.
-pub(crate) fn report_cross_network_consistency(seen: &[(&str, Multisig)]) {
+/// Returns true when the deployments disagree.
+pub(crate) fn report_cross_network_consistency(seen: &[(&str, Multisig)]) -> bool {
     if seen.len() < 2 {
-        return;
+        return false;
     }
     println!();
     Output::header("🔗 Cross-network Consistency");
@@ -130,20 +138,29 @@ pub(crate) fn report_cross_network_consistency(seen: &[(&str, Multisig)]) {
         .collect();
 
     if mismatched.is_empty() {
+        // Name the networks compared: "all N" counted only the endpoints that
+        // answered, so a dropped cluster shrank the claim without saying so.
         Output::success(&format!(
-            "Multisig config is identical across all {} networks.",
-            seen.len()
+            "Multisig config is identical across the {} networks compared ({}).",
+            seen.len(),
+            seen.iter()
+                .map(|(net, _)| *net)
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
+        false
     } else {
         Output::warning(&format!(
             "Multisig config on {} differs from {}; the deployment is inconsistent across networks.",
             mismatched.join(", "),
             first_net
         ));
+        true
     }
 }
 
-fn display_program_authenticity(p: &ProgramAuthenticity, is_mainnet: bool) {
+/// Returns true when the program failed authenticity checks.
+fn display_program_authenticity(p: &ProgramAuthenticity, is_mainnet: bool) -> bool {
     println!();
     Output::header("⚙️ Squads Program Authenticity");
     Output::field("Program", &p.program_id.to_string());
@@ -175,23 +192,37 @@ fn display_program_authenticity(p: &ProgramAuthenticity, is_mainnet: bool) {
         } else {
             Output::success("Squads program is present and loaded by the upgradeable loader.");
         }
+        false
     } else {
-        for warning in warnings {
-            Output::warning(&warning);
+        for warning in &warnings {
+            Output::warning(warning);
         }
+        true
     }
 }
 
-fn display_feature(v: &FeatureVerification) {
+/// Returns true when the feature account is in an unexpected state - an owner or
+/// data length this tool does not recognise.
+fn display_feature(v: &FeatureVerification) -> bool {
     println!();
     Output::header("🪄 Feature Gate");
     Output::field("Feature gate ID (vault 0)", &v.feature_id.to_string());
     Output::field("Status", &format!("{:?}", v.status));
     Output::field("Lamports", &v.lamports.to_string());
     Output::field("Rent-exempt", &v.rent_exempt.to_string());
+    if let crate::verification::FeatureGateStatus::Unexpected { owner, data_len } = &v.status {
+        Output::warning(&format!(
+            "Feature gate account is in an unexpected state: owner {owner}, {data_len} bytes."
+        ));
+        return true;
+    }
+    false
 }
 
-fn display_owners(ms: &Multisig) {
+/// Returns true when the owner set is not binding, i.e. a config authority can
+/// rewrite members and threshold unilaterally. A time lock or a completed rekey
+/// are intended states and only warn.
+fn display_owners(ms: &Multisig) -> bool {
     let voting_members = ms
         .members
         .iter()
@@ -222,4 +253,6 @@ fn display_owners(ms: &Multisig) {
     for warning in member_set_warnings(ms) {
         Output::warning(&warning);
     }
+
+    !is_autonomous(ms)
 }

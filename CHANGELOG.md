@@ -5,6 +5,55 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Cluster identity is established in a way the endpoint cannot relax. Answering
+  "not mainnet" previously skipped the immutability and bytecode-hash
+  assertions, letting the party being checked choose how strictly it was
+  checked. A mainnet fork on a custom URL stays strict; a URL naming mainnet
+  whose chain disagrees is refused. Governance actions establish the cluster
+  before signing, since a signature is bound to a cluster only by the blockhash
+  the endpoint supplies.
+- `verify` fails when a check runs and reports a problem, not only when a check
+  cannot run: a failed bytecode hash, a mutable program on mainnet, a
+  non-autonomous multisig, or cross-network drift. A time lock and a completed
+  rekey remain warnings, being intended states.
+- A config transaction is labelled as one everywhere. It previously shared the
+  "Vault transaction" label, which implies it cannot alter governance, and the
+  action-list disclosure was selected by the caller's `--kind` rather than by
+  the on-chain account type - so naming it `--kind activate` skipped it.
+- `show` lists a bounded window of the newest proposals and says how many older
+  ones it omitted, rather than sizing its work from an unbounded on-chain
+  counter.
+- The config file is written readable only by its owner.
+
+### Fixed
+
+- Every Squads account read behind a decision or a signer-facing disclosure is
+  authenticated: the config-change disclosure, both execute paths, and the
+  proposal listings in `show` and the interactive picker.
+- Text originating outside the trust boundary has its control characters
+  neutralised, so a remote error string cannot reposition the cursor and repaint
+  locally derived output before a signing decision.
+- A rekey proposal is refused when the endpoint's member set is missing a member
+  saved locally, which would otherwise produce a "brick" leaving that member in
+  sole control. The disclosure also warns when a config change leaves exactly
+  one member able to sign.
+- The rent-exemption amount funded from the fee payer is bounded by a locally
+  computed ceiling instead of taken from the endpoint.
+- `show` reports the feature account's state in both report layouts. One
+  unapproved proposal referencing the Squads program used to switch layouts and
+  suppress it entirely.
+- `show` names networks it could not read and scopes its consistency and
+  freeze verdicts to what was actually compared.
+- "Permanently frozen" additionally requires the multisig to be autonomous; a
+  config authority can restore quorum at any time.
+- Account roles in the transaction drill-down are computed at a width that
+  cannot wrap, so writable accounts are never displayed as read-only.
+- CI verifies the surfpool download against a pinned digest.
+
 ## [0.3.1] - 2026-08-10
 
 Hardens the path that decides what a proposal is and what a signer is told it
@@ -31,10 +80,14 @@ transaction a rekey and any all-System vault message an activation.
 
 ### Fixed
 
-- Squads accounts are authenticated, not just decoded: transaction, proposal,
-  and multisig reads now require Squads ownership and a record naming the
-  multisig and index being read. A multisig is bound to its address through the
-  `create_key` PDA derivation.
+- Squads accounts are authenticated, not just decoded: proposal classification,
+  the approval-quorum read, the `show --index` detail views, and multisig reads
+  require Squads ownership and a record naming the multisig and index being
+  read. A multisig is bound to its address through the `create_key` PDA
+  derivation, which proves the body was not lifted from a different multisig
+  (it does not constrain the member set, threshold, or transaction index). Reads
+  behind the config-change disclosure, the execute paths, and the proposal
+  listings were not covered; see the next release.
 - A failed multisig read no longer defaults the member list to empty. That
   baseline made a config change which only weakens the threshold identical to a
   canonical rekey, so it was certified as one.

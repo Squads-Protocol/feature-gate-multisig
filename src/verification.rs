@@ -48,6 +48,41 @@ pub fn is_mainnet_cluster(rpc: &RpcClient) -> Result<bool> {
     Ok(genesis.to_string() == MAINNET_GENESIS_HASH)
 }
 
+/// Decide how strictly to check `rpc`, in a way the endpoint cannot relax.
+///
+/// Two independent signals: the chain's genesis hash, and whether the operator's
+/// URL names mainnet. Either one asserting mainnet is enough, because the only
+/// dangerous direction is *downgrading* - answering "not mainnet" is what skips
+/// the immutability and bytecode-hash assertions, so an endpoint that could do
+/// that would be choosing how strictly it is checked.
+///
+/// A mainnet fork on a custom URL (surfpool) therefore stays strict, which is
+/// intended: it carries mainnet state. A URL naming mainnet while the chain says
+/// otherwise is the substitution this refuses outright.
+///
+/// Returns the cluster plus whether the chain itself could be asked, so callers
+/// can record an unverified cluster as incomplete.
+pub fn resolve_cluster(rpc: &RpcClient, rpc_url: &str) -> Result<(bool, bool)> {
+    let by_genesis = is_mainnet_cluster(rpc).ok();
+    strictness_for(by_genesis, crate::utils::is_mainnet(rpc_url), rpc_url)
+}
+
+/// The decision itself, separated from the RPC call so the asymmetry is testable.
+/// `by_genesis` is None when the chain could not be asked.
+fn strictness_for(by_genesis: Option<bool>, by_url: bool, rpc_url: &str) -> Result<(bool, bool)> {
+    match by_genesis {
+        Some(false) if by_url => Err(eyre!(
+            "Cluster mismatch: {rpc_url} names mainnet but its genesis hash is not mainnet's. \
+             Refusing to continue - relaxing the audit here is exactly what a substituted \
+             endpoint would want."
+        )),
+        Some(by_genesis) => Ok((by_genesis || by_url, true)),
+        // Could not ask the chain. Fall back to the URL, which is at least not
+        // the endpoint's choice, and report the cluster as unverified.
+        None => Ok((by_url, false)),
+    }
+}
+
 /// On-chain state of a feature gate account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureGateStatus {
@@ -266,11 +301,18 @@ pub fn is_autonomous(ms: &Multisig) -> bool {
     ms.config_authority == Pubkey::default()
 }
 
-/// True when the multisig can never pass another proposal: its usable voting
-/// keys cannot meet the threshold. The rekey flow deliberately produces this
+/// True when the multisig can never pass another proposal: it is autonomous and
+/// its usable voting keys cannot meet the threshold.
+///
+/// Autonomy is part of the test, not a separate concern: a non-default
+/// `config_authority` can add members and change the threshold directly, so an
+/// unreachable threshold freezes nothing while such an authority exists. The rekey flow deliberately produces this
 /// state (a single `Pubkey::default()` member, which can never sign),
 /// permanently freezing the feature gate's configuration.
 pub fn is_rekeyed(ms: &Multisig) -> bool {
+    if !is_autonomous(ms) {
+        return false;
+    }
     let usable_voters = ms
         .members
         .iter()
@@ -683,6 +725,42 @@ mod tests {
         // Threshold change -> different fingerprint.
         b.threshold = 1;
         assert_ne!(config_fingerprint(&a), config_fingerprint(&b));
+    }
+
+    /// An endpoint may escalate strictness but never relax it. Getting this
+    /// backwards - requiring the URL and the chain to agree - breaks every
+    /// mainnet fork on a custom URL, which is how this was first written.
+    #[test]
+    fn cluster_strictness_can_be_escalated_but_not_relaxed() {
+        // Mainnet fork on a custom URL: chain says mainnet, URL does not. Strict.
+        assert_eq!(
+            strictness_for(Some(true), false, "http://127.0.0.1:8899").unwrap(),
+            (true, true)
+        );
+        // Both agree, either way.
+        assert_eq!(
+            strictness_for(Some(true), true, "https://api.mainnet.solana.com").unwrap(),
+            (true, true)
+        );
+        assert_eq!(
+            strictness_for(Some(false), false, "https://api.devnet.solana.com").unwrap(),
+            (false, true)
+        );
+        // The downgrade attempt: URL names mainnet, chain disagrees. Refused.
+        let err = strictness_for(Some(false), true, "https://api.mainnet.solana.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Cluster mismatch"), "got: {err}");
+
+        // Chain unreachable: fall back to the URL and report it unverified.
+        assert_eq!(
+            strictness_for(None, true, "https://api.mainnet.solana.com").unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            strictness_for(None, false, "http://127.0.0.1:8899").unwrap(),
+            (false, false)
+        );
     }
 
     #[test]
