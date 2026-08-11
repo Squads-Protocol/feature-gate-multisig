@@ -49,8 +49,28 @@ feature-gate-multisig-tool config
 |---------|-------------|
 | `create` | Create a new feature gate multisig with an activation proposal |
 | `show <address>` | Display multisig details, members, and proposal status |
+| `verify <address>` | Check program authenticity, feature state and owners on every configured network |
+| `propose` / `approve` / `reject` / `execute` | Act on a proposal non-interactively |
 | `config` | Show saved configuration |
 | `interactive` | Launch interactive menu (default) |
+
+### Scripting
+
+`verify` exits non-zero when a check fails **or** cannot be completed, so it can
+gate a runbook:
+
+```bash
+feature-gate-multisig-tool verify "$MULTISIG" && \
+  feature-gate-multisig-tool approve --multisig "$MULTISIG" --kind activate --index 1 --yes
+```
+
+It still reports every problem in one run rather than stopping at the first.
+A non-zero exit means the multisig has not been shown to be correct — not
+necessarily that it is malicious; an unreachable network fails the same way.
+
+`--yes` resolves each confirmation to its default answer. It does not force an
+action through: a proposal this tool cannot classify, and any config change
+(membership or threshold), abort under `--yes` and need an interactive decision.
 
 ## Interactive Mode
 
