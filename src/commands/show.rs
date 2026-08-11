@@ -989,3 +989,38 @@ fn fetch_and_display_proposal(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `transaction_index` is unbounded remote data and the PDA binding does not
+    /// constrain it, so it must never size an allocation or drive one network
+    /// round trip per unit. u64::MAX previously aborted the process on the
+    /// capacity reservation alone.
+    #[test]
+    fn proposal_listing_is_bounded_by_the_window() {
+        assert!(listed_indices(0).is_empty());
+
+        // Fewer than the cap: everything, oldest first.
+        assert_eq!(listed_indices(3), vec![1, 2, 3]);
+
+        // Exactly the cap.
+        assert_eq!(
+            listed_indices(MAX_LISTED_PROPOSALS).len() as u64,
+            MAX_LISTED_PROPOSALS
+        );
+        assert_eq!(listed_indices(MAX_LISTED_PROPOSALS)[0], 1);
+
+        // Beyond it: the newest window, never more.
+        let many = listed_indices(1_000);
+        assert_eq!(many.len() as u64, MAX_LISTED_PROPOSALS);
+        assert_eq!(*many.last().unwrap(), 1_000);
+        assert_eq!(many[0], 1_000 - MAX_LISTED_PROPOSALS + 1);
+
+        // The hostile case: a fabricated counter must not be allocated for.
+        let absurd = listed_indices(u64::MAX);
+        assert_eq!(absurd.len() as u64, MAX_LISTED_PROPOSALS);
+        assert_eq!(*absurd.last().unwrap(), u64::MAX);
+    }
+}

@@ -1025,6 +1025,36 @@ mod tests {
         assert!(rent_exempt_minimum(FEATURE_ACCOUNT_SIZE + 1) > 953_520);
     }
 
+    /// The config records RPC URLs (which for commercial providers carry an API
+    /// key in the path) and the path of the signing keypair, so it must not be
+    /// world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("fgm-perm-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        std::env::set_var(CONFIG_DIR_ENV, &dir);
+
+        save_config(&Config::default()).expect("save config");
+
+        let path = get_config_path().expect("config path");
+        let mode = std::fs::metadata(&path)
+            .expect("stat config")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "config should be owner-only, got {:o}",
+            mode & 0o777
+        );
+
+        std::env::remove_var(CONFIG_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn resolves_network_arg_by_url_name_or_passthrough() {
         let config = Config {

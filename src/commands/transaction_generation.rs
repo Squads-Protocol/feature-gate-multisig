@@ -254,6 +254,19 @@ fn warn_on_duplicate_proposal(
 /// count of members who could still cast a vote, rather than leaving a signer to
 /// derive them from the action list, and defaults to no. Defaulting to no also
 /// means `--yes` aborts here instead of resolving it to a silent yes.
+/// Saved members the endpoint did not report. The saved roster omits the
+/// contributor, so this is a subset test rather than an equality one: extra
+/// reported members are normal, a missing one is not.
+fn missing_saved_members(saved: &[String], reported: &[crate::squads::Member]) -> Vec<String> {
+    let reported: std::collections::HashSet<String> =
+        reported.iter().map(|m| m.key.to_string()).collect();
+    saved
+        .iter()
+        .filter(|key| !reported.contains(*key))
+        .cloned()
+        .collect()
+}
+
 /// Authenticated read of the transaction at `index`. Returns None when the
 /// account is a vault transaction rather than a config one, so callers select
 /// the disclosure from the account discriminator instead of a caller-supplied
@@ -1171,25 +1184,12 @@ pub fn rekey_multisig_feature_gate(
     // that omits one produces a "brick" that instead leaves that member in sole
     // control. The PDA binding only proves create_key and bump, not the member
     // vector, so corroborate against the roster saved locally at creation.
-    let reported: std::collections::HashSet<String> = feature_gate_ms
-        .members
-        .iter()
-        .map(|m| m.key.to_string())
-        .collect();
-    let missing: Vec<&String> = config
-        .members
-        .iter()
-        .filter(|saved| !reported.contains(*saved))
-        .collect();
+    let missing = missing_saved_members(&config.members, &feature_gate_ms.members);
     if !missing.is_empty() {
         return Err(eyre::eyre!(
             "This endpoint reports a member set missing {} saved member(s): {}. A rekey built from it would leave them in control instead of removing them. Refusing to continue.",
             missing.len(),
-            missing
-                .iter()
-                .map(|m| m.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            missing.join(", ")
         ));
     }
 
@@ -1550,4 +1550,43 @@ pub fn execute_common_config_change(
         .map_err(|e| eyre::eyre!("Failed to execute config change: {}", e))?;
     output::Output::field("Config change executed (sig)", &signature);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::squads::{Member, Permissions};
+
+    fn member(key: Pubkey) -> Member {
+        Member {
+            key,
+            permissions: Permissions::all(),
+        }
+    }
+
+    /// A rekey removes one member per member the endpoint reported, so an
+    /// endpoint that omits one produces a "brick" leaving that member in sole
+    /// control. The saved roster omits the contributor, so extra reported
+    /// members are normal and only a missing one is a problem.
+    #[test]
+    fn omitted_saved_members_are_detected() {
+        let alice = Pubkey::new_unique();
+        let bob = Pubkey::new_unique();
+        let contributor = Pubkey::new_unique();
+        let saved = vec![alice.to_string(), bob.to_string()];
+
+        // Endpoint reports everyone, plus the contributor the roster omits.
+        let honest = vec![member(alice), member(bob), member(contributor)];
+        assert!(missing_saved_members(&saved, &honest).is_empty());
+
+        // Endpoint omits bob: the rekey would leave bob in control.
+        let omitting = vec![member(alice), member(contributor)];
+        assert_eq!(
+            missing_saved_members(&saved, &omitting),
+            vec![bob.to_string()]
+        );
+
+        // No saved roster means nothing to corroborate against.
+        assert!(missing_saved_members(&[], &omitting).is_empty());
+    }
 }
