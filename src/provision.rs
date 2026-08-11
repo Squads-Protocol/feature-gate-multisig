@@ -338,7 +338,10 @@ pub fn send_and_confirm_transaction(
                     ..
                 }) = &*err.kind
                 {
-                    println!("Simulation logs:\n\n{}\n", logs.join("\n").bright_yellow());
+                    println!(
+                        "Simulation logs:\n\n{}\n",
+                        crate::output::scrub(&logs.join("\n")).bright_yellow()
+                    );
                 }
                 if !is_transient_rpc_error(&err) {
                     return Err(eyre!("Failed to send transaction: {}", err));

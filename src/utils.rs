@@ -321,7 +321,11 @@ pub fn prompt_for_threshold_with_max(max_members: usize) -> Result<u16> {
         match validate_threshold(&input, max_members) {
             Ok(t) => return Ok(t),
             Err(e) => {
-                println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
+                println!(
+                    "  {} {}",
+                    "❌".bright_red(),
+                    crate::output::scrub(&e.to_string()).bright_red()
+                );
             }
         }
     }
@@ -464,7 +468,11 @@ pub fn prompt_for_network(config: &Config) -> Result<String> {
         match validate_rpc_url(&input) {
             Ok(url) => return Ok(url),
             Err(e) => {
-                println!("  {} {}", "❌".bright_red(), e.to_string().bright_red());
+                println!(
+                    "  {} {}",
+                    "❌".bright_red(),
+                    crate::output::scrub(&e.to_string()).bright_red()
+                );
                 let retry = Confirm::new("Try again?").with_default(true).prompt()?;
                 if !retry {
                     return Err(eyre::eyre!("User cancelled network entry"));

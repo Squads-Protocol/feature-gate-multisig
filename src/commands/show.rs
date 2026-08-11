@@ -487,7 +487,7 @@ fn fetch_and_display_transaction(
     let transaction = match result {
         Ok(tx) => tx,
         Err(e) => {
-            println!("  ❌ {}", e);
+            println!("  ❌ {}", crate::output::scrub(&e.to_string()));
             return Ok(());
         }
     };
@@ -845,7 +845,7 @@ fn fetch_and_display_proposal(
         {
             Ok(prop) => prop,
             Err(e) => {
-                println!("  ❌ {}", e);
+                println!("  ❌ {}", crate::output::scrub(&e.to_string()));
                 return Ok(());
             }
         };
