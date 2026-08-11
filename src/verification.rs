@@ -266,11 +266,18 @@ pub fn is_autonomous(ms: &Multisig) -> bool {
     ms.config_authority == Pubkey::default()
 }
 
-/// True when the multisig can never pass another proposal: its usable voting
-/// keys cannot meet the threshold. The rekey flow deliberately produces this
+/// True when the multisig can never pass another proposal: it is autonomous and
+/// its usable voting keys cannot meet the threshold.
+///
+/// Autonomy is part of the test, not a separate concern: a non-default
+/// `config_authority` can add members and change the threshold directly, so an
+/// unreachable threshold freezes nothing while such an authority exists. The rekey flow deliberately produces this
 /// state (a single `Pubkey::default()` member, which can never sign),
 /// permanently freezing the feature gate's configuration.
 pub fn is_rekeyed(ms: &Multisig) -> bool {
+    if !is_autonomous(ms) {
+        return false;
+    }
     let usable_voters = ms
         .members
         .iter()

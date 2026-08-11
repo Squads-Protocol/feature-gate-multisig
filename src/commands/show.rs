@@ -2,7 +2,7 @@ use crate::commands::proposal::{describe_transaction, proposal_status_label, Pro
 use crate::commands::verify::report_cross_network_consistency;
 use crate::output::Output;
 use crate::provision::{
-    create_rpc_client, fetch_squads_multisig, get_squads_account_data_with_retry,
+    create_rpc_client, fetch_proposal, fetch_squads_multisig, get_squads_account_data_with_retry,
 };
 use crate::squads::{
     deserialize_squads_account, get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction,
@@ -90,8 +90,6 @@ fn show_multisig(
     let mut network_multisigs: Vec<(&str, Multisig)> = Vec::new();
 
     if looks_like_parent {
-        // Vault 0 of a parent is its voting identity on child multisigs, not a
-        // feature gate; reporting a "feature state" for it would be misleading.
         Output::header(&format!("📋 Squads Multisig {multisig_pubkey}"));
         Output::info(
             "This looks like a parent (voting) multisig: its proposals act on child multisigs.",
@@ -100,32 +98,43 @@ fn show_multisig(
             "Voting identity (vault 0)",
             &format!("{vault0} (appears as a member on child multisigs)"),
         );
-        for url in &networks {
-            let client = create_rpc_client(url);
-            if let Ok(ms) = fetch_squads_multisig(&client, &multisig_pubkey, "multisig") {
-                network_multisigs.push((get_network_display(url), ms));
-            }
-        }
     } else {
         Output::header(&format!("📋 Feature Gate Multisig {multisig_pubkey}"));
         Output::field("Feature gate (vault 0)", &vault0.to_string());
+    }
 
-        // Per-network sweep: feature state (cheap, two RPC calls per network)
-        // and each network's multisig config for the drift check further down.
-        let mut states: Vec<String> = Vec::new();
-        for url in &networks {
-            let client = create_rpc_client(url);
-            let state = match verify_feature_gate(&client, &multisig_pubkey) {
-                Ok(v) => feature_status_label(&v.status),
-                Err(_) => "unreachable".to_string(),
-            };
-            states.push(format!("{}: {}", get_network_display(url), state));
-            if let Ok(ms) = fetch_squads_multisig(&client, &multisig_pubkey, "multisig") {
-                network_multisigs.push((get_network_display(url), ms));
+    // One sweep for both layouts. Keeping it out of the branch above means vault
+    // 0's on-chain state is always reported: the parent layout is chosen by a
+    // heuristic any member can trip with a single unapproved proposal, and it
+    // used to suppress this line entirely.
+    let mut states: Vec<String> = Vec::new();
+    let mut unreadable: Vec<&str> = Vec::new();
+    for url in &networks {
+        let client = create_rpc_client(url);
+        let state = match verify_feature_gate(&client, &multisig_pubkey) {
+            Ok(v) => feature_status_label(&v.status),
+            Err(_) => "unreachable".to_string(),
+        };
+        states.push(format!("{}: {}", get_network_display(url), state));
+        // Name a network that drops out. Silently omitting it shrank the
+        // denominator behind the consistency and rekey verdicts below.
+        match fetch_squads_multisig(&client, &multisig_pubkey, "multisig") {
+            Ok(ms) => network_multisigs.push((get_network_display(url), ms)),
+            Err(e) => {
+                Output::warning(&format!(
+                    "Multisig not readable on {}: {e}",
+                    get_network_display(url)
+                ));
+                unreadable.push(get_network_display(url));
             }
         }
-        Output::field("Feature state", &states.join(" | "));
     }
+    let state_label = if looks_like_parent {
+        "Vault 0 state"
+    } else {
+        "Feature state"
+    };
+    Output::field(state_label, &states.join(" | "));
 
     let voting_members = multisig
         .members
@@ -153,8 +162,13 @@ fn show_multisig(
         .map(|(network, _)| *network)
         .collect();
     if !rekeyed_on.is_empty() {
-        let scope = if rekeyed_on.len() == network_multisigs.len() {
+        let scope = if rekeyed_on.len() == network_multisigs.len() && unreadable.is_empty() {
             String::new()
+        } else if !unreadable.is_empty() {
+            format!(
+                "; {} was not readable and has not been checked",
+                unreadable.join(", ")
+            )
         } else {
             "; the other networks remain active".to_string()
         };
@@ -198,6 +212,13 @@ fn show_multisig(
     display_proposals_summary(&rpc_client, &multisig_pubkey, &multisig, &kinds);
 
     report_cross_network_consistency(&network_multisigs);
+    if !unreadable.is_empty() {
+        Output::warning(&format!(
+            "This sweep is incomplete: {} could not be read, so nothing above accounts for {}.",
+            unreadable.join(", "),
+            if unreadable.len() == 1 { "it" } else { "them" }
+        ));
+    }
 
     if let Some(index) = detail_index {
         if index == 0 || index > multisig.transaction_index {
@@ -256,15 +277,7 @@ fn display_proposals_summary(
         let kind = kinds
             .get(index as usize - 1)
             .map_or("Unknown", |k| k.label());
-        let (proposal_pda, _) = get_proposal_pda(multisig_pubkey, index);
-        let proposal = rpc_client.get_account(&proposal_pda).ok().and_then(|acc| {
-            deserialize_squads_account::<Proposal>(
-                &acc.data,
-                PROPOSAL_ACCOUNT_DISCRIMINATOR,
-                "proposal",
-            )
-            .ok()
-        });
+        let proposal = fetch_proposal(rpc_client, multisig_pubkey, index).ok();
         let (status, approvals, rejections) = match proposal {
             Some(p) => (
                 proposal_status_label(&p.status).to_string(),
