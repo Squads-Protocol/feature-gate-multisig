@@ -108,6 +108,16 @@ pub fn is_mainnet(rpc_url: &str) -> bool {
     rpc_url.contains("mainnet")
 }
 
+/// Rent-exempt minimum for an account of `size` bytes, computed locally from
+/// Solana's rent parameters: (account overhead + size) x lamports-per-byte-year
+/// x years-of-rent-exemption. Used as a ceiling on what an endpoint may claim.
+fn rent_exempt_minimum(size: usize) -> u64 {
+    const ACCOUNT_STORAGE_OVERHEAD: u64 = 128;
+    const LAMPORTS_PER_BYTE_YEAR: u64 = 3480;
+    const EXEMPTION_THRESHOLD_YEARS: u64 = 2;
+    (ACCOUNT_STORAGE_OVERHEAD + size as u64) * LAMPORTS_PER_BYTE_YEAR * EXEMPTION_THRESHOLD_YEARS
+}
+
 // Config management functions
 
 /// Returns the path to the per-user config file:
@@ -154,6 +164,16 @@ pub fn save_config(config: &Config) -> Result<()> {
 
     fs::write(&config_path, config_str)
         .map_err(|e| eyre::eyre!("Failed to write config file: {}", e))?;
+
+    // Restrict to the owning user: this records RPC endpoint URLs (which for
+    // commercial providers carry an API key in the path) and the location of the
+    // keypair used to sign governance transactions.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| eyre::eyre!("Failed to restrict config file permissions: {}", e))?;
+    }
 
     Ok(())
 }
@@ -571,8 +591,17 @@ pub fn create_and_send_funding_transaction(
 
     let rpc_client = create_rpc_client(rpc_url);
 
-    // Calculate rent-exempt minimum balance for feature account
+    // This value is signed into a transfer out of the fee payer, so it cannot be
+    // taken on the endpoint's word. Rent for a fixed-size account is locally
+    // computable, so treat the local figure as a ceiling and only accept a
+    // smaller answer.
     let rent = rpc_client.get_minimum_balance_for_rent_exemption(FEATURE_ACCOUNT_SIZE)?;
+    let expected = rent_exempt_minimum(FEATURE_ACCOUNT_SIZE);
+    if rent > expected {
+        return Err(eyre::eyre!(
+            "Endpoint reports {rent} lamports of rent for a {FEATURE_ACCOUNT_SIZE}-byte account,              more than the {expected} this size can require. Refusing to sign a transfer of that amount."
+        ));
+    }
 
     crate::output::Output::info(&format!(
         "Funding feature gate address with {} lamports (rent-exempt minimum for {} bytes)",
@@ -984,6 +1013,17 @@ pub fn check_fee_payer_balance_on_networks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ceiling has to equal what a real validator reports, or every create
+    /// would fail. Verified against surfpool: 953,520 lamports for 9 bytes.
+    #[test]
+    fn rent_ceiling_matches_the_chain() {
+        use crate::feature_gate_program::FEATURE_ACCOUNT_SIZE;
+        assert_eq!(rent_exempt_minimum(FEATURE_ACCOUNT_SIZE), 953_520);
+        // Larger accounts cost more, so the ceiling scales rather than being a
+        // single hardcoded number.
+        assert!(rent_exempt_minimum(FEATURE_ACCOUNT_SIZE + 1) > 953_520);
+    }
 
     #[test]
     fn resolves_network_arg_by_url_name_or_passthrough() {

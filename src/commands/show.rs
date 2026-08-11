@@ -1,5 +1,6 @@
 use crate::commands::proposal::{describe_transaction, proposal_status_label, ProposalKind};
 use crate::commands::verify::report_cross_network_consistency;
+use crate::constants::MAX_LISTED_PROPOSALS;
 use crate::output::Output;
 use crate::provision::{
     create_rpc_client, fetch_proposal, fetch_squads_multisig, get_squads_account_data_with_retry,
@@ -53,6 +54,19 @@ pub fn show_command(
     show_multisig(config, &address, &rpc_url, detail_index)
 }
 
+/// The newest proposal indices a listing walks, capped. `transaction_index` is
+/// unbounded data from the endpoint, so it must not size an allocation or drive
+/// one network round trip per unit.
+fn listed_indices(transaction_index: u64) -> Vec<u64> {
+    if transaction_index == 0 {
+        return Vec::new();
+    }
+    let oldest = transaction_index
+        .saturating_sub(MAX_LISTED_PROPOSALS - 1)
+        .max(1);
+    (oldest..=transaction_index).collect()
+}
+
 fn show_multisig(
     config: &Config,
     address: &str,
@@ -71,8 +85,20 @@ fn show_multisig(
     // tells us what this multisig is. A parent (voting) multisig's proposals
     // wrap actions on child multisigs; a feature gate multisig's proposals
     // act on the feature account.
-    let kinds: Vec<ProposalKind> = (1..=multisig.transaction_index)
-        .map(|index| describe_transaction(&rpc_client, &multisig_pubkey, index))
+    // transaction_index is unbounded remote data and the PDA binding does not
+    // constrain it, so cap the sweep instead of allocating and fetching per the
+    // endpoint's count. Same window the interactive picker uses.
+    let shown = listed_indices(multisig.transaction_index);
+    if let Some(oldest) = shown.first().filter(|oldest| **oldest > 1) {
+        Output::info(&format!(
+            "Showing proposals {oldest}-{}; {} older ones are not listed.",
+            multisig.transaction_index,
+            oldest - 1
+        ));
+    }
+    let kinds: Vec<ProposalKind> = shown
+        .iter()
+        .map(|index| describe_transaction(&rpc_client, &multisig_pubkey, *index))
         .collect();
     let looks_like_parent = kinds
         .iter()
@@ -281,7 +307,7 @@ fn display_proposals_summary(
     }
 
     let mut rows = Vec::new();
-    for index in 1..=multisig.transaction_index {
+    for index in listed_indices(multisig.transaction_index) {
         let kind = kinds
             .get(index as usize - 1)
             .map_or("Unknown", |k| k.label());
@@ -364,7 +390,8 @@ fn offer_detail_drilldown(
         return Ok(());
     }
     loop {
-        let mut options: Vec<String> = (1..=multisig.transaction_index)
+        let mut options: Vec<String> = listed_indices(multisig.transaction_index)
+            .into_iter()
             .map(|i| format!("#{i}"))
             .collect();
         options.push("Done".to_string());
@@ -767,7 +794,7 @@ fn display_vault_transaction(transaction: &VaultTransaction, tx_index: u64) {
             #[derive(Tabled)]
             struct AccountKeyInfo {
                 #[tabled(rename = "Index")]
-                index: u8,
+                index: usize,
                 #[tabled(rename = "Public Key")]
                 pubkey: String,
                 #[tabled(rename = "Role")]
@@ -780,24 +807,22 @@ fn display_vault_transaction(transaction: &VaultTransaction, tx_index: u64) {
                 .iter()
                 .enumerate()
                 .map(|(i, pubkey)| {
-                    let role = if i < transaction.message.num_signers as usize {
-                        if i < transaction.message.num_writable_signers as usize {
-                            "Writable Signer"
-                        } else {
-                            "Read-only Signer"
-                        }
-                    } else if i
-                        < (transaction.message.num_signers
-                            + transaction.message.num_writable_non_signers)
-                            as usize
-                    {
-                        "Writable Non-signer"
-                    } else {
-                        "Read-only Non-signer"
+                    // Writability comes from the same function that builds the
+                    // real execution metas, so the displayed role always matches
+                    // what Squads applies. Computing it here summed two u8 header
+                    // fields before widening, which wrapped above 255 and showed
+                    // writable accounts as read-only.
+                    let signer = i < usize::from(transaction.message.num_signers);
+                    let writable = transaction.message.is_static_writable_index(i);
+                    let role = match (signer, writable) {
+                        (true, true) => "Writable Signer",
+                        (true, false) => "Read-only Signer",
+                        (false, true) => "Writable Non-signer",
+                        (false, false) => "Read-only Non-signer",
                     };
 
                     AccountKeyInfo {
-                        index: i as u8,
+                        index: i,
                         pubkey: pubkey.to_string(),
                         role: role.to_string(),
                     }

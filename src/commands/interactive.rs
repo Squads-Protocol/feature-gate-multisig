@@ -231,7 +231,7 @@ fn prompt_for_proposal_index(
     multisig: &Pubkey,
     action: ProposalCommand,
 ) -> Result<(u64, ProposalKind)> {
-    const MAX_LISTED: u64 = 10;
+    const MAX_LISTED: u64 = crate::constants::MAX_LISTED_PROPOSALS;
 
     let mut entries: Vec<(u64, ProposalKind)> = Vec::new();
     let mut options: Vec<String> = Vec::new();
