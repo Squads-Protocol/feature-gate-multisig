@@ -347,6 +347,12 @@ fn confirm_config_change(
         &usable_voters.to_string(),
     );
 
+    let voters_before = multisig
+        .members
+        .iter()
+        .filter(|m| m.key != Pubkey::default() && (m.permissions.mask & PERMISSION_VOTE) != 0)
+        .count();
+
     if usable_voters == 0 {
         output::Output::warning(
             "No remaining member can sign. This permanently disables voting on this multisig, and it cannot be undone.",
@@ -354,6 +360,17 @@ fn confirm_config_change(
     } else if usable_voters < usize::from(threshold) {
         output::Output::warning(&format!(
             "Only {usable_voters} member(s) can sign but the threshold is {threshold}; the multisig will be unable to reach quorum."
+        ));
+    } else if usable_voters == 1 {
+        // Between "nobody can sign" and "quorum unreachable" sits the case that
+        // actually hands over control: exactly one signer left, and a threshold
+        // it can meet alone.
+        output::Output::warning(&format!(
+            "This leaves a single member able to sign, with a threshold of {threshold}: that member would control this multisig alone."
+        ));
+    } else if usable_voters < voters_before {
+        output::Output::warning(&format!(
+            "This reduces the members able to sign from {voters_before} to {usable_voters}."
         ));
     }
 
@@ -879,7 +896,7 @@ pub fn reject_common_feature_gate_proposal(
     )?;
 
     if !confirm_action("Send this reject transaction now?", true) {
-        output::Output::hint("Skipped sending. You can submit the above encoded transaction manually or rerun to send.");
+        output::Output::hint("Skipped sending. Rerun to send.");
         return Ok(());
     }
 
@@ -989,7 +1006,7 @@ pub fn execute_common_feature_gate_proposal(
 
     // Confirm before sending on-chain (EOA execute path)
     if !confirm_action("Send this execute transaction now?", true) {
-        output::Output::hint("Skipped sending. You can submit the above encoded transaction manually or rerun to send.");
+        output::Output::hint("Skipped sending. Rerun to send.");
         return Ok(());
     }
 
@@ -1149,6 +1166,32 @@ pub fn rekey_multisig_feature_gate(
         &feature_gate_multisig_address,
         "feature gate multisig",
     )?;
+
+    // A rekey removes one member per member the endpoint reported, so an endpoint
+    // that omits one produces a "brick" that instead leaves that member in sole
+    // control. The PDA binding only proves create_key and bump, not the member
+    // vector, so corroborate against the roster saved locally at creation.
+    let reported: std::collections::HashSet<String> = feature_gate_ms
+        .members
+        .iter()
+        .map(|m| m.key.to_string())
+        .collect();
+    let missing: Vec<&String> = config
+        .members
+        .iter()
+        .filter(|saved| !reported.contains(*saved))
+        .collect();
+    if !missing.is_empty() {
+        return Err(eyre::eyre!(
+            "This endpoint reports a member set missing {} saved member(s): {}. A rekey built from it would leave them in control instead of removing them. Refusing to continue.",
+            missing.len(),
+            missing
+                .iter()
+                .map(|m| m.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     // Build config actions for rekey
     let actions = build_config_actions_for_kind(TransactionKind::Rekey, &feature_gate_ms.members)?;
@@ -1402,9 +1445,7 @@ fn approve_common_proposal(
         None => confirm_action("Send this approve transaction now?", true),
     };
     if !confirmed {
-        output::Output::hint(
-            "Skipped sending. You can submit the above encoded transaction manually or rerun to send.",
-        );
+        output::Output::hint("Skipped sending. Rerun to send.");
         return Ok(());
     }
 
