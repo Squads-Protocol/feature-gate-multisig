@@ -104,6 +104,65 @@ pub fn fetch_squads_multisig(
     Ok(multisig)
 }
 
+/// Fetch the vault transaction at `index`, authenticated: Squads-owned, and
+/// recording this multisig, this index, and vault 0. Anything that shapes an
+/// instruction the operator signs must come from here - the account keys and
+/// header of this record become the remaining accounts of an execute.
+pub fn fetch_vault_transaction(
+    rpc_client: &RpcClient,
+    multisig_address: &Pubkey,
+    transaction_index: u64,
+) -> eyre::Result<crate::squads::VaultTransaction> {
+    let (transaction_pda, _) = get_transaction_pda(multisig_address, transaction_index);
+    let data = get_squads_account_data_with_retry(rpc_client, &transaction_pda)?;
+    let transaction: crate::squads::VaultTransaction = deserialize_squads_account(
+        &data,
+        VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
+        "vault transaction",
+    )
+    .map_err(|e| eyre!("at {}: {}", transaction_pda, e))?;
+    if transaction.multisig != *multisig_address
+        || transaction.index != transaction_index
+        || transaction.vault_index != 0
+    {
+        return Err(eyre!(
+            "Vault transaction {} records multisig {} index {} vault {}, but was read as multisig {} index {} vault 0. Refusing to build an instruction from it.",
+            transaction_pda,
+            transaction.multisig,
+            transaction.index,
+            transaction.vault_index,
+            multisig_address,
+            transaction_index
+        ));
+    }
+    Ok(transaction)
+}
+
+/// Fetch the proposal at `index`, authenticated the same way. Its status and
+/// vote rosters decide what a signer is shown and which proposals are offered.
+pub fn fetch_proposal(
+    rpc_client: &RpcClient,
+    multisig_address: &Pubkey,
+    proposal_index: u64,
+) -> eyre::Result<crate::squads::Proposal> {
+    let (proposal_pda, _) = get_proposal_pda(multisig_address, proposal_index);
+    let data = get_squads_account_data_with_retry(rpc_client, &proposal_pda)?;
+    let proposal: crate::squads::Proposal =
+        deserialize_squads_account(&data, PROPOSAL_ACCOUNT_DISCRIMINATOR, "proposal")?;
+    if proposal.multisig != *multisig_address || proposal.transaction_index != proposal_index {
+        return Err(eyre!(
+            "Proposal {} records multisig {} index {}, but was read as multisig {} index {}. \
+             Refusing to trust its status or vote counts.",
+            proposal_pda,
+            proposal.multisig,
+            proposal.transaction_index,
+            multisig_address,
+            proposal_index
+        ));
+    }
+    Ok(proposal)
+}
+
 /// Best-effort reverse lookup from a feature gate account to its multisig.
 ///
 /// The vault-PDA derivation is one-way, but the transaction that activated the
@@ -728,36 +787,13 @@ pub fn get_proposal_status_and_threshold(
     proposal_index: u64,
     rpc_client: &RpcClient,
 ) -> eyre::Result<(usize, u16, crate::squads::ProposalStatus)> {
-    use crate::squads::Proposal;
-
     // Multisig threshold
     let ms = fetch_squads_multisig(rpc_client, multisig_address, "multisig")?;
 
     // Proposal approved count and status. These decide whether a quorum exists
     // and whether execution may proceed, so the record has to be attributable to
     // the Squads program and to this multisig - not merely decodable.
-    let (proposal_pda, _) = get_proposal_pda(multisig_address, proposal_index);
-    let prop_acc = rpc_client.get_account(&proposal_pda)?;
-    if prop_acc.owner != SQUADS_MULTISIG_PROGRAM_ID {
-        return Err(eyre!(
-            "Proposal {} is not owned by the Squads program (owner: {})",
-            proposal_pda,
-            prop_acc.owner
-        ));
-    }
-    let prop: Proposal =
-        deserialize_squads_account(&prop_acc.data, PROPOSAL_ACCOUNT_DISCRIMINATOR, "proposal")?;
-    if prop.multisig != *multisig_address || prop.transaction_index != proposal_index {
-        return Err(eyre!(
-            "Proposal {} records multisig {} index {}, but was read as multisig {} index {}. \
-             Refusing to trust its approval count or status.",
-            proposal_pda,
-            prop.multisig,
-            prop.transaction_index,
-            multisig_address,
-            proposal_index
-        ));
-    }
+    let prop = fetch_proposal(rpc_client, multisig_address, proposal_index)?;
 
     Ok((prop.approved.len(), ms.threshold, prop.status))
 }
@@ -998,23 +1034,15 @@ pub fn create_execute_transaction_message(
     rpc_client: &RpcClient,
     recent_blockhash: Hash,
 ) -> eyre::Result<Message> {
-    use crate::squads::{
-        get_transaction_pda, get_vault_pda, MultisigExecuteTransactionAccounts, VaultTransaction,
-    };
+    use crate::squads::{get_transaction_pda, get_vault_pda, MultisigExecuteTransactionAccounts};
 
     let (proposal_pda, _proposal_bump) = get_proposal_pda(multisig_address, proposal_index);
     let (transaction_pda, _transaction_bump) =
         get_transaction_pda(multisig_address, proposal_index);
     let _vault_pda = get_vault_pda(multisig_address, 0);
 
-    let transaction_account_data = rpc_client.get_account_data(&transaction_pda)?;
-    let transaction_contents: VaultTransaction = deserialize_squads_account(
-        &transaction_account_data,
-        VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
-        "vault transaction",
-    )
-    .map_err(|e| eyre::eyre!("at {}: {}", transaction_pda, e))?;
-    let transaction_message = transaction_contents.message;
+    let transaction_message =
+        fetch_vault_transaction(rpc_client, multisig_address, proposal_index)?.message;
 
     // All accounts from the stored message are passed through to the Squads program,
     // including the parent multisig needed for vault PDA derivation during CPI.

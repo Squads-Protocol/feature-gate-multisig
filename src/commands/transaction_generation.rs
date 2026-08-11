@@ -8,7 +8,6 @@ use crate::squads::{
     deserialize_squads_account, get_vault_pda, Multisig as SquadsMultisig, TransactionMessage,
     MULTISIG_ACCOUNT_DISCRIMINATOR, PERMISSION_EXECUTE, PERMISSION_INITIATE, PERMISSION_VOTE,
     PROPOSAL_APPROVE_DISCRIMINATOR, PROPOSAL_REJECT_DISCRIMINATOR, SQUADS_MULTISIG_PROGRAM_ID,
-    VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
 };
 use crate::{
     output,
@@ -941,21 +940,15 @@ pub fn execute_common_feature_gate_proposal(
             );
         }
 
-        // Vault transaction execute path
-        use crate::squads::{get_transaction_pda, VaultTransaction};
-        let (child_transaction_pda, _) =
-            get_transaction_pda(&feature_gate_multisig_address, proposal_index);
-        let child_transaction_account_data = rpc_client
-            .get_account_data(&child_transaction_pda)
-            .map_err(|e| eyre::eyre!("Failed to fetch child transaction account: {}", e))?;
-        let child_transaction_contents: VaultTransaction = deserialize_squads_account(
-            &child_transaction_account_data,
-            VAULT_TRANSACTION_ACCOUNT_DISCRIMINATOR,
-            "child vault transaction",
-        )?;
-        let child_transaction_message = child_transaction_contents.message;
-
-        // Build execution account metas from the child transaction.
+        // Vault transaction execute path. These metas are committed on-chain
+        // inside a parent proposal other members ratify, so the record they come
+        // from has to be authenticated rather than merely decodable.
+        let child_transaction_message = crate::provision::fetch_vault_transaction(
+            &rpc_client,
+            &feature_gate_multisig_address,
+            proposal_index,
+        )?
+        .message;
         let child_execution_account_metas = child_transaction_message.execution_account_metas()?;
 
         return handle_parent_multisig_flow(
