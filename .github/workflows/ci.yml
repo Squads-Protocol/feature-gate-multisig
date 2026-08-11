@@ -64,6 +64,10 @@ jobs:
     timeout-minutes: 20
     env:
       SURFPOOL_VERSION: v1.4.0
+      # A release tag can be repointed at a different asset, so pin the content
+      # too. Every action here is SHA-pinned and every crate is version- and
+      # lockfile-pinned; this was the one artifact that was not.
+      SURFPOOL_SHA256: b65e3e18da8e97a0558e04693d76a12aa31111c7d74958da7cee0fd2eeb4cae8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -84,6 +88,7 @@ jobs:
           set -euo pipefail
           url="https://github.com/txtx/surfpool/releases/download/${SURFPOOL_VERSION}/surfpool-linux-x64.tar.gz"
           curl -fsSL "$url" -o surfpool.tar.gz
+          echo "${SURFPOOL_SHA256}  surfpool.tar.gz" | sha256sum -c -
           tar -xzf surfpool.tar.gz
           sudo install -m 755 surfpool /usr/local/bin/surfpool
           surfpool --version

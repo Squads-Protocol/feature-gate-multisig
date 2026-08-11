@@ -82,13 +82,12 @@ pub fn fetch_squads_multisig(
     let multisig: crate::squads::Multisig =
         deserialize_squads_account(&acc.data, MULTISIG_ACCOUNT_DISCRIMINATOR, account_kind)?;
 
-    // Owner and discriminator only prove "some Squads multisig". Binding
-    // create_key back through the PDA derivation is what proves it is *this*
-    // one, and the Squads program enforces that same derivation at creation, so
-    // a genuine account always satisfies it. Without the check, an account body
-    // served for the requested address could carry an attacker-chosen member set
-    // and threshold - which the rekey classifier, `verify_member_permission`,
-    // and the approval-quorum math all trust as ground truth.
+    // Owner and discriminator only prove "some Squads multisig". Re-deriving the
+    // address from create_key proves the body was not lifted from a different
+    // multisig. Note what it does not prove: create_key and bump are public, so
+    // an endpoint fabricating a body can echo them and still choose members,
+    // threshold and transaction_index freely. Callers that depend on those
+    // fields need their own corroboration.
     let (derived, derived_bump) = crate::squads::get_multisig_pda(&multisig.create_key);
     if derived != *address || derived_bump != multisig.bump {
         return Err(eyre!(
