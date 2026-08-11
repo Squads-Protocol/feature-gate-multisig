@@ -179,7 +179,8 @@ fn reconcile_requested_kind(
         false,
     ) {
         return Err(eyre::eyre!(
-            "Aborted: proposal #{index} was not verified and was not explicitly approved.{}",
+            "Aborted: proposal #{index} (\"{}\") was not verified and was not explicitly approved.{}",
+            on_chain.label(),
             if is_assume_yes() {
                 " --yes does not stand in for that decision; re-run without it to review and confirm."
             } else {
@@ -231,6 +232,10 @@ pub(crate) enum ProposalKind {
     Activate,
     Revoke,
     Rekey,
+    /// A config transaction that is not the canonical rekey. It can still add or
+    /// remove members and move the threshold, so it must never share a label
+    /// with a vault transaction, which cannot touch governance at all.
+    ConfigChange,
     ChildAction,
     Other,
     Unknown,
@@ -242,6 +247,7 @@ impl ProposalKind {
             ProposalKind::Activate => "Activate feature gate",
             ProposalKind::Revoke => "Revoke feature gate",
             ProposalKind::Rekey => "Rekey - PERMANENTLY DISABLES VOTING",
+            ProposalKind::ConfigChange => "Config change - ALTERS MEMBERS/THRESHOLD",
             ProposalKind::ChildAction => "Child multisig action",
             ProposalKind::Other => "Vault transaction",
             ProposalKind::Unknown => "Unknown",
@@ -253,7 +259,10 @@ impl ProposalKind {
             ProposalKind::Activate => Some(TransactionKind::Activate),
             ProposalKind::Revoke => Some(TransactionKind::Revoke),
             ProposalKind::Rekey => Some(TransactionKind::Rekey),
-            ProposalKind::ChildAction | ProposalKind::Other | ProposalKind::Unknown => None,
+            ProposalKind::ConfigChange
+            | ProposalKind::ChildAction
+            | ProposalKind::Other
+            | ProposalKind::Unknown => None,
         }
     }
 
@@ -268,8 +277,23 @@ impl ProposalKind {
             ProposalKind::Activate
             | ProposalKind::Revoke
             | ProposalKind::Rekey
+            | ProposalKind::ConfigChange
             | ProposalKind::ChildAction
             | ProposalKind::Other => false,
+        }
+    }
+
+    /// True when the on-chain account is a config transaction, whatever kind the
+    /// caller named. Governs whether the full action-list disclosure runs, so it
+    /// must follow the account discriminator and not a caller-supplied `--kind`.
+    pub(crate) fn is_config_transaction(self) -> bool {
+        match self {
+            ProposalKind::Rekey | ProposalKind::ConfigChange => true,
+            ProposalKind::Activate
+            | ProposalKind::Revoke
+            | ProposalKind::ChildAction
+            | ProposalKind::Other
+            | ProposalKind::Unknown => false,
         }
     }
 }
@@ -317,7 +341,7 @@ pub(crate) fn describe_transaction(
         return if is_canonical_rekey(&config_tx.actions, &current.members) {
             ProposalKind::Rekey
         } else {
-            ProposalKind::Other
+            ProposalKind::ConfigChange
         };
     }
 
@@ -635,6 +659,7 @@ mod tests {
             ProposalKind::Activate,
             ProposalKind::Revoke,
             ProposalKind::Rekey,
+            ProposalKind::ConfigChange,
             ProposalKind::ChildAction,
             ProposalKind::Other,
             ProposalKind::Unknown,
@@ -658,6 +683,40 @@ mod tests {
         // decision, not refused - another Squads client may have created it.
         assert!(!ProposalKind::Other.is_unverifiable());
         assert!(!ProposalKind::ChildAction.is_unverifiable());
+    }
+
+    /// A config transaction can rewrite membership and threshold; a vault
+    /// transaction cannot touch governance at all. They must never share a label,
+    /// and every config transaction must route to the action-list disclosure.
+    #[test]
+    fn config_transactions_are_never_labelled_as_vault_transactions() {
+        for kind in [ProposalKind::Rekey, ProposalKind::ConfigChange] {
+            assert!(
+                kind.is_config_transaction(),
+                "{} must trigger the config disclosure",
+                kind.label()
+            );
+            assert_ne!(kind.label(), ProposalKind::Other.label());
+        }
+
+        for kind in [
+            ProposalKind::Activate,
+            ProposalKind::Revoke,
+            ProposalKind::ChildAction,
+            ProposalKind::Other,
+            ProposalKind::Unknown,
+        ] {
+            assert!(
+                !kind.is_config_transaction(),
+                "{} is not a config transaction",
+                kind.label()
+            );
+        }
+
+        // The specific collision this guards: a non-canonical config change used
+        // to fall through to Other, whose label claims it is a vault transaction.
+        assert_eq!(ProposalKind::Other.label(), "Vault transaction");
+        assert!(ProposalKind::ConfigChange.label().contains("Config change"));
     }
 
     #[test]
