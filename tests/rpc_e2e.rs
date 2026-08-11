@@ -37,8 +37,9 @@ use feature_gate_multisig_tool::feature_gate_program::{
     FEATURE_ACCOUNT_SIZE, FEATURE_GATE_PROGRAM_ID,
 };
 use feature_gate_multisig_tool::provision::{
-    build_squads_transaction_message, create_multisig, create_transaction_and_proposal_message,
-    fetch_squads_multisig, get_squads_account_data_with_retry, send_and_confirm_transaction,
+    build_squads_transaction_message, create_execute_transaction_message, create_multisig,
+    create_transaction_and_proposal_message, fetch_proposal, fetch_squads_multisig,
+    fetch_vault_transaction, get_squads_account_data_with_retry, send_and_confirm_transaction,
 };
 use feature_gate_multisig_tool::squads::{
     get_proposal_pda, get_transaction_pda, get_vault_pda, ConfigAction, Member, Permissions,
@@ -2272,4 +2273,228 @@ fn rpc_e2e_18_config_change_is_not_approvable_as_a_vault_transaction() {
         "attacker must not have been added"
     );
     println!("✅ Config change refused and left unapproved");
+}
+
+/// Test 19: the reads that shape a signed execute instruction, and the ones that
+/// decide what a signer is shown, must reject a record belonging to a different
+/// index. Both are reachable only through an endpoint that answers with genuine
+/// data for the wrong account, so both go through the substituting proxy.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_19_execute_and_listing_reads_reject_substituted_records() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let (config, multisig, _vault, eoa_pubkeys, eoa_keypaths) =
+        setup_eoa_multisig(&client, "eoa_test19", 2);
+
+    // Index 1 is the pre-created activation; add a revocation at index 2 so
+    // there are two genuine records to swap between.
+    proposal_command(
+        &config,
+        ProposalCommand::Propose,
+        ProposalCommandArgs {
+            multisig: multisig.to_string(),
+            kind: TransactionKind::Revoke,
+            voting_key: Some(eoa_pubkeys[0].to_string()),
+            keypair: Some(eoa_keypaths[0].clone()),
+            index: None,
+        },
+    )
+    .expect("propose revoke at index 2");
+
+    // --- the execute path's transaction read ---
+    let (tx_one, _) = get_transaction_pda(&multisig, 1);
+    let (tx_two, _) = get_transaction_pda(&multisig, 2);
+    {
+        let proxy = SubstitutingRpcProxy::start(tx_one, tx_two);
+        let proxied = RpcClient::new_with_commitment(proxy.url(), CommitmentConfig::confirmed());
+
+        let message = match fetch_vault_transaction(&proxied, &multisig, 1) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a vault transaction from another index must be rejected"),
+        };
+        println!("✅ Refused with: {message}");
+        assert!(
+            message.contains("Refusing to build an instruction from it"),
+            "error should name the binding failure, got: {message}"
+        );
+        assert!(
+            proxy.substitutions() > 0,
+            "the proxy never substituted, so the check was not exercised"
+        );
+
+        // And the instruction builder that consumes it refuses too, rather than
+        // signing an account list the endpoint chose.
+        let blockhash = client.get_latest_blockhash().expect("blockhash");
+        assert!(
+            create_execute_transaction_message(
+                &multisig,
+                &eoa_pubkeys[0],
+                &eoa_pubkeys[0],
+                1,
+                &proxied,
+                blockhash,
+            )
+            .is_err(),
+            "the execute message builder must refuse a substituted transaction"
+        );
+    }
+
+    // --- the listing/status read ---
+    let (proposal_one, _) = get_proposal_pda(&multisig, 1);
+    let (proposal_two, _) = get_proposal_pda(&multisig, 2);
+    let proxy = SubstitutingRpcProxy::start(proposal_one, proposal_two);
+    let proxied = RpcClient::new_with_commitment(proxy.url(), CommitmentConfig::confirmed());
+
+    let message = match fetch_proposal(&proxied, &multisig, 1) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a proposal record from another index must be rejected"),
+    };
+    println!("✅ Refused with: {message}");
+    assert!(
+        message.contains("Refusing to trust its status or vote counts"),
+        "error should name the binding failure, got: {message}"
+    );
+    assert!(
+        proxy.substitutions() > 0,
+        "the proxy never substituted, so the check was not exercised"
+    );
+
+    // The genuine records still read fine, so the check is not blanket.
+    assert_eq!(
+        fetch_proposal(&client, &multisig, 1)
+            .expect("real proposal 1 must read")
+            .transaction_index,
+        1
+    );
+    assert_eq!(
+        fetch_vault_transaction(&client, &multisig, 1)
+            .expect("real transaction 1 must read")
+            .index,
+        1
+    );
+    println!("✅ Substituted execute and listing records rejected");
+}
+
+/// Create a Squads multisig with a non-default `config_authority`, which the CLI
+/// itself never does (`create_multisig` hardcodes `None`). That authority can
+/// rewrite members and threshold unilaterally, so the owner list is not binding.
+fn create_multisig_with_config_authority(
+    client: &RpcClient,
+    creator: &Keypair,
+    authority: Pubkey,
+) -> Pubkey {
+    use feature_gate_multisig_tool::squads::{
+        deserialize_squads_account, get_multisig_pda, get_program_config_pda, InstructionData,
+        MultisigCreateArgsV2, MultisigCreateV2Accounts, MultisigCreateV2Data, ProgramConfig,
+        PROGRAM_CONFIG_ACCOUNT_DISCRIMINATOR,
+    };
+
+    let create_key = Keypair::new();
+    let (multisig, _) = get_multisig_pda(&create_key.pubkey());
+    let (program_config, _) = get_program_config_pda();
+    let config_account = client
+        .get_account(&program_config)
+        .expect("read Squads program config");
+    let parsed: ProgramConfig = deserialize_squads_account(
+        &config_account.data,
+        PROGRAM_CONFIG_ACCOUNT_DISCRIMINATOR,
+        "program config",
+    )
+    .expect("decode program config");
+
+    let instruction = solana_instruction::Instruction {
+        program_id: SQUADS_MULTISIG_PROGRAM_ID,
+        accounts: MultisigCreateV2Accounts {
+            create_key: create_key.pubkey(),
+            creator: creator.pubkey(),
+            multisig,
+            system_program: solana_system_interface::program::ID,
+            program_config,
+            treasury: parsed.treasury,
+        }
+        .to_account_metas(),
+        data: MultisigCreateV2Data {
+            args: MultisigCreateArgsV2 {
+                config_authority: Some(authority),
+                threshold: 1,
+                members: vec![Member {
+                    key: creator.pubkey(),
+                    permissions: Permissions::all(),
+                }],
+                time_lock: 0,
+                rent_collector: None,
+                memo: None,
+            },
+        }
+        .data()
+        .expect("serialize create args"),
+    };
+
+    let message = solana_message::v0::Message::try_compile(
+        &creator.pubkey(),
+        &[instruction],
+        &[],
+        client.get_latest_blockhash().expect("blockhash"),
+    )
+    .expect("compile create");
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[creator, &create_key])
+            .expect("sign create");
+    send_and_confirm_transaction(&transaction, client).expect("create multisig with authority");
+    multisig
+}
+
+/// Test 20: `verify` must fail when a check runs and reports a problem, not only
+/// when a check cannot run. A multisig whose config authority can rewrite members
+/// and threshold at will is the case a runbook gate would otherwise wave through.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_20_verify_fails_on_a_non_autonomous_multisig() {
+    init_test_env();
+
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    wait_for_account(&client, &SQUADS_MULTISIG_PROGRAM_ID);
+
+    let creator = Keypair::new();
+    let airdrop = client
+        .request_airdrop(&creator.pubkey(), 10_000_000_000)
+        .expect("airdrop creator");
+    client.confirm_transaction(&airdrop).expect("confirm");
+
+    let attacker_authority = Keypair::new().pubkey();
+    let multisig = create_multisig_with_config_authority(&client, &creator, attacker_authority);
+    println!("✅ Created a multisig with config authority {attacker_authority}");
+
+    let config = Config {
+        networks: vec![rpc_url()],
+        threshold: 1,
+        members: vec![creator.pubkey().to_string()],
+        fee_payer_path: None,
+        voting_key: None,
+    };
+
+    // Every read succeeds here - the program is authentic, the feature account is
+    // Fresh, the multisig is readable. The only negative is the autonomy check,
+    // which previously printed a warning and exited 0.
+    let error = verify_command(&config, Some(multisig.to_string()))
+        .expect_err("verify must fail when a check reports a problem");
+    println!("✅ Refused with: {error}");
+    assert!(
+        error
+            .to_string()
+            .contains("has not been shown to be correct"),
+        "error should be the verification failure, got: {error}"
+    );
+
+    // An autonomous multisig on the same cluster still verifies cleanly, so the
+    // failure is the authority and not something incidental.
+    let (_config, autonomous, _vault, _pubkeys, _paths) =
+        setup_eoa_multisig(&client, "eoa_test20", 2);
+    verify_command(&config, Some(autonomous.to_string()))
+        .expect("an autonomous multisig must still verify cleanly");
+    println!("✅ Non-autonomous multisig fails verification; autonomous one passes");
 }

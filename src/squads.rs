@@ -725,6 +725,28 @@ mod tests {
         }
     }
 
+    /// Header counts are unvalidated u8 fields from the account. Summing them at
+    /// u8 width wraps above 255, which is how the drill-down once displayed
+    /// writable accounts as read-only; this widens each field first.
+    #[test]
+    fn writability_does_not_wrap_on_large_headers() {
+        let mut message = message_with_lookups(Vec::new());
+        message.account_keys = (0..350).map(|_| Pubkey::new_unique()).collect();
+        message.num_signers = 200;
+        message.num_writable_signers = 200;
+        message.num_writable_non_signers = 100;
+
+        // 200 + 100 = 300 overflows u8 and wraps to 44, so the old expression
+        // called everything from index 44 up read-only. Writable non-signers
+        // actually run 200..300.
+        assert!(message.is_static_writable_index(250));
+        assert!(message.is_static_writable_index(299));
+        // 300 onwards really are read-only.
+        assert!(!message.is_static_writable_index(300));
+        // Out of range is never writable.
+        assert!(!message.is_static_writable_index(400));
+    }
+
     /// Accounts loaded from a lookup table are absent from `account_keys`, so the
     /// metas would be incomplete. Refuse with a clear message rather than letting
     /// Squads reject the execution on-chain.

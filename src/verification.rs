@@ -643,6 +643,16 @@ mod tests {
         }];
         assert!(is_rekeyed(&rekeyed));
 
+        // The same unusable member set, but a config authority can add members
+        // and move the threshold directly, so nothing is frozen. Claiming
+        // "permanently frozen" here would be false.
+        let mut authority_held = rekeyed.clone();
+        authority_held.config_authority = Pubkey::new_unique();
+        assert!(
+            !is_rekeyed(&authority_held),
+            "a unilateral config authority can restore quorum, so this is not frozen"
+        );
+
         // Quorum impossible more generally: threshold above the usable voters.
         let stuck = multisig_with(Pubkey::default(), 0, 3);
         assert!(is_rekeyed(&stuck));
