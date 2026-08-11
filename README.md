@@ -14,13 +14,13 @@ Requires a Rust toolchain ([rustup](https://rustup.rs)), and `libudev-dev` +
 Install a released version:
 
 ```bash
-cargo install --locked --git https://github.com/Squads-Protocol/feature-gate-multisig --tag <version>
+cargo install --locked --git https://github.com/nbelenkov/feature-gate-multisig --tag <version>
 ```
 
 Or clone and build:
 
 ```bash
-git clone https://github.com/Squads-Protocol/feature-gate-multisig.git
+git clone https://github.com/nbelenkov/feature-gate-multisig.git
 cd feature-gate-multisig
 git checkout <version>   # pick a release tag; omit for the development branch
 cargo build --release --locked
