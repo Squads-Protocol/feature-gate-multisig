@@ -2,8 +2,8 @@ use crate::commands::proposal::{
     describe_transaction, proposal_status_label, unverifiable_proposal_error, ProposalKind,
 };
 use crate::commands::{
-    config_command, create_command, proposal_command, show_command, verify_command,
-    ProposalCommand, ProposalCommandArgs, TransactionKind,
+    check_signer_command, config_command, create_command, proposal_command, show_command,
+    verify_command, ProposalCommand, ProposalCommandArgs, TransactionKind,
 };
 use crate::output::Output;
 use crate::provision::{create_rpc_client, fetch_proposal, fetch_squads_multisig};
@@ -13,6 +13,7 @@ use eyre::Result;
 use inquire::{Confirm, Select, Text};
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
+use std::str::FromStr;
 
 pub fn interactive_mode() -> Result<()> {
     let mut config = load_config()?;
@@ -25,6 +26,7 @@ pub fn interactive_mode() -> Result<()> {
             "Create new feature gate multisig",
             "Show feature gate multisig details",
             "Verify feature gate multisig",
+            "Check signer (signs nothing)",
             "Show configuration",
             "Proposal Actions (Approve/Reject/Execute)",
             "Exit",
@@ -53,6 +55,7 @@ pub fn interactive_mode() -> Result<()> {
                 .prompt()
                 .map_err(eyre::Report::from)
                 .and_then(|address| verify_command(&config, Some(address))),
+            "Check signer (signs nothing)" => handle_check_signer(&config, &last_multisig),
             "Show configuration" => config_command(&config),
             "Exit" => break,
             _ => unreachable!(),
@@ -69,6 +72,34 @@ pub fn interactive_mode() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Interactive `check-signer`: prompt for a keypair path and an optional
+/// multisig, then run the same checks as the CLI subcommand.
+fn handle_check_signer(config: &Config, last_multisig: &Option<String>) -> Result<()> {
+    let default_path = config.fee_payer_path.as_deref().unwrap_or("usb://ledger");
+    let path = Text::new("Enter the signer keypair path to check:")
+        .with_default(default_path)
+        .prompt()?;
+    let path = expand_tilde_path(&path)?;
+
+    let multisig = loop {
+        let mut text = Text::new("Multisig to check membership against (leave empty to skip):");
+        if let Some(last) = last_multisig.as_deref() {
+            text = text.with_default(last);
+        }
+        let input = text.prompt()?;
+        let input = input.trim();
+        if input.is_empty() {
+            break None;
+        }
+        match Pubkey::from_str(input) {
+            Ok(key) => break Some(key.to_string()),
+            Err(_) => Output::warning("Invalid public key, please try again."),
+        }
+    };
+
+    check_signer_command(config, Some(path), multisig)
 }
 
 /// True when the error is the user pressing Esc in an inquire prompt.
@@ -201,7 +232,7 @@ fn prompt_for_transaction_kind() -> Result<Option<TransactionKind>> {
 /// staleness. Voting (approve/reject) requires an Active proposal that is not
 /// stale. Execution requires an Approved proposal; a stale but approved vault
 /// transaction can still execute, while a stale config transaction cannot.
-fn is_actionable(
+pub(crate) fn is_actionable(
     action: ProposalCommand,
     status: &ProposalStatus,
     kind: ProposalKind,

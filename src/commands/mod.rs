@@ -1,3 +1,4 @@
+pub mod check_signer;
 pub mod config;
 pub mod create;
 pub mod interactive;
@@ -6,6 +7,7 @@ pub mod show;
 pub mod transaction_generation;
 pub mod verify;
 
+pub use check_signer::check_signer_command;
 pub use config::config_command;
 pub use create::create_command;
 pub use interactive::interactive_mode;

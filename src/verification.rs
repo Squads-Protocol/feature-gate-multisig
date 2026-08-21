@@ -12,6 +12,7 @@ use crate::squads::{get_vault_pda, Multisig, SQUADS_MULTISIG_PROGRAM_ID};
 use eyre::{eyre, Result};
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
+use std::str::FromStr;
 
 /// Upgradeable BPF loader that owns deployed programs and their ProgramData accounts.
 pub const BPF_LOADER_UPGRADEABLE_ID: Pubkey =
@@ -355,7 +356,40 @@ pub fn member_set_warnings(ms: &Multisig) -> Vec<String> {
     member_set_warnings_against(ms, KNOWN_SIGNERS)
 }
 
-fn member_set_warnings_against(ms: &Multisig, known: &[(&str, Pubkey)]) -> Vec<String> {
+/// The signer set to hold a multisig to, and a phrase naming its source:
+/// [`KNOWN_SIGNERS`] when vendored into this build, otherwise the operator's
+/// configured member list. `None` when there is nothing to compare against.
+pub fn expected_signers(
+    config_members: &[String],
+) -> Option<(Vec<(String, Pubkey)>, &'static str)> {
+    if !KNOWN_SIGNERS.is_empty() {
+        let vendored = KNOWN_SIGNERS
+            .iter()
+            .map(|(name, key)| ((*name).to_string(), *key))
+            .collect();
+        return Some((vendored, "the signer set vendored into this build"));
+    }
+    if config_members.is_empty() {
+        return None;
+    }
+    // Keep unparseable entries in the set under their raw text so they are
+    // reported as missing rather than quietly shrinking the check.
+    let configured = config_members
+        .iter()
+        .map(|entry| {
+            let key = Pubkey::from_str(entry).unwrap_or_default();
+            (entry.clone(), key)
+        })
+        .collect();
+    Some((configured, "your configured member list"))
+}
+
+/// Warnings when the multisig's voting members differ from `expected`.
+pub fn member_set_warnings_for(ms: &Multisig, expected: &[(String, Pubkey)]) -> Vec<String> {
+    member_set_warnings_against(ms, expected)
+}
+
+fn member_set_warnings_against<N: AsRef<str>>(ms: &Multisig, known: &[(N, Pubkey)]) -> Vec<String> {
     use crate::squads::{PERMISSION_EXECUTE, PERMISSION_VOTE};
 
     if known.is_empty() {
@@ -369,9 +403,17 @@ fn member_set_warnings_against(ms: &Multisig, known: &[(&str, Pubkey)]) -> Vec<S
             .iter()
             .any(|m| m.key == *key && m.permissions.mask & PERMISSION_VOTE != 0);
         if !is_voting_member {
-            warnings.push(format!(
-                "Expected signer {name} ({key}) is not a voting member of this multisig."
-            ));
+            let name = name.as_ref();
+            // Configured sets use the key as the name; don't print it twice.
+            if name == key.to_string() {
+                warnings.push(format!(
+                    "Expected signer {key} is not a voting member of this multisig."
+                ));
+            } else {
+                warnings.push(format!(
+                    "Expected signer {name} ({key}) is not a voting member of this multisig."
+                ));
+            }
         }
     }
 
@@ -710,7 +752,7 @@ mod tests {
         assert!(warnings[0].contains("execute proposals"));
 
         // Empty registry (the current vendored state): check is skipped.
-        assert!(member_set_warnings_against(&ms, &[]).is_empty());
+        assert!(member_set_warnings_against(&ms, &[] as &[(&str, Pubkey)]).is_empty());
     }
 
     #[test]

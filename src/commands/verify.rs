@@ -3,11 +3,11 @@ use crate::constants::DEFAULT_DEVNET_URL;
 use crate::output::Output;
 use crate::provision::{create_rpc_client, fetch_squads_multisig};
 use crate::squads::{Multisig, PERMISSION_VOTE};
-use crate::utils::{get_network_display, validate_pubkey_with_retry, Config};
+use crate::utils::{format_time_lock, get_network_display, validate_pubkey_with_retry, Config};
 use crate::verification::{
-    config_fingerprint, is_autonomous, is_rekeyed, member_set_warnings, multisig_safety_warnings,
-    program_warnings, resolve_cluster, verify_feature_gate, verify_squads_program,
-    FeatureVerification, ProgramAuthenticity,
+    config_fingerprint, expected_signers, is_autonomous, is_rekeyed, member_set_warnings_for,
+    multisig_safety_warnings, program_warnings, resolve_cluster, verify_feature_gate,
+    verify_squads_program, FeatureVerification, ProgramAuthenticity,
 };
 use eyre::Result;
 use solana_pubkey::Pubkey;
@@ -64,7 +64,7 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
                 continue;
             }
         };
-        let (found, failed) = verify_on_network(&rpc, &multisig, mainnet);
+        let (found, failed) = verify_on_network(&rpc, &multisig, mainnet, &config.members);
         incomplete |= failed;
         if let Some(ms) = found {
             seen.push((get_network_display(network), ms));
@@ -89,6 +89,7 @@ fn verify_on_network(
     rpc: &RpcClient,
     multisig: &Pubkey,
     is_mainnet: bool,
+    expected_members: &[String],
 ) -> (Option<Multisig>, bool) {
     let mut failed = false;
     match verify_squads_program(rpc) {
@@ -107,7 +108,7 @@ fn verify_on_network(
     }
     match fetch_squads_multisig(rpc, multisig, "multisig") {
         Ok(ms) => {
-            failed |= display_owners(&ms);
+            failed |= display_owners(&ms, is_mainnet, expected_members);
             (Some(ms), failed)
         }
         Err(e) => {
@@ -219,10 +220,11 @@ fn display_feature(v: &FeatureVerification) -> bool {
     false
 }
 
-/// Returns true when the owner set is not binding, i.e. a config authority can
-/// rewrite members and threshold unilaterally. A time lock or a completed rekey
-/// are intended states and only warn.
-fn display_owners(ms: &Multisig) -> bool {
+/// Returns true when this multisig should not be acted on: a config authority
+/// can rewrite members and threshold unilaterally, it has been rekeyed, the
+/// voting members differ from the expected set, or (on mainnet) there is no
+/// expected set at all. A time lock only warns.
+fn display_owners(ms: &Multisig, is_mainnet: bool, expected_members: &[String]) -> bool {
     let voting_members = ms
         .members
         .iter()
@@ -239,8 +241,9 @@ fn display_owners(ms: &Multisig) -> bool {
         "Autonomous (config by vote)",
         &is_autonomous(ms).to_string(),
     );
-    Output::field("Time lock", &format!("{}s", ms.time_lock));
-    if is_rekeyed(ms) {
+    Output::field("Time lock", &format_time_lock(ms.time_lock));
+    let rekeyed = is_rekeyed(ms);
+    if rekeyed {
         Output::warning(
             "This multisig has been rekeyed: its voting keys cannot meet the threshold, so no proposal can ever pass and the configuration is permanently frozen.",
         );
@@ -250,9 +253,28 @@ fn display_owners(ms: &Multisig) -> bool {
     for warning in multisig_safety_warnings(ms) {
         Output::warning(&warning);
     }
-    for warning in member_set_warnings(ms) {
-        Output::warning(&warning);
+    // Check members against the vendored set when this build has one,
+    // otherwise the operator's configured members. No expectation at all is
+    // reported, not silently passed.
+    let (member_warnings, unconfigured_signer_set) = match expected_signers(expected_members) {
+        Some((expected, source)) => {
+            Output::field("Owners checked against", source);
+            (member_set_warnings_for(ms, &expected), false)
+        }
+        None => {
+            Output::warning(
+                "No expected signer set to check against: KNOWN_SIGNERS is empty in this build \
+                 and no members are saved in your config. The member list below was displayed \
+                 but not verified against anything.",
+            );
+            (Vec::new(), is_mainnet)
+        }
+    };
+    for warning in &member_warnings {
+        Output::warning(warning);
     }
 
-    !is_autonomous(ms)
+    // Each of these is a reason not to act; all must reach the exit code so
+    // `verify && approve` cannot sail through.
+    !is_autonomous(ms) || rekeyed || !member_warnings.is_empty() || unconfigured_signer_set
 }

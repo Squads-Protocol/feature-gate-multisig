@@ -15,7 +15,7 @@ test-surfpool:
 		surfpool_pid=$$!; \
 		sleep 5; \
 		echo "Running RPC E2E tests..."; \
-		RPC_URL=http://127.0.0.1:8899 cargo test --locked rpc_e2e_ -- --test-threads=1 --nocapture --include-ignored; \
+		RPC_URL=http://127.0.0.1:8899 cargo test --locked --features e2e-harness rpc_e2e_ -- --test-threads=1 --nocapture --include-ignored; \
 		status=$$?; \
 		echo "Stopping surfpool..."; \
 		kill -KILL "$$surfpool_pid" 2>/dev/null || true; \

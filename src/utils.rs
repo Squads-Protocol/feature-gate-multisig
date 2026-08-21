@@ -61,10 +61,35 @@ pub struct DeploymentResult {
     pub transaction_signature: String,
 }
 
+/// True when an environment flag is set to something meaning "on".
+/// `FLAG=0` and `FLAG=false` read as off, not as present-therefore-on.
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| flag_value_enabled(&value))
+}
+
+/// Split from [`env_flag_enabled`] so the parsing rule is testable without
+/// touching process-global env state.
+fn flag_value_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
 /// True when running under the E2E test harness, which auto-confirms prompts
 /// and picks defaults non-interactively.
+///
+/// Only exists in `e2e-harness` builds: a release binary must carry no env-var
+/// path that can silence a confirmation. Without the feature this is a
+/// constant `false`.
+#[cfg(feature = "e2e-harness")]
 pub fn is_e2e_test_mode() -> bool {
-    std::env::var("E2E_TEST_MODE").is_ok()
+    env_flag_enabled("E2E_TEST_MODE")
+}
+
+#[cfg(not(feature = "e2e-harness"))]
+pub fn is_e2e_test_mode() -> bool {
+    false
 }
 
 /// Env var set by the `--yes` CLI flag. Confirmations resolve to their default
@@ -74,7 +99,7 @@ pub const ASSUME_YES_ENV: &str = "FEATURE_GATE_MULTISIG_ASSUME_YES";
 
 /// True when `--yes` was passed: take each confirmation's default answer.
 pub fn is_assume_yes() -> bool {
-    std::env::var(ASSUME_YES_ENV).is_ok()
+    env_flag_enabled(ASSUME_YES_ENV)
 }
 
 /// Load a signer from a CLI-style path: a keypair file or `usb://ledger`.
@@ -99,6 +124,56 @@ pub fn get_network_display(rpc_url: &str) -> &'static str {
     } else {
         "Custom"
     }
+}
+
+/// Render a time lock for display: "none" when zero, otherwise the raw seconds
+/// with the largest whole unit as a hint ("3600s (1h)"), "~"-prefixed when the
+/// value does not divide evenly ("5400s (~1h)").
+pub fn format_time_lock(seconds: u32) -> String {
+    if seconds == 0 {
+        return "none".to_string();
+    }
+    let seconds = u64::from(seconds);
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let (unit, label) = duration_unit(seconds);
+    let approx = if seconds % unit == 0 { "" } else { "~" };
+    format!("{seconds}s ({approx}{}{label})", seconds / unit)
+}
+
+fn duration_unit(seconds: u64) -> (u64, &'static str) {
+    if seconds >= 86_400 {
+        (86_400, "d")
+    } else if seconds >= 3_600 {
+        (3_600, "h")
+    } else {
+        (60, "m")
+    }
+}
+
+/// Approximate age of a unix timestamp, truncated to the largest whole unit
+/// ("3d ago"). The timestamp is on-chain data, so extreme or future values must
+/// render as text rather than wrap or panic.
+pub fn format_relative_age(timestamp: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    relative_age_at(timestamp, now)
+}
+
+fn relative_age_at(timestamp: i64, now: i64) -> String {
+    let delta = now.saturating_sub(timestamp);
+    if delta < 0 {
+        return "in the future".to_string();
+    }
+    if delta < 60 {
+        return "just now".to_string();
+    }
+    let delta = delta as u64;
+    let (unit, label) = duration_unit(delta);
+    format!("{}{} ago", delta / unit, label)
 }
 
 /// URL-based mainnet heuristic. Only a fallback: cluster detection normally uses
@@ -718,13 +793,11 @@ pub fn validate_rpc_url(url: &str) -> Result<String> {
     }
 
     // Check for common Solana RPC patterns
-    if url.contains("solana.com")
+    let looks_like_rpc_endpoint = url.contains("solana.com")
         || url.contains("localhost")
         || url.contains("127.0.0.1")
-        || url.contains("rpc")
-    {
-        println!("  {} Valid RPC URL format detected", "✓".bright_green());
-    } else {
+        || url.contains("rpc");
+    if !looks_like_rpc_endpoint {
         println!(
             "  {} Warning: URL doesn't match common Solana RPC patterns",
             "⚠️".bright_yellow()
@@ -1013,6 +1086,54 @@ pub fn check_fee_payer_balance_on_networks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_lock_rendering() {
+        assert_eq!(format_time_lock(0), "none");
+        assert_eq!(format_time_lock(45), "45s");
+        assert_eq!(format_time_lock(60), "60s (1m)");
+        assert_eq!(format_time_lock(90), "90s (~1m)");
+        assert_eq!(format_time_lock(3600), "3600s (1h)");
+        assert_eq!(format_time_lock(5400), "5400s (~1h)");
+        assert_eq!(format_time_lock(172_800), "172800s (2d)");
+    }
+
+    /// Status timestamps are on-chain data: extreme and future values must
+    /// render as text, never wrap or panic.
+    #[test]
+    fn relative_age_rendering() {
+        let now = 1_755_000_000;
+        assert_eq!(relative_age_at(now, now), "just now");
+        assert_eq!(relative_age_at(now - 59, now), "just now");
+        assert_eq!(relative_age_at(now - 120, now), "2m ago");
+        assert_eq!(relative_age_at(now - 7_200, now), "2h ago");
+        assert_eq!(relative_age_at(now - 300_000, now), "3d ago");
+        assert_eq!(relative_age_at(now + 500, now), "in the future");
+        assert_eq!(
+            relative_age_at(i64::MIN, now),
+            format!("{}d ago", i64::MAX as u64 / 86_400)
+        );
+        assert_eq!(relative_age_at(i64::MAX, now), "in the future");
+    }
+
+    #[test]
+    fn flag_values_that_mean_off_are_off() {
+        for off in ["", " ", "0", "false", "FALSE", "no", "off", " Off "] {
+            assert!(!flag_value_enabled(off), "{off:?} should read as off");
+        }
+        for on in ["1", "true", "yes", "on", "anything"] {
+            assert!(flag_value_enabled(on), "{on:?} should read as on");
+        }
+    }
+
+    /// A released build must have no environment-variable path to auto-confirm.
+    #[test]
+    #[cfg(not(feature = "e2e-harness"))]
+    fn e2e_mode_is_compiled_out_of_release_builds() {
+        std::env::set_var("E2E_TEST_MODE", "1");
+        assert!(!is_e2e_test_mode());
+        std::env::remove_var("E2E_TEST_MODE");
+    }
 
     /// The ceiling has to equal what a real validator reports, or every create
     /// would fail. Verified against surfpool: 953,520 lamports for 9 bytes.
