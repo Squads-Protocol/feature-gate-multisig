@@ -116,20 +116,27 @@ fn verify_on_network(
             failed = true;
         }
     }
+    // Read the multisig before the feature account: a rekeyed multisig can
+    // never act again, which changes what its feature's status *means*. "Fresh"
+    // on a live multisig is a pending job; on a rekeyed one it is a permanent
+    // dead end, and the report should not read the same in both cases.
+    let ms = fetch_squads_multisig(rpc, multisig, "multisig").ok();
+    let rekeyed = ms.as_ref().map(is_rekeyed).unwrap_or(false);
+
     match verify_feature_gate(rpc, multisig) {
-        Ok(v) => failed |= display_feature(&v),
+        Ok(v) => failed |= display_feature(&v, rekeyed),
         Err(e) => {
             Output::warning(&format!("Could not read feature gate account: {e}"));
             failed = true;
         }
     }
-    match fetch_squads_multisig(rpc, multisig, "multisig") {
-        Ok(ms) => {
+    match ms {
+        Some(ms) => {
             failed |= display_owners(&ms);
             (Some(ms), failed)
         }
-        Err(e) => {
-            Output::warning(&format!("Multisig not readable on this network: {e}"));
+        None => {
+            Output::warning("Multisig not readable on this network.");
             (None, true)
         }
     }
@@ -221,11 +228,22 @@ fn display_program_authenticity(p: &ProgramAuthenticity, is_mainnet: bool) -> bo
 
 /// Returns true when the feature account is in an unexpected state - an owner or
 /// data length this tool does not recognise.
-fn display_feature(v: &FeatureVerification) -> bool {
+fn display_feature(v: &FeatureVerification, multisig_rekeyed: bool) -> bool {
+    use crate::verification::FeatureGateStatus;
     println!();
     Output::header("🪄 Feature Gate");
     Output::field("Feature gate ID (vault 0)", &v.feature_id.to_string());
-    Output::field("Status", &format!("{:?}", v.status));
+    // A rekeyed multisig can never pass another proposal, so a feature it still
+    // governs is frozen wherever it stands. Saying only "Fresh" or "Pending"
+    // reads as work outstanding when it is actually a terminal state.
+    let status = match (&v.status, multisig_rekeyed) {
+        (FeatureGateStatus::Activated { .. }, _) => format!("{:?}", v.status),
+        (s, true) => format!(
+            "{s:?} - PERMANENT: the multisig is rekeyed, so this can never be activated or revoked"
+        ),
+        (s, false) => format!("{s:?}"),
+    };
+    Output::field("Status", &status);
     Output::field("Lamports", &v.lamports.to_string());
     Output::field("Rent-exempt", &v.rent_exempt.to_string());
     if let crate::verification::FeatureGateStatus::Unexpected { owner, data_len } = &v.status {
