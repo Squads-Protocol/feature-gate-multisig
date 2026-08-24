@@ -37,6 +37,10 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
     // Warn-and-exit-0 reads as "verified" to anything checking the exit code, so
     // a check that could not run - or ran and reported a problem - has to fail.
     let mut incomplete = false;
+    // Track whether every multisig that answered is rekeyed, so a deliberate
+    // decommission reports as one instead of as a failed correctness check.
+    let mut all_rekeyed = true;
+    let mut any_seen = false;
     for network in &networks {
         println!();
         Output::header(&format!(
@@ -67,6 +71,8 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
         let (found, failed) = verify_on_network(&rpc, &multisig, mainnet);
         incomplete |= failed;
         if let Some(ms) = found {
+            all_rekeyed &= is_rekeyed(&ms);
+            any_seen = true;
             seen.push((get_network_display(network), ms));
         }
     }
@@ -75,6 +81,18 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
     incomplete |= report_cross_network_consistency(&seen);
 
     if incomplete {
+        // A rekeyed multisig is not a broken one, it is a decommissioned one.
+        // Reporting "has not been shown to be correct" for an intentional,
+        // irreversible end state trains people to shrug at that sentence -- the
+        // exact sentence that must still mean something when a real check fails.
+        // Still a non-zero exit, so `verify && approve` cannot sail through.
+        if any_seen && all_rekeyed {
+            return Err(eyre::eyre!(
+                "This multisig is DECOMMISSIONED: it has been rekeyed, so no proposal can ever \
+                 pass and its feature gate is frozen where it stands. Nothing further can be \
+                 done with it. If you expected a live multisig, you have the wrong address."
+            ));
+        }
         return Err(eyre::eyre!(
             "Verification failed: see the warnings above. The multisig has not been shown to be correct."
         ));
