@@ -256,18 +256,32 @@ fn display_owners(ms: &Multisig, is_mainnet: bool, expected_members: &[String]) 
     // Check members against the vendored set when this build has one,
     // otherwise the operator's configured members. No expectation at all is
     // reported, not silently passed.
-    let (member_warnings, unconfigured_signer_set) = match expected_signers(expected_members) {
-        Some((expected, source)) => {
-            Output::field("Owners checked against", source);
-            (member_set_warnings_for(ms, &expected), false)
-        }
-        None => {
-            Output::warning(
-                "No expected signer set to check against: KNOWN_SIGNERS is empty in this build \
-                 and no members are saved in your config. The member list below was displayed \
-                 but not verified against anything.",
-            );
-            (Vec::new(), is_mainnet)
+    //
+    // Skipped entirely once rekeyed. Rekeying *is* "every expected signer was
+    // removed and an unsignable dummy put in their place", so comparing the
+    // member set against expectations restates the rekey warning once per
+    // signer and buries the one fact that matters. The rekey itself already
+    // forces a non-zero exit below.
+    let (member_warnings, unconfigured_signer_set) = if rekeyed {
+        Output::info(
+            "Owner check skipped: a rekeyed multisig has no governance signers left to compare \
+             against, by definition.",
+        );
+        (Vec::new(), false)
+    } else {
+        match expected_signers(expected_members) {
+            Some((expected, source)) => {
+                Output::field("Owners checked against", source);
+                (member_set_warnings_for(ms, &expected), false)
+            }
+            None => {
+                Output::warning(
+                    "No expected signer set to check against: KNOWN_SIGNERS is empty in this \
+                     build and no members are saved in your config. The member list below was \
+                     displayed but not verified against anything.",
+                );
+                (Vec::new(), is_mainnet)
+            }
         }
     };
     for warning in &member_warnings {
