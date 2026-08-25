@@ -77,19 +77,24 @@ action through: a proposal this tool cannot classify, and any config change
 > **See [docs/WORKFLOWS.md](docs/WORKFLOWS.md) for detailed step-by-step examples.**
 
 The interactive menu provides:
-- **Create new feature gate multisig** - Guided setup with member collection
-- **Show multisig details** - Inspect any multisig address
-- **Proposal Actions** - Create/Approve/Reject/Execute proposals
-- **Show configuration** - View saved settings
+- **Create new feature gate multisig** - guided setup with member collection
+- **Show / Verify feature gate multisig** - inspect any address
+- **Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)** - act on proposals
+- **Show configuration** - view saved settings
 
 ### Proposal Actions
 
-Supports three transaction types:
-- **Activate Feature Gate** - Enable a Solana feature gate
-- **Revoke Feature Gate** - Cancel a pending activation
-- **Rekey Multisig** - Brick the multisig (rekey use only)
+Choosing **Create (Activate / Revoke / Rekey)** asks which transaction type:
 
-Each supports: Create, Approve, Reject, Execute
+| Type | Effect |
+|---|---|
+| Activate Feature Gate | queue a feature for activation at the next epoch boundary |
+| Revoke Feature Gate | close a **pending** activation and burn its lamports to the incinerator |
+| Rekey Multisig | **irreversible**: replaces every member with an unsignable dummy and sets threshold 1, so no proposal can ever pass again |
+
+Approve, Reject and Execute act on proposals that already exist, and take the
+kind from the on-chain transaction rather than from `--kind`, so an existing
+proposal cannot be mislabelled.
 
 ## Proposal Structure
 
@@ -101,6 +106,14 @@ When a multisig is created, one proposal is automatically generated:
 
 **Note**: Activating or revoking a feature gate does not change the multisig threshold.
 
+`create` also adds a throwaway contributor member with Initiate-only permission,
+generated on the fly and never saved. Its key is discarded, so that member can
+never act again and a "2 member" multisig reports 3 members.
+
+Revocation only works while the feature is **Pending**. Once the runtime stamps
+`activated_at` at an epoch boundary it is permanent, and the program rejects the
+instruction with `InvalidAccountOwner`.
+
 Revocation proposals are **not** pre-created. If you need to revoke a feature, create a new revocation proposal using "Proposal Actions" → "Revoke Feature Gate" → "Create". See [Emergency Revocation workflow](docs/WORKFLOWS.md#4-emergency-revocation) for details.
 
 ## Parent → Child Multisig Voting
@@ -109,13 +122,26 @@ For programmatic voting from a parent multisig:
 
 > **Important**: Add the parent's **vault PDA** (not multisig address) as a member of the child multisig with Vote/Execute permissions.
 
-The **fee payer keypair** must be a member of the parent multisig with full permissions. The fee payer's signature is used to create/approve/execute proposals on the parent multisig.
+The **fee payer keypair** must be a member of the parent multisig with Initiate.
+Here `voting_key` and the fee payer are deliberately *different*: pass the parent
+multisig as `--voting-key` and sign with your own key.
 
-The parent multisig address cannot sign during CPI - only the vault PDA can be signed for using PDA seeds.
+The parent multisig address cannot sign during CPI - only the vault PDA can be
+signed for using PDA seeds. That PDA is off-curve, so no private key exists for
+it; the Squads program signs as it once a parent proposal passes.
 
 ```
 Parent vault PDA = get_vault_pda(parent_multisig, 0)
 ```
+
+The tool detects the mode automatically: if `--voting-key` resolves to a Squads
+multisig account, it takes the parent path.
+
+**Each child action costs three parent transactions** - create the parent
+proposal, approve it, execute it - and only the execute reaches the child. So one
+activation is six, and a revoke drill is fifteen. The CLI prompts for all three
+in sequence; interrupting between them leaves a half-finished parent proposal
+and the child untouched.
 
 The CLI will display the required PDA if misconfigured. See [Parent Multisig Voting workflow](docs/WORKFLOWS.md#3-activating-a-feature-parent-multisig-voting) for detailed steps.
 
@@ -128,7 +154,8 @@ Stored in your OS config directory (for example `~/.config/feature-gate-multisig
   "threshold": 2,
   "members": ["<pubkey1>", "<pubkey2>"],
   "networks": ["https://api.devnet.solana.com"],
-  "fee_payer_path": "usb://ledger"
+  "fee_payer_path": "usb://ledger",
+  "voting_key": "<pubkey1>"
 }
 ```
 
@@ -138,6 +165,17 @@ Stored in your OS config directory (for example `~/.config/feature-gate-multisig
 | `members` | Saved member public keys |
 | `networks` | RPC endpoints for deployment |
 | `fee_payer_path` | Keypair path (file or `usb://ledger`) |
+| `voting_key` | Default voting identity: your own key, or a parent multisig |
+
+**Voting as yourself: `voting_key` and `fee_payer_path` must be the same key.**
+Only the fee-payer keypair is loaded, and the voting key has to sign, so a
+mismatch fails fast rather than producing an unsignable transaction:
+
+```
+Error: In EOA mode, voting_key must match fee_payer.
+```
+
+That rule inverts when voting through a parent multisig; see below.
 
 ## Network Support
 
@@ -145,6 +183,13 @@ Stored in your OS config directory (for example `~/.config/feature-gate-multisig
 - Devnet: `https://api.devnet.solana.com`
 - Testnet: `https://api.testnet.solana.com`
 - Custom RPC endpoints supported
+
+The cluster is identified by its **genesis hash**, and mainnet gets the strict
+checks. A forked-mainnet staging cluster reports mainnet's genesis hash by
+design, so neither this tool nor a hardware-wallet screen can tell the two
+apart. When rehearsing against a fork, put **only** the staging RPC in
+`networks`: a member with mainnet still in the list who picks the wrong entry
+signs a real mainnet transaction with real keys.
 
 ## Testing
 
