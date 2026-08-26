@@ -99,7 +99,7 @@ fn handle_check_signer(config: &Config, last_multisig: &Option<String>) -> Resul
         }
     };
 
-    check_signer_command(config, Some(path), multisig)
+    check_signer_command(config, Some(path), multisig, None)
 }
 
 /// True when the error is the user pressing Esc in an inquire prompt.

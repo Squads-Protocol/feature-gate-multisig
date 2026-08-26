@@ -170,6 +170,11 @@ The contributor key receives Initiate-only permissions, while additional members
             help = "Also check this key is a member of this multisig, and what it may do"
         )]
         multisig: Option<String>,
+        #[arg(
+            long,
+            help = "Network to inspect: a configured network name (devnet/testnet/mainnet) or an RPC URL. Prompts when omitted and several networks are configured"
+        )]
+        network: Option<String>,
     },
     #[command(about = "Show current configuration including networks and saved members")]
     #[command(
@@ -313,9 +318,11 @@ fn handle_command(command: Commands) -> Result<()> {
             run_proposal(&config, ProposalCommand::Execute, args, Some(index))
         }
         Commands::Interactive => interactive_mode(),
-        Commands::CheckSigner { keypair, multisig } => {
-            check_signer_command(&config, keypair, multisig)
-        }
+        Commands::CheckSigner {
+            keypair,
+            multisig,
+            network,
+        } => check_signer_command(&config, keypair, multisig, network),
         Commands::Config => config_command(&config),
     }
 }
