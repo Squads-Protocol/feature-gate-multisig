@@ -264,8 +264,9 @@ fn display_owners(ms: &Multisig, is_mainnet: bool, expected_members: &[String]) 
         None => {
             Output::warning(
                 "No expected signer set to check against: KNOWN_SIGNERS is empty in this build \
-                 and no members are saved in your config. The member list below was displayed \
-                 but not verified against anything.",
+                 and no members are saved in your config. Add the expected signers to `members` \
+                 in your config file (`config` prints its path; config.example.json shows the \
+                 shape). The member list above was displayed but not verified against anything.",
             );
             (Vec::new(), is_mainnet)
         }
