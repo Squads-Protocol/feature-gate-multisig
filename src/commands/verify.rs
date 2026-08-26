@@ -264,8 +264,8 @@ fn display_owners(ms: &Multisig, is_mainnet: bool, expected_members: &[String]) 
     // forces a non-zero exit below.
     let (member_warnings, unconfigured_signer_set) = if rekeyed {
         Output::info(
-            "Owner check skipped: a rekeyed multisig has no governance signers left to compare \
-             against, by definition.",
+            "This multisig has been rekeyed: there are no governance signers left to check \
+             against, so the owner check was skipped.",
         );
         (Vec::new(), false)
     } else {
