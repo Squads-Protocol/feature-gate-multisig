@@ -11,6 +11,11 @@ version and checksum.
 Requires a Rust toolchain ([rustup](https://rustup.rs)), and `libudev-dev` +
 `pkg-config` on Linux (for hardware-wallet support).
 
+To check hardware-wallet support in your build: any command against a
+`usb://ledger` fee payer with no device plugged in must fail with "no device
+found", not "hidapi crate compilation disabled" (Ledger signing cannot work in
+that build).
+
 Install a released version:
 
 ```bash
@@ -51,8 +56,20 @@ feature-gate-multisig-tool config
 | `show <address>` | Display multisig details, members, and proposal status |
 | `verify <address>` | Check program authenticity, feature state and owners on every configured network |
 | `propose` / `approve` / `reject` / `execute` | Act on a proposal non-interactively |
+| `check-signer` | Confirm a keypair (including `usb://ledger`) can act on a multisig; signs nothing |
 | `config` | Show saved configuration |
 | `interactive` | Launch interactive menu (default) |
+
+### Before an activation: check every signer
+
+```bash
+feature-gate-multisig-tool check-signer --keypair usb://ledger --multisig "$MULTISIG"
+```
+
+Resolves the key (device present and unlocked; signs nothing) and reports
+whether it is a voting member of the multisig. Non-zero exit means that signer
+cannot act: wrong device, derivation path, or multisig, or a build without
+hardware-wallet support. Run it days ahead, not at the first signature.
 
 ### Scripting
 
@@ -65,8 +82,20 @@ feature-gate-multisig-tool verify "$MULTISIG" && \
 ```
 
 It still reports every problem in one run rather than stopping at the first.
-A non-zero exit means the multisig has not been shown to be correct — not
+A non-zero exit means the multisig has not been shown to be correct - not
 necessarily that it is malicious; an unreachable network fails the same way.
+
+`verify` fails when the multisig is not autonomous, has been rekeyed
+(permanently frozen), or its voting members differ from the expected set:
+`KNOWN_SIGNERS` when vendored into the build, otherwise the `members` list in
+your config. With neither it says so, and fails on mainnet. Keep config
+`members` equal to the agreed signer set and `verify` catches a swapped, added,
+or removed owner.
+
+`propose`, `approve`, `reject`, and `execute` print the action, multisig,
+feature gate, and network before signing; `--yes` does not suppress this. They
+also refuse up front when the proposal's status or staleness means the action
+cannot succeed.
 
 `--yes` resolves each confirmation to its default answer. It does not force an
 action through: a proposal this tool cannot classify, and any config change
@@ -147,6 +176,11 @@ Stored in your OS config directory (for example `~/.config/feature-gate-multisig
 - Custom RPC endpoints supported
 
 ## Testing
+
+The e2e harness auto-answers prompts via `E2E_TEST_MODE`, which only exists
+behind the `e2e-harness` cargo feature and is **compiled out of release
+builds**. `make test-surfpool` enables it; such builds print a warning banner
+on every run.
 
 ```bash
 # Unit tests

@@ -365,6 +365,15 @@ fn print_deployment_summary(
         activation_proposal_pda.to_string().bright_green()
     );
     println!("     Type: Vault Transaction");
-    println!("     Requires: {}/{} approvals", threshold, threshold);
+    let voting_member_count = members
+        .iter()
+        .filter(|m| m.permissions.mask & crate::squads::PERMISSION_VOTE != 0)
+        .count();
+    // Denominator is the voting member count, not the threshold repeated:
+    // "3/3" reads as "every member must approve".
+    println!(
+        "     Requires: {}/{} approvals",
+        threshold, voting_member_count
+    );
     println!();
 }

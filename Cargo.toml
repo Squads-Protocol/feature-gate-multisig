@@ -33,6 +33,9 @@ tabled = "=0.21.0"
 solana-rpc-client = "=3.1.14"
 solana-rpc-client-api = "=3.1.14"
 solana-clap-v3-utils = "=3.1.14"
+# Depended on directly so hidapi stays compiled in and `usb://ledger` works;
+# mirrors solana-remote-wallet's own default features.
+solana-remote-wallet = { version = "=3.1.14", default-features = false, features = ["agave-unstable-api", "linux-static-hidraw"] }
 solana-instruction = {version = "=3.4.0", features = ["bincode"]}
 solana-pubkey = {version = "=4.2.0", features = ["borsh", "curve25519"]}
 solana-keypair = "=3.1.2"
@@ -46,6 +49,12 @@ solana-system-interface = {version = "=3.2.0", features = ["bincode"]}
 solana-commitment-config = "=3.1.1"
 solana-hash = "=4.5.0"
 solana-sha256-hasher = "=3.1.0"
+
+[features]
+# E2E escape hatch (`E2E_TEST_MODE`, auto-confirms every prompt). Compile-time
+# opt-in so release binaries carry no env-var confirmation bypass; enabled by
+# `make test-surfpool`.
+e2e-harness = []
 
 [dev-dependencies]
 once_cell = "=1.21.4"

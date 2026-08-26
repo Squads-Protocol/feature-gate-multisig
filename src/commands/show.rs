@@ -1,4 +1,6 @@
-use crate::commands::proposal::{describe_transaction, proposal_status_label, ProposalKind};
+use crate::commands::proposal::{
+    describe_transaction, proposal_status_label, proposal_status_timestamp, ProposalKind,
+};
 use crate::commands::verify::report_cross_network_consistency;
 use crate::constants::MAX_LISTED_PROPOSALS;
 use crate::output::Output;
@@ -13,9 +15,9 @@ use crate::squads::{
 };
 use crate::utils::*;
 use crate::verification::{
-    is_autonomous, is_rekeyed, known_signer_name, member_set_warnings, multisig_safety_warnings,
-    program_warnings, resolve_cluster, verify_feature_gate, verify_squads_program,
-    FeatureGateStatus,
+    expected_signers, is_autonomous, is_rekeyed, known_signer_name, member_set_warnings_for,
+    multisig_safety_warnings, program_warnings, resolve_cluster, verify_feature_gate,
+    verify_squads_program, FeatureGateStatus,
 };
 use colored::*;
 use eyre::Result;
@@ -178,7 +180,7 @@ fn show_multisig(
         "Autonomous (config by vote)",
         &is_autonomous(&multisig).to_string(),
     );
-    Output::field("Time lock", &format!("{}s", multisig.time_lock));
+    Output::field("Time lock", &format_time_lock(multisig.time_lock));
 
     // Rekey is per network: each cluster's multisig is independent state, so
     // one can be frozen while the others remain active.
@@ -236,8 +238,21 @@ fn show_multisig(
     for warning in multisig_safety_warnings(&multisig) {
         Output::warning(&warning);
     }
-    for warning in member_set_warnings(&multisig) {
-        Output::warning(&warning);
+    // The same member-set check `verify` runs, warnings only: `show` gates
+    // nothing, so there is no exit code or mainnet refusal here.
+    match expected_signers(&config.members) {
+        Some((expected, source)) => {
+            Output::field("Owners checked against", source);
+            for warning in member_set_warnings_for(&multisig, &expected) {
+                Output::warning(&warning);
+            }
+        }
+        None => Output::warning(
+            "No expected signer set to check against: KNOWN_SIGNERS is empty in this build \
+             and no members are saved in your config. Add the expected signers to `members` \
+             in your config file (`config` prints its path; config.example.json shows the \
+             shape). The member list below was displayed but not verified against anything.",
+        ),
     }
     println!();
 
@@ -304,7 +319,19 @@ fn display_proposals_summary(
         approvals: String,
         #[tabled(rename = "Rejections")]
         rejections: String,
+        #[tabled(rename = "Updated")]
+        updated: String,
     }
+
+    // Print vote counts as progress against their cutoffs: approvals vs the
+    // threshold, rejections vs the count that makes approval impossible.
+    let voting_members = multisig
+        .members
+        .iter()
+        .filter(|m| m.permissions.mask & PERMISSION_VOTE != 0)
+        .count() as u64;
+    let approve_cutoff = u64::from(multisig.threshold);
+    let reject_cutoff = voting_members.saturating_sub(approve_cutoff) + 1;
 
     let mut rows = Vec::new();
     for index in listed_indices(multisig.transaction_index) {
@@ -312,13 +339,20 @@ fn display_proposals_summary(
             .get(index as usize - 1)
             .map_or("Unknown", |k| k.label());
         let proposal = fetch_proposal(rpc_client, multisig_pubkey, index).ok();
-        let (status, approvals, rejections) = match proposal {
+        let (status, approvals, rejections, updated) = match proposal {
             Some(p) => (
                 proposal_status_label(&p.status).to_string(),
-                p.approved.len().to_string(),
-                p.rejected.len().to_string(),
+                format!("{}/{}", p.approved.len(), approve_cutoff),
+                format!("{}/{}", p.rejected.len(), reject_cutoff),
+                proposal_status_timestamp(&p.status)
+                    .map_or_else(|| "-".to_string(), format_relative_age),
             ),
-            None => ("missing".to_string(), "-".to_string(), "-".to_string()),
+            None => (
+                "missing".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+            ),
         };
         rows.push(ProposalRow {
             index,
@@ -326,6 +360,7 @@ fn display_proposals_summary(
             status,
             approvals,
             rejections,
+            updated,
         });
     }
     let mut table = Table::new(rows);
@@ -424,11 +459,23 @@ pub(crate) fn print_members_table(multisig: &Multisig) {
         bitmask: u8,
     }
 
-    println!(
-        "{} ({} total)",
-        "👥 MEMBERS".bright_blue().bold(),
-        multisig.members.len()
-    );
+    // Break out voting members: the threshold above is stated against them,
+    // not the plain total.
+    let total = multisig.members.len();
+    let voting = multisig
+        .members
+        .iter()
+        .filter(|m| m.permissions.mask & PERMISSION_VOTE != 0)
+        .count();
+    let breakdown = if voting == total {
+        format!("{total} total, all voting")
+    } else {
+        format!(
+            "{total} total: {voting} voting, {} non-voting",
+            total - voting
+        )
+    };
+    println!("{} ({breakdown})", "👥 MEMBERS".bright_blue().bold());
     println!();
 
     let member_data: Vec<MemberInfo> = multisig

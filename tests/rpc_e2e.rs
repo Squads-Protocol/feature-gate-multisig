@@ -1311,10 +1311,19 @@ fn rpc_e2e_9_verify_checks() {
     // Pasting the feature gate account instead of the multisig must fail with
     // a hint that names the actual multisig (reverse lookup via the activation
     // transaction's account keys).
-    let err = match fetch_squads_multisig(&client, &child_vault, "multisig") {
-        Ok(_) => panic!("vault address must not pass as a multisig"),
-        Err(e) => e.to_string(),
-    };
+    let mut err = String::new();
+    for _ in 0..30 {
+        err = match fetch_squads_multisig(&client, &child_vault, "multisig") {
+            Ok(_) => panic!("vault address must not pass as a multisig"),
+            Err(e) => e.to_string(),
+        };
+        // The reverse lookup only sees rooted transactions; poll rather than
+        // race the validator's rooting cadence.
+        if err.contains(&child_multisig.to_string()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
     assert!(
         err.contains("feature gate account"),
         "error should explain the mix-up: {err}"
@@ -2492,9 +2501,52 @@ fn rpc_e2e_20_verify_fails_on_a_non_autonomous_multisig() {
 
     // An autonomous multisig on the same cluster still verifies cleanly, so the
     // failure is the authority and not something incidental.
-    let (_config, autonomous, _vault, _pubkeys, _paths) =
+    let (autonomous_config, autonomous, _vault, _pubkeys, _paths) =
         setup_eoa_multisig(&client, "eoa_test20", 2);
-    verify_command(&config, Some(autonomous.to_string()))
+    verify_command(&autonomous_config, Some(autonomous.to_string()))
         .expect("an autonomous multisig must still verify cleanly");
     println!("✅ Non-autonomous multisig fails verification; autonomous one passes");
+}
+
+/// Test 21: `verify` must fail when the on-chain voting members differ from
+/// the expected set (the configured member list when nothing is vendored),
+/// and when there is no expected set at all.
+#[test]
+#[ignore = "requires a running surfpool validator; run via make test-surfpool"]
+fn rpc_e2e_21_verify_fails_when_members_differ_from_expectation() {
+    init_test_env();
+    let client = RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::confirmed());
+    let (config, multisig, _vault, _pubkeys, _paths) = setup_eoa_multisig(&client, "eoa_test21", 2);
+
+    verify_command(&config, Some(multisig.to_string()))
+        .expect("verify should pass when the configured members match the chain");
+    println!("✅ Matching member set verifies cleanly");
+
+    // Swap one expected signer for a stranger: verify must fail.
+    let mut tampered = config.clone();
+    tampered.members[0] = Pubkey::new_unique().to_string();
+    let error = verify_command(&tampered, Some(multisig.to_string()))
+        .expect_err("verify must fail when the on-chain owners are not the expected ones");
+    assert!(
+        error
+            .to_string()
+            .contains("has not been shown to be correct"),
+        "error should be the verification failure, got: {error}"
+    );
+    println!("✅ Refused a member set that differs from the expectation: {error}");
+
+    // No expectation at all is not a pass either: nothing was checked.
+    let no_expectation = Config {
+        members: Vec::new(),
+        ..config.clone()
+    };
+    let unchecked = verify_command(&no_expectation, Some(multisig.to_string()))
+        .expect_err("verify must refuse when there is no expected signer set on mainnet");
+    assert!(
+        unchecked
+            .to_string()
+            .contains("has not been shown to be correct"),
+        "error should be the verification failure, got: {unchecked}"
+    );
+    println!("✅ Refused when there was no expected signer set to check against");
 }
