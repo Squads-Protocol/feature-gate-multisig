@@ -235,13 +235,17 @@ impl From<KindArg> for TransactionKind {
 fn main() {
     let cli = Cli::parse();
 
-    // A build that can auto-confirm must say so on every run, so a harness
-    // build cannot be mistaken for a release one.
+    // A build that can auto-confirm must say so on every run, whether or not
+    // the env var is set, so a harness build cannot be mistaken for a release one.
+    #[cfg(feature = "e2e-harness")]
+    Output::warning(
+        "This is an e2e-harness build: it can auto-confirm prompts. Never use it to sign \
+         for a real cluster.",
+    );
     if feature_gate_multisig_tool::utils::is_e2e_test_mode() {
         Output::warning(
-            "E2E_TEST_MODE is set on an e2e-harness build: every confirmation, including \
-             irreversible config changes, is auto-approved. Never use this build to sign for \
-             a real cluster.",
+            "E2E_TEST_MODE is set: every confirmation, including irreversible config \
+             changes, is auto-approved.",
         );
     }
 
