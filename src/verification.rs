@@ -348,14 +348,6 @@ pub fn known_signer_name(key: &Pubkey) -> Option<&'static str> {
         .map(|(name, _)| *name)
 }
 
-/// Warnings when the multisig's voting members differ from the vendored
-/// expected signer set. Empty when [`KNOWN_SIGNERS`] is empty. Initiate-only
-/// members (the ephemeral contributor key) are ignored: only keys that can
-/// vote matter for governance.
-pub fn member_set_warnings(ms: &Multisig) -> Vec<String> {
-    member_set_warnings_against(ms, KNOWN_SIGNERS)
-}
-
 /// An expected governance signer: a display name plus its key. The key is
 /// `None` when a configured entry is not a valid public key, so it can never
 /// match a member (in particular not the `Pubkey::default()` member a rekey
@@ -429,60 +421,6 @@ pub fn member_set_warnings_for(ms: &Multisig, expected: &[ExpectedSigner]) -> Ve
             continue;
         }
         if expected.iter().any(|(_, k)| *k == Some(member.key)) {
-            continue;
-        }
-        let abilities = match (
-            member.permissions.mask & PERMISSION_VOTE != 0,
-            member.permissions.mask & PERMISSION_EXECUTE != 0,
-        ) {
-            (true, true) => "vote and execute",
-            (true, false) => "vote",
-            (false, _) => "execute proposals",
-        };
-        warnings.push(format!(
-            "Member {} can {abilities} but is not one of the expected governance signers.",
-            member.key
-        ));
-    }
-    warnings
-}
-
-fn member_set_warnings_against<N: AsRef<str>>(ms: &Multisig, known: &[(N, Pubkey)]) -> Vec<String> {
-    use crate::squads::{PERMISSION_EXECUTE, PERMISSION_VOTE};
-
-    if known.is_empty() {
-        return Vec::new();
-    }
-
-    let mut warnings = Vec::new();
-    for (name, key) in known {
-        let is_voting_member = ms
-            .members
-            .iter()
-            .any(|m| m.key == *key && m.permissions.mask & PERMISSION_VOTE != 0);
-        if !is_voting_member {
-            let name = name.as_ref();
-            // Configured sets use the key as the name; don't print it twice.
-            if name == key.to_string() {
-                warnings.push(format!(
-                    "Expected signer {key} is not a voting member of this multisig."
-                ));
-            } else {
-                warnings.push(format!(
-                    "Expected signer {name} ({key}) is not a voting member of this multisig."
-                ));
-            }
-        }
-    }
-
-    // Any extra member that can vote or execute is a party with power over
-    // governance; only pure Initiate-only members (the expected contributor
-    // pattern) are exempt.
-    for member in &ms.members {
-        if member.permissions.mask & (PERMISSION_VOTE | PERMISSION_EXECUTE) == 0 {
-            continue;
-        }
-        if known.iter().any(|(_, k)| k == &member.key) {
             continue;
         }
         let abilities = match (
@@ -765,7 +703,10 @@ mod tests {
         let org_b = Pubkey::new_unique();
         let stranger = Pubkey::new_unique();
         let contributor = Pubkey::new_unique();
-        let known = [("Org A", org_a), ("Org B", org_b)];
+        let known = [
+            ("Org A".to_string(), Some(org_a)),
+            ("Org B".to_string(), Some(org_b)),
+        ];
 
         let mut ms = multisig_with(Pubkey::default(), 0, 2);
         ms.members = vec![
@@ -783,11 +724,11 @@ mod tests {
                 permissions: Permissions { mask: 1 },
             },
         ];
-        assert!(member_set_warnings_against(&ms, &known).is_empty());
+        assert!(member_set_warnings_for(&ms, &known).is_empty());
 
         // A missing expected signer and an unexpected voter both warn.
         ms.members[1].key = stranger;
-        let warnings = member_set_warnings_against(&ms, &known);
+        let warnings = member_set_warnings_for(&ms, &known);
         assert!(warnings
             .iter()
             .any(|w| w.contains("Org B") && w.contains("not a voting member")));
@@ -805,12 +746,12 @@ mod tests {
             key: stranger,
             permissions: Permissions { mask: 4 },
         });
-        let warnings = member_set_warnings_against(&ms, &known);
+        let warnings = member_set_warnings_for(&ms, &known);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("execute proposals"));
 
         // Empty registry (the current vendored state): check is skipped.
-        assert!(member_set_warnings_against(&ms, &[] as &[(&str, Pubkey)]).is_empty());
+        assert!(member_set_warnings_for(&ms, &[]).is_empty());
     }
 
     #[test]

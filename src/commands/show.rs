@@ -15,9 +15,9 @@ use crate::squads::{
 };
 use crate::utils::*;
 use crate::verification::{
-    is_autonomous, is_rekeyed, known_signer_name, member_set_warnings, multisig_safety_warnings,
-    program_warnings, resolve_cluster, verify_feature_gate, verify_squads_program,
-    FeatureGateStatus,
+    expected_signers, is_autonomous, is_rekeyed, known_signer_name, member_set_warnings_for,
+    multisig_safety_warnings, program_warnings, resolve_cluster, verify_feature_gate,
+    verify_squads_program, FeatureGateStatus,
 };
 use colored::*;
 use eyre::Result;
@@ -238,8 +238,20 @@ fn show_multisig(
     for warning in multisig_safety_warnings(&multisig) {
         Output::warning(&warning);
     }
-    for warning in member_set_warnings(&multisig) {
-        Output::warning(&warning);
+    // The same member-set check `verify` runs, warnings only: `show` gates
+    // nothing, so there is no exit code or mainnet refusal here.
+    match expected_signers(&config.members) {
+        Some((expected, source)) => {
+            Output::field("Owners checked against", source);
+            for warning in member_set_warnings_for(&multisig, &expected) {
+                Output::warning(&warning);
+            }
+        }
+        None => Output::warning(
+            "No expected signer set to check against: KNOWN_SIGNERS is empty in this build \
+             and no members are saved in your config. The member list below was displayed \
+             but not verified against anything.",
+        ),
     }
     println!();
 
