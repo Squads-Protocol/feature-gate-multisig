@@ -92,9 +92,11 @@ Choosing **Create (Activate / Revoke / Rekey)** asks which transaction type:
 | Revoke Feature Gate | close a **pending** activation and burn its lamports to the incinerator |
 | Rekey Multisig | **irreversible**: replaces every member with an unsignable dummy and sets threshold 1, so no proposal can ever pass again |
 
-Approve, Reject and Execute act on proposals that already exist, and take the
-kind from the on-chain transaction rather than from `--kind`, so an existing
-proposal cannot be mislabelled.
+Approve, Reject and Execute act on proposals that already exist. The
+interactive picker reads each proposal's kind from its on-chain transaction;
+the CLI subcommands still require `--kind`, and refuse to act when it does not
+match the on-chain transaction, so an existing proposal cannot be mislabelled
+either way.
 
 ## Proposal Structure
 
@@ -112,7 +114,7 @@ never act again and a "2 member" multisig reports 3 members.
 
 Revocation only works while the feature is **Pending**. Once the runtime stamps
 `activated_at` at an epoch boundary it is permanent, and the program rejects the
-instruction with `InvalidAccountOwner`.
+instruction with `FeatureGateError::FeatureAlreadyActivated`.
 
 Revocation proposals are **not** pre-created. If you need to revoke a feature, create a new revocation proposal using "Proposal Actions" → "Revoke Feature Gate" → "Create". See [Emergency Revocation workflow](docs/WORKFLOWS.md#4-emergency-revocation) for details.
 

@@ -5,7 +5,7 @@ Step-by-step examples for common operations.
 ## Table of Contents
 - [0. Configuration Setup](#0-configuration-setup)
 - [1. Creating a Feature Gate Multisig](#1-creating-a-feature-gate-multisig)
-- [2. Activating a Feature (EOA Voting)](#2-activating-a-feature-eoa-voting)
+- [2. Activating a Feature (Non multisig Voting)](#2-activating-a-feature-non-multisig-voting)
 - [3. Activating a Feature (Parent Multisig Voting)](#3-activating-a-feature-parent-multisig-voting)
 - [4. Emergency Revocation](#4-emergency-revocation)
 - [5. Rejecting a Proposal](#5-rejecting-a-proposal)
@@ -36,7 +36,9 @@ where the fee payer must instead be a member of that parent.
 $TOOL create --threshold 2 --keypair $KP
 ```
 Reads members from config. Prints the multisig address and the feature gate id
-(its vault-0 PDA), and pre-creates activation proposal **index 1**.
+(its vault-0 PDA), and pre-creates activation proposal **index 1**. This is the
+same flow the interactive menu runs; interactive mode is the preferred way to
+create (see [section 1](#1-creating-a-feature-gate-multisig)).
 
 ### Inspect
 
@@ -145,11 +147,16 @@ feature-gate-multisig-tool config
 
 ## 1. Creating a Feature Gate Multisig
 
-Use interactive mode:
+Use interactive mode (preferred):
 ```bash
 feature-gate-multisig-tool
 # Select: "Create new feature gate multisig"
 ```
+
+The CLI `create` in the [quick reference](#cli-quick-reference) runs the same
+flow non-interactively: members and networks come from the saved config,
+`--threshold` overrides the saved value, and `--keypair` skips the fee payer
+prompt.
 
 ### What happens:
 1. Prompts for members (public keys with Vote/Execute permissions)
@@ -175,12 +182,15 @@ For direct voting with an externally owned account (Non multisig).
 feature-gate-multisig-tool
 # Select: "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)"
 # Enter: Feature gate multisig address
-# Enter: Fee payer keypair path
-# Enter: Voting key (your pubkey)
-# Select: "Activate Feature Gate"
+# Select: Network (asked only when several are configured)
 # Select: "Approve"
-# Enter: Proposal index (1)
+# Select: the activation proposal from the list (kind and index are read on-chain)
+# Confirm: the action summary
+# Enter: Voting key (your pubkey)
 ```
+
+The fee payer resolves from the saved config; you are only prompted for a path
+when none is saved.
 
 Repeat for each member until threshold is met.
 
@@ -189,11 +199,11 @@ Repeat for each member until threshold is met.
 feature-gate-multisig-tool
 # Select: "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)"
 # Enter: Feature gate multisig address
-# Enter: Fee payer keypair path
-# Enter: Voting key (your pubkey)
-# Select: "Activate Feature Gate"
+# Select: Network
 # Select: "Execute"
-# Enter: Proposal index (1)
+# Select: the approved activation proposal from the list
+# Confirm: the action summary
+# Enter: Voting key (your pubkey)
 ```
 
 **Note**: Executing the activation does not change the multisig threshold.
@@ -218,12 +228,15 @@ Parent vault PDA = get_vault_pda(parent_multisig_address, 0)
 feature-gate-multisig-tool
 # Select: "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)"
 # Enter: Child feature gate multisig address
-# Enter: Fee payer keypair path (must be parent multisig member)
-# Enter: Voting key (parent multisig address)
-# Select: "Activate Feature Gate"
+# Select: Network
 # Select: "Approve"
-# Enter: Proposal index (1)
+# Select: the activation proposal from the list
+# Confirm: the action summary
+# Enter: Voting key (parent multisig address)
 ```
+
+The fee payer resolves from the saved config and must be a parent multisig
+member.
 
 This creates a proposal on the parent multisig. When executed, it approves the child proposal.
 
@@ -239,11 +252,11 @@ Executes the parent proposal, which triggers the child approval. Some parent mul
 ```bash
 # Select: "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)"
 # Enter: Child feature gate multisig address
-# Enter: Fee payer keypair path (must be parent multisig member)
-# Enter: Voting key (parent multisig address)
-# Select: "Activate Feature Gate"
+# Select: Network
 # Select: "Execute"
-# Enter: Proposal index (1)
+# Select: the approved activation proposal from the list
+# Confirm: the action summary
+# Enter: Voting key (parent multisig address)
 ```
 
 **Note**: Executing the activation does not change the multisig threshold.
@@ -259,10 +272,10 @@ To revoke a pending feature activation:
 feature-gate-multisig-tool
 # Select: "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)"
 # Enter: Feature gate multisig address
-# Enter: Fee payer keypair path
-# Enter: Voting key (your pubkey)
+# Select: Network
 # Select: "Create (Activate / Revoke / Rekey)"
 # Select: "Revoke Feature Gate"
+# Enter: Voting key (your pubkey)
 ```
 
 ### Step 2: Approve the revocation proposal
@@ -270,11 +283,11 @@ feature-gate-multisig-tool
 feature-gate-multisig-tool
 # Select: "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)"
 # Enter: Feature gate multisig address
-# Enter: Fee payer keypair path
-# Enter: Voting key (your pubkey)
-# Select: "Revoke Feature Gate"
+# Select: Network
 # Select: "Approve"
-# Enter: Proposal index
+# Select: the revocation proposal from the list
+# Confirm: the action summary
+# Enter: Voting key (your pubkey)
 ```
 
 ### Step 3: Execute the revocation
@@ -282,11 +295,11 @@ feature-gate-multisig-tool
 feature-gate-multisig-tool
 # Select: "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)"
 # Enter: Feature gate multisig address
-# Enter: Fee payer keypair path
-# Enter: Voting key (your pubkey)
-# Select: "Revoke Feature Gate"
+# Select: Network
 # Select: "Execute"
-# Enter: Proposal index
+# Select: the approved revocation proposal from the list
+# Confirm: the action summary
+# Enter: Voting key (your pubkey)
 ```
 
 Revocation uses the current multisig threshold. Activation does not downgrade the threshold.
@@ -301,9 +314,11 @@ To reject a proposal (prevents execution):
 feature-gate-multisig-tool
 # Select: "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)"
 # Enter: Multisig address
-# Select: Transaction type (Activate/Revoke/Rekey)
+# Select: Network
 # Select: "Reject"
-# Enter: Proposal index
+# Select: the proposal from the list (kind and index are read on-chain)
+# Confirm: the action summary
+# Enter: Voting key
 ```
 
 A proposal is rejected when rejections >= (members - threshold + 1).
@@ -322,8 +337,11 @@ A proposal is rejected when rejections >= (members - threshold + 1).
 ```bash
 feature-gate-multisig-tool
 # Select: "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)"
+# Enter: Feature gate multisig address
+# Select: Network
 # Select: "Create (Activate / Revoke / Rekey)"
 # Select: "Rekey Multisig (this will brick the multisig)"
+# Enter: Voting key
 ```
 
 Then approve and execute with required threshold.
