@@ -87,7 +87,12 @@ pub fn proposal_command(
     // matches the kind the caller specified, so an approve/reject/execute can
     // never be applied to a different (or disguised) transaction than intended.
     if let Some(idx) = args.index {
-        reconcile_requested_kind(&create_rpc_client(&rpc_url), &multisig, idx, args.kind)?;
+        let rpc = create_rpc_client(&rpc_url);
+        // One read, reused by all three checks below.
+        let on_chain = describe_transaction(&rpc, &multisig, idx);
+        reconcile_requested_kind(on_chain, idx, args.kind)?;
+        ensure_actionable(&rpc, &multisig, idx, command, on_chain)?;
+        disclose_pending_action(&multisig, idx, command, on_chain, &rpc_url);
     }
 
     let index = || {
@@ -161,12 +166,10 @@ pub(crate) fn unverifiable_proposal_error(index: u64) -> eyre::Report {
 ///   it takes an explicit decision. `--yes` resolves this confirmation to its
 ///   `false` default and therefore aborts rather than force-approving.
 fn reconcile_requested_kind(
-    rpc_client: &RpcClient,
-    multisig: &Pubkey,
+    on_chain: ProposalKind,
     index: u64,
     requested: TransactionKind,
 ) -> Result<()> {
-    let on_chain = describe_transaction(rpc_client, multisig, index);
     if let Some(actual) = on_chain.transaction_kind() {
         return if actual == requested {
             Ok(())
@@ -202,6 +205,80 @@ fn reconcile_requested_kind(
         ));
     }
     Ok(())
+}
+
+/// Refuse an action the proposal's on-chain status can no longer accept.
+/// Squads enforces this too, but only after the transaction is signed and
+/// sent, as a raw `InvalidProposalStatus` (0x1778) error.
+fn ensure_actionable(
+    rpc_client: &RpcClient,
+    multisig: &Pubkey,
+    index: u64,
+    command: ProposalCommand,
+    kind: ProposalKind,
+) -> Result<()> {
+    let proposal = crate::provision::fetch_proposal(rpc_client, multisig, index)?;
+    let stale_index =
+        fetch_squads_multisig(rpc_client, multisig, "multisig")?.stale_transaction_index;
+
+    if crate::commands::interactive::is_actionable(
+        command,
+        &proposal.status,
+        kind,
+        index,
+        stale_index,
+    ) {
+        return Ok(());
+    }
+
+    let action = match command {
+        ProposalCommand::Approve => "approved",
+        ProposalCommand::Reject => "rejected",
+        ProposalCommand::Execute => "executed",
+        ProposalCommand::Propose => return Ok(()),
+    };
+    let status = proposal_status_label(&proposal.status);
+    let stale_note = if index <= stale_index {
+        format!(
+            " It is also stale: a later config change moved the multisig's stale index to {stale_index}."
+        )
+    } else {
+        String::new()
+    };
+    Err(eyre::eyre!(
+        "Proposal #{index} is {status} and cannot be {action}.{stale_note} Run `show {multisig}` \
+         to see which proposals are still open."
+    ))
+}
+
+/// Print what is about to be signed, before signing. A statement rather than
+/// a prompt, so `--yes` cannot silence it.
+fn disclose_pending_action(
+    multisig: &Pubkey,
+    index: u64,
+    command: ProposalCommand,
+    kind: ProposalKind,
+    rpc_url: &str,
+) {
+    let verb = match command {
+        ProposalCommand::Approve => "APPROVE",
+        ProposalCommand::Reject => "REJECT",
+        ProposalCommand::Execute => "EXECUTE",
+        ProposalCommand::Propose => return,
+    };
+    let feature_gate = get_vault_pda(multisig, 0).0;
+    Output::header(&format!("About to {verb} proposal #{index}"));
+    Output::field("On-chain action", kind.label());
+    Output::field("Multisig", &multisig.to_string());
+    Output::field("Feature gate (vault 0)", &feature_gate.to_string());
+    Output::field(
+        "Network",
+        &format!(
+            "{} ({})",
+            crate::utils::get_network_display(rpc_url),
+            rpc_url
+        ),
+    );
 }
 
 /// Resolve the voting key: explicit flag, then the config default, then a prompt.
@@ -470,6 +547,20 @@ pub(crate) fn proposal_status_label(status: &ProposalStatus) -> &'static str {
         ProposalStatus::Executing => "Executing",
         ProposalStatus::Executed { .. } => "Executed",
         ProposalStatus::Cancelled { .. } => "Cancelled",
+    }
+}
+
+/// The unix timestamp at which the proposal entered its current status.
+/// `Executing` is a transient legacy state that records none.
+pub(crate) fn proposal_status_timestamp(status: &ProposalStatus) -> Option<i64> {
+    match status {
+        ProposalStatus::Draft { timestamp }
+        | ProposalStatus::Active { timestamp }
+        | ProposalStatus::Rejected { timestamp }
+        | ProposalStatus::Approved { timestamp }
+        | ProposalStatus::Executed { timestamp }
+        | ProposalStatus::Cancelled { timestamp } => Some(*timestamp),
+        ProposalStatus::Executing => None,
     }
 }
 

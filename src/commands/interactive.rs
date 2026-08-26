@@ -2,8 +2,8 @@ use crate::commands::proposal::{
     describe_transaction, proposal_status_label, unverifiable_proposal_error, ProposalKind,
 };
 use crate::commands::{
-    config_command, create_command, proposal_command, show_command, verify_command,
-    ProposalCommand, ProposalCommandArgs, TransactionKind,
+    check_signer_command, config_command, create_command, proposal_command, show_command,
+    verify_command, ProposalCommand, ProposalCommandArgs, TransactionKind,
 };
 use crate::output::Output;
 use crate::provision::{create_rpc_client, fetch_proposal, fetch_squads_multisig};
@@ -13,6 +13,7 @@ use eyre::Result;
 use inquire::{Confirm, Select, Text};
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
+use std::str::FromStr;
 
 pub fn interactive_mode() -> Result<()> {
     let mut config = load_config()?;
@@ -25,8 +26,9 @@ pub fn interactive_mode() -> Result<()> {
             "Create new feature gate multisig",
             "Show feature gate multisig details",
             "Verify feature gate multisig",
+            "Check signer (signs nothing)",
             "Show configuration",
-            "Proposal Actions (Approve/Reject/Execute)",
+            "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)",
             "Exit",
         ];
 
@@ -40,7 +42,7 @@ pub fn interactive_mode() -> Result<()> {
         let result = match choice {
             "Create new feature gate multisig" => prompt_for_fee_payer_path(&config)
                 .and_then(|path| create_command(&mut config, None, Some(path))),
-            "Proposal Actions (Approve/Reject/Execute)" => {
+            "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)" => {
                 handle_proposal_action(&config, &mut last_multisig)
             }
             "Show feature gate multisig details" => {
@@ -53,6 +55,7 @@ pub fn interactive_mode() -> Result<()> {
                 .prompt()
                 .map_err(eyre::Report::from)
                 .and_then(|address| verify_command(&config, Some(address))),
+            "Check signer (signs nothing)" => handle_check_signer(&config, &last_multisig),
             "Show configuration" => config_command(&config),
             "Exit" => break,
             _ => unreachable!(),
@@ -69,6 +72,34 @@ pub fn interactive_mode() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Interactive `check-signer`: prompt for a keypair path and an optional
+/// multisig, then run the same checks as the CLI subcommand.
+fn handle_check_signer(config: &Config, last_multisig: &Option<String>) -> Result<()> {
+    let default_path = config.fee_payer_path.as_deref().unwrap_or("usb://ledger");
+    let path = Text::new("Enter the signer keypair path to check:")
+        .with_default(default_path)
+        .prompt()?;
+    let path = expand_tilde_path(&path)?;
+
+    let multisig = loop {
+        let mut text = Text::new("Multisig to check membership against (leave empty to skip):");
+        if let Some(last) = last_multisig.as_deref() {
+            text = text.with_default(last);
+        }
+        let input = text.prompt()?;
+        let input = input.trim();
+        if input.is_empty() {
+            break None;
+        }
+        match Pubkey::from_str(input) {
+            Ok(key) => break Some(key.to_string()),
+            Err(_) => Output::warning("Invalid public key, please try again."),
+        }
+    };
+
+    check_signer_command(config, Some(path), multisig, None)
 }
 
 /// True when the error is the user pressing Esc in an inquire prompt.
@@ -99,7 +130,10 @@ fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -
         ..config.clone()
     };
 
-    let action_options = vec!["Create", "Approve", "Reject", "Execute", "Cancel"];
+    // Name the kinds inline: Revoke and Rekey are only reachable through Create,
+    // and a bare "Create" gave no hint that they exist.
+    const CREATE: &str = "Create (Activate / Revoke / Rekey)";
+    let action_options = vec![CREATE, "Approve", "Reject", "Execute", "Cancel"];
     let action_choice: &str = Select::new("Select action:", action_options).prompt()?;
     if action_choice == "Cancel" {
         return Ok(());
@@ -107,7 +141,7 @@ fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -
 
     // Create picks a kind (nothing exists to infer from); the other actions pick
     // a live proposal, and its kind comes from the on-chain transaction shape.
-    let (command, kind, index) = if action_choice == "Create" {
+    let (command, kind, index) = if action_choice == CREATE {
         let Some(kind) = prompt_for_transaction_kind()? else {
             return Ok(());
         };
@@ -201,7 +235,7 @@ fn prompt_for_transaction_kind() -> Result<Option<TransactionKind>> {
 /// staleness. Voting (approve/reject) requires an Active proposal that is not
 /// stale. Execution requires an Approved proposal; a stale but approved vault
 /// transaction can still execute, while a stale config transaction cannot.
-fn is_actionable(
+pub(crate) fn is_actionable(
     action: ProposalCommand,
     status: &ProposalStatus,
     kind: ProposalKind,

@@ -27,12 +27,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libudev-dev
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+      # Toolchain and components come from rust-toolchain.toml, so they are
+      # declared in one place. rustflags is cleared because the action otherwise
+      # sets `-D warnings` globally; clippy applies it explicitly below.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
         with:
-          toolchain: stable
-          components: clippy, rustfmt
+          rustflags: ""
+          # It bundles rust-cache 2.9.1; we pin a newer one ourselves below.
+          cache: false
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       - name: Format
         run: cargo fmt --all --check
@@ -81,11 +85,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libudev-dev
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
         with:
-          toolchain: stable
+          rustflags: ""
+          cache: false
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       - name: Install surfpool
         run: |

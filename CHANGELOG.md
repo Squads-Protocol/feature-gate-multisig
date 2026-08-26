@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- `E2E_TEST_MODE`, which auto-confirms every prompt including irreversible
+  config changes, is now behind the `e2e-harness` cargo feature and compiled
+  out of release builds. Builds that carry it warn on every run.
+- The member-set check is no longer inert: when no `KNOWN_SIGNERS` set is
+  vendored into the build (the common case, where `verify` displayed the owners
+  unchecked and exited 0), the configured `members` list is used instead, and
+  `verify` names which expectation it checked. With no expectation at all it
+  refuses on mainnet.
+- `verify` exits non-zero for a rekeyed multisig or an unexpected member set,
+  so `verify && approve` cannot proceed past either. Both previously only
+  warned.
+- Environment flags are enabled by value rather than by presence, so
+  `FEATURE_GATE_MULTISIG_ASSUME_YES=false` no longer enables `--yes` behaviour.
+
+### Added
+
+- `check-signer`: resolve a keypair path (including `usb://ledger`) to its
+  public key and report whether it can act on a given multisig. Signs nothing,
+  so signers can confirm their setup before an activation depends on it.
+- `propose`, `approve`, `reject`, and `execute` print the on-chain action,
+  multisig, feature gate, and network before signing; `--yes` does not
+  suppress it.
+- `show`: the proposal table shows vote progress against cutoffs and how long
+  ago each proposal changed state; the member count breaks out voting vs
+  non-voting; time locks render with units.
+
+### Fixed
+
+- Hardware wallets work at all: `solana-remote-wallet` is now a direct
+  dependency with `hidapi` compiled in. Previously every `usb://ledger` use
+  failed with "hidapi crate compilation disabled in solana-remote-wallet".
+- The non-interactive subcommands refuse an action the proposal's status or
+  staleness cannot accept (matching the interactive picker), instead of sending
+  a transaction the Squads program rejects with a raw `InvalidProposalStatus`.
+- The deployment summary reported `Requires: <threshold>/<threshold> approvals`;
+  the denominator is now the number of voting members.
+
 ## [0.4.0] - 2026-08-12
 
 ### Changed
