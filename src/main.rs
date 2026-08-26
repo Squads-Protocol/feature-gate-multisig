@@ -170,6 +170,11 @@ The contributor key receives Initiate-only permissions, while additional members
             help = "Also check this key is a member of this multisig, and what it may do"
         )]
         multisig: Option<String>,
+        #[arg(
+            long,
+            help = "Network to inspect: a configured network name (devnet/testnet/mainnet) or an RPC URL. Prompts when omitted and several networks are configured"
+        )]
+        network: Option<String>,
     },
     #[command(about = "Show current configuration including networks and saved members")]
     #[command(
@@ -235,13 +240,17 @@ impl From<KindArg> for TransactionKind {
 fn main() {
     let cli = Cli::parse();
 
-    // A build that can auto-confirm must say so on every run, so a harness
-    // build cannot be mistaken for a release one.
+    // A build that can auto-confirm must say so on every run, whether or not
+    // the env var is set, so a harness build cannot be mistaken for a release one.
+    #[cfg(feature = "e2e-harness")]
+    Output::warning(
+        "This is an e2e-harness build: it can auto-confirm prompts. Never use it to sign \
+         for a real cluster.",
+    );
     if feature_gate_multisig_tool::utils::is_e2e_test_mode() {
         Output::warning(
-            "E2E_TEST_MODE is set on an e2e-harness build: every confirmation, including \
-             irreversible config changes, is auto-approved. Never use this build to sign for \
-             a real cluster.",
+            "E2E_TEST_MODE is set: every confirmation, including irreversible config \
+             changes, is auto-approved.",
         );
     }
 
@@ -309,9 +318,11 @@ fn handle_command(command: Commands) -> Result<()> {
             run_proposal(&config, ProposalCommand::Execute, args, Some(index))
         }
         Commands::Interactive => interactive_mode(),
-        Commands::CheckSigner { keypair, multisig } => {
-            check_signer_command(&config, keypair, multisig)
-        }
+        Commands::CheckSigner {
+            keypair,
+            multisig,
+            network,
+        } => check_signer_command(&config, keypair, multisig, network),
         Commands::Config => config_command(&config),
     }
 }

@@ -348,73 +348,69 @@ pub fn known_signer_name(key: &Pubkey) -> Option<&'static str> {
         .map(|(name, _)| *name)
 }
 
-/// Warnings when the multisig's voting members differ from the vendored
-/// expected signer set. Empty when [`KNOWN_SIGNERS`] is empty. Initiate-only
-/// members (the ephemeral contributor key) are ignored: only keys that can
-/// vote matter for governance.
-pub fn member_set_warnings(ms: &Multisig) -> Vec<String> {
-    member_set_warnings_against(ms, KNOWN_SIGNERS)
-}
+/// An expected governance signer: a display name plus its key. The key is
+/// `None` when a configured entry is not a valid public key, so it can never
+/// match a member (in particular not the `Pubkey::default()` member a rekey
+/// leaves behind).
+pub type ExpectedSigner = (String, Option<Pubkey>);
 
 /// The signer set to hold a multisig to, and a phrase naming its source:
 /// [`KNOWN_SIGNERS`] when vendored into this build, otherwise the operator's
 /// configured member list. `None` when there is nothing to compare against.
-pub fn expected_signers(
-    config_members: &[String],
-) -> Option<(Vec<(String, Pubkey)>, &'static str)> {
+/// An unparseable configured entry keeps its raw text with no key, so it is
+/// reported as broken rather than quietly shrinking the check.
+pub fn expected_signers(config_members: &[String]) -> Option<(Vec<ExpectedSigner>, &'static str)> {
     if !KNOWN_SIGNERS.is_empty() {
         let vendored = KNOWN_SIGNERS
             .iter()
-            .map(|(name, key)| ((*name).to_string(), *key))
+            .map(|(name, key)| ((*name).to_string(), Some(*key)))
             .collect();
         return Some((vendored, "the signer set vendored into this build"));
     }
     if config_members.is_empty() {
         return None;
     }
-    // Keep unparseable entries in the set under their raw text so they are
-    // reported as missing rather than quietly shrinking the check.
     let configured = config_members
         .iter()
-        .map(|entry| {
-            let key = Pubkey::from_str(entry).unwrap_or_default();
-            (entry.clone(), key)
-        })
+        .map(|entry| (entry.clone(), Pubkey::from_str(entry).ok()))
         .collect();
     Some((configured, "your configured member list"))
 }
 
 /// Warnings when the multisig's voting members differ from `expected`.
-pub fn member_set_warnings_for(ms: &Multisig, expected: &[(String, Pubkey)]) -> Vec<String> {
-    member_set_warnings_against(ms, expected)
-}
-
-fn member_set_warnings_against<N: AsRef<str>>(ms: &Multisig, known: &[(N, Pubkey)]) -> Vec<String> {
+/// Initiate-only members (the ephemeral contributor key) are ignored: only
+/// keys that can vote or execute matter for governance.
+pub fn member_set_warnings_for(ms: &Multisig, expected: &[ExpectedSigner]) -> Vec<String> {
     use crate::squads::{PERMISSION_EXECUTE, PERMISSION_VOTE};
 
-    if known.is_empty() {
+    if expected.is_empty() {
         return Vec::new();
     }
 
     let mut warnings = Vec::new();
-    for (name, key) in known {
-        let is_voting_member = ms
-            .members
-            .iter()
-            .any(|m| m.key == *key && m.permissions.mask & PERMISSION_VOTE != 0);
-        if !is_voting_member {
-            let name = name.as_ref();
-            // Configured sets use the key as the name; don't print it twice.
-            if name == key.to_string() {
-                warnings.push(format!(
-                    "Expected signer {key} is not a voting member of this multisig."
-                ));
-            } else {
-                warnings.push(format!(
-                    "Expected signer {name} ({key}) is not a voting member of this multisig."
-                ));
-            }
+    for (name, key) in expected {
+        let is_voting_member = key.is_some_and(|key| {
+            ms.members
+                .iter()
+                .any(|m| m.key == key && m.permissions.mask & PERMISSION_VOTE != 0)
+        });
+        if is_voting_member {
+            continue;
         }
+        warnings.push(match key {
+            // A broken entry can never match any member; say so instead of
+            // implying the signer is merely absent.
+            None => format!(
+                "Expected signer {name} is not a valid public key; fix this entry in your config."
+            ),
+            // Configured sets use the key as the name; don't print it twice.
+            Some(key) if *name == key.to_string() => {
+                format!("Expected signer {key} is not a voting member of this multisig.")
+            }
+            Some(key) => {
+                format!("Expected signer {name} ({key}) is not a voting member of this multisig.")
+            }
+        });
     }
 
     // Any extra member that can vote or execute is a party with power over
@@ -424,7 +420,7 @@ fn member_set_warnings_against<N: AsRef<str>>(ms: &Multisig, known: &[(N, Pubkey
         if member.permissions.mask & (PERMISSION_VOTE | PERMISSION_EXECUTE) == 0 {
             continue;
         }
-        if known.iter().any(|(_, k)| k == &member.key) {
+        if expected.iter().any(|(_, k)| *k == Some(member.key)) {
             continue;
         }
         let abilities = match (
@@ -707,7 +703,10 @@ mod tests {
         let org_b = Pubkey::new_unique();
         let stranger = Pubkey::new_unique();
         let contributor = Pubkey::new_unique();
-        let known = [("Org A", org_a), ("Org B", org_b)];
+        let known = [
+            ("Org A".to_string(), Some(org_a)),
+            ("Org B".to_string(), Some(org_b)),
+        ];
 
         let mut ms = multisig_with(Pubkey::default(), 0, 2);
         ms.members = vec![
@@ -725,11 +724,11 @@ mod tests {
                 permissions: Permissions { mask: 1 },
             },
         ];
-        assert!(member_set_warnings_against(&ms, &known).is_empty());
+        assert!(member_set_warnings_for(&ms, &known).is_empty());
 
         // A missing expected signer and an unexpected voter both warn.
         ms.members[1].key = stranger;
-        let warnings = member_set_warnings_against(&ms, &known);
+        let warnings = member_set_warnings_for(&ms, &known);
         assert!(warnings
             .iter()
             .any(|w| w.contains("Org B") && w.contains("not a voting member")));
@@ -747,12 +746,38 @@ mod tests {
             key: stranger,
             permissions: Permissions { mask: 4 },
         });
-        let warnings = member_set_warnings_against(&ms, &known);
+        let warnings = member_set_warnings_for(&ms, &known);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("execute proposals"));
 
         // Empty registry (the current vendored state): check is skipped.
-        assert!(member_set_warnings_against(&ms, &[] as &[(&str, Pubkey)]).is_empty());
+        assert!(member_set_warnings_for(&ms, &[]).is_empty());
+    }
+
+    #[test]
+    fn unparseable_config_entry_never_matches_a_member() {
+        use crate::squads::{Member, Permissions};
+
+        // The rekeyed shape: a default-pubkey voting member. A typo'd config
+        // entry used to parse to Pubkey::default() and silently match it,
+        // suppressing the missing-signer warning exactly where it mattered.
+        let mut ms = multisig_with(Pubkey::default(), 0, 1);
+        ms.members = vec![Member {
+            key: Pubkey::default(),
+            permissions: Permissions::all(),
+        }];
+
+        let (expected, source) = expected_signers(&["not-a-pubkey".to_string()]).unwrap();
+        assert_eq!(source, "your configured member list");
+        assert_eq!(expected, vec![("not-a-pubkey".to_string(), None)]);
+
+        let warnings = member_set_warnings_for(&ms, &expected);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("not-a-pubkey") && w.contains("not a valid public key")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

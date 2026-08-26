@@ -6,7 +6,8 @@
 use crate::output::Output;
 use crate::provision::{create_rpc_client, fetch_squads_multisig};
 use crate::squads::{Member, PERMISSION_EXECUTE, PERMISSION_INITIATE, PERMISSION_VOTE};
-use crate::utils::{choose_network_from_config, load_signer, Config};
+use crate::utils::{choose_network_from_config, load_signer, resolve_network_arg, Config};
+use crate::verification::is_rekeyed;
 use eyre::Result;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
@@ -17,6 +18,7 @@ pub fn check_signer_command(
     config: &Config,
     keypair_path: Option<String>,
     multisig: Option<String>,
+    network: Option<String>,
 ) -> Result<()> {
     let path = keypair_path
         .or_else(|| config.fee_payer_path.clone())
@@ -44,7 +46,11 @@ pub fn check_signer_command(
     let multisig = Pubkey::from_str(&multisig)
         .map_err(|_| eyre::eyre!("Invalid multisig address: {multisig}"))?;
 
-    let rpc_url = choose_network_from_config(config)?;
+    // --network keeps this scriptable; the picker is interactive-only.
+    let rpc_url = match network {
+        Some(arg) => resolve_network_arg(config, &arg)?,
+        None => choose_network_from_config(config)?,
+    };
     let ms = fetch_squads_multisig(&create_rpc_client(&rpc_url), &multisig, "multisig")?;
     Output::field("Multisig", &multisig.to_string());
     Output::field("Network", &rpc_url);
@@ -67,6 +73,14 @@ pub fn check_signer_command(
     Output::success("This signer is a voting member and can approve proposals on this multisig.");
     if member.permissions.mask & PERMISSION_EXECUTE == 0 {
         Output::warning("It cannot execute, so someone else has to send the final transaction.");
+    }
+    // Membership means nothing on a frozen multisig, so say so even though the
+    // signer checks all passed.
+    if is_rekeyed(&ms) {
+        Output::warning(
+            "This multisig has been rekeyed: its voting keys cannot meet the threshold, so no \
+             proposal can ever pass and this signer's vote can never be exercised.",
+        );
     }
     Ok(())
 }

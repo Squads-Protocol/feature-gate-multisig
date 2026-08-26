@@ -28,7 +28,7 @@ pub fn interactive_mode() -> Result<()> {
             "Verify feature gate multisig",
             "Check signer (signs nothing)",
             "Show configuration",
-            "Proposal Actions (Approve/Reject/Execute)",
+            "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)",
             "Exit",
         ];
 
@@ -42,7 +42,7 @@ pub fn interactive_mode() -> Result<()> {
         let result = match choice {
             "Create new feature gate multisig" => prompt_for_fee_payer_path(&config)
                 .and_then(|path| create_command(&mut config, None, Some(path))),
-            "Proposal Actions (Approve/Reject/Execute)" => {
+            "Proposal Actions (Approve/Reject/Execute/Rekey/Revoke)" => {
                 handle_proposal_action(&config, &mut last_multisig)
             }
             "Show feature gate multisig details" => {
@@ -99,7 +99,7 @@ fn handle_check_signer(config: &Config, last_multisig: &Option<String>) -> Resul
         }
     };
 
-    check_signer_command(config, Some(path), multisig)
+    check_signer_command(config, Some(path), multisig, None)
 }
 
 /// True when the error is the user pressing Esc in an inquire prompt.
@@ -130,7 +130,10 @@ fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -
         ..config.clone()
     };
 
-    let action_options = vec!["Create", "Approve", "Reject", "Execute", "Cancel"];
+    // Name the kinds inline: Revoke and Rekey are only reachable through Create,
+    // and a bare "Create" gave no hint that they exist.
+    const CREATE: &str = "Create (Activate / Revoke / Rekey)";
+    let action_options = vec![CREATE, "Approve", "Reject", "Execute", "Cancel"];
     let action_choice: &str = Select::new("Select action:", action_options).prompt()?;
     if action_choice == "Cancel" {
         return Ok(());
@@ -138,7 +141,7 @@ fn handle_proposal_action(config: &Config, last_multisig: &mut Option<String>) -
 
     // Create picks a kind (nothing exists to infer from); the other actions pick
     // a live proposal, and its kind comes from the on-chain transaction shape.
-    let (command, kind, index) = if action_choice == "Create" {
+    let (command, kind, index) = if action_choice == CREATE {
         let Some(kind) = prompt_for_transaction_kind()? else {
             return Ok(());
         };
