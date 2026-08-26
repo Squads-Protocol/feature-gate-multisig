@@ -7,6 +7,7 @@ use crate::output::Output;
 use crate::provision::{create_rpc_client, fetch_squads_multisig};
 use crate::squads::{Member, PERMISSION_EXECUTE, PERMISSION_INITIATE, PERMISSION_VOTE};
 use crate::utils::{choose_network_from_config, load_signer, Config};
+use crate::verification::is_rekeyed;
 use eyre::Result;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
@@ -67,6 +68,14 @@ pub fn check_signer_command(
     Output::success("This signer is a voting member and can approve proposals on this multisig.");
     if member.permissions.mask & PERMISSION_EXECUTE == 0 {
         Output::warning("It cannot execute, so someone else has to send the final transaction.");
+    }
+    // Membership means nothing on a frozen multisig, so say so even though the
+    // signer checks all passed.
+    if is_rekeyed(&ms) {
+        Output::warning(
+            "This multisig has been rekeyed: its voting keys cannot meet the threshold, so no \
+             proposal can ever pass and this signer's vote can never be exercised.",
+        );
     }
     Ok(())
 }
