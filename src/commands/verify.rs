@@ -37,6 +37,12 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
     // Warn-and-exit-0 reads as "verified" to anything checking the exit code, so
     // a check that could not run - or ran and reported a problem - has to fail.
     let mut incomplete = false;
+    // Track whether every configured network was read and every copy is
+    // rekeyed, so a deliberate decommission reports as one instead of as a
+    // failed correctness check. A network that did not answer holds a copy this
+    // run never saw, so it disqualifies that claim.
+    let mut all_rekeyed = true;
+    let mut every_network_read = true;
     for network in &networks {
         println!();
         Output::header(&format!(
@@ -61,13 +67,18 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
             Err(e) => {
                 Output::error(&e.to_string());
                 incomplete = true;
+                every_network_read = false;
                 continue;
             }
         };
         let (found, failed) = verify_on_network(&rpc, &multisig, mainnet, &config.members);
         incomplete |= failed;
-        if let Some(ms) = found {
-            seen.push((get_network_display(network), ms));
+        match found {
+            Some(ms) => {
+                all_rekeyed &= is_rekeyed(&ms);
+                seen.push((get_network_display(network), ms));
+            }
+            None => every_network_read = false,
         }
     }
 
@@ -75,6 +86,19 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
     incomplete |= report_cross_network_consistency(&seen);
 
     if incomplete {
+        // A rekeyed multisig is not a broken one, it is a decommissioned one.
+        // Reporting "has not been shown to be correct" for an intentional,
+        // irreversible end state trains people to shrug at that sentence -- the
+        // exact sentence that must still mean something when a real check fails.
+        // Still a non-zero exit, so `verify && approve` cannot sail through.
+        if every_network_read && all_rekeyed {
+            return Err(eyre::eyre!(
+                "This multisig is DECOMMISSIONED: it has been rekeyed on every configured \
+                 network, so no proposal can ever pass and its feature gate is frozen where it \
+                 stands. Nothing further can be done with it. If you expected a live multisig, \
+                 you have the wrong address. Any other warnings above still stand."
+            ));
+        }
         return Err(eyre::eyre!(
             "Verification failed: see the warnings above. The multisig has not been shown to be correct."
         ));
@@ -99,14 +123,21 @@ fn verify_on_network(
             failed = true;
         }
     }
+    // Read the multisig before the feature account: a rekeyed multisig can
+    // never act again, which changes what its feature's status *means*. "Fresh"
+    // on a live multisig is a pending job; on a rekeyed one it is a permanent
+    // dead end, and the report should not read the same in both cases.
+    let ms = fetch_squads_multisig(rpc, multisig, "multisig");
+    let rekeyed = ms.as_ref().map(is_rekeyed).unwrap_or(false);
+
     match verify_feature_gate(rpc, multisig) {
-        Ok(v) => failed |= display_feature(&v),
+        Ok(v) => failed |= display_feature(&v, rekeyed),
         Err(e) => {
             Output::warning(&format!("Could not read feature gate account: {e}"));
             failed = true;
         }
     }
-    match fetch_squads_multisig(rpc, multisig, "multisig") {
+    match ms {
         Ok(ms) => {
             failed |= display_owners(&ms, is_mainnet, expected_members);
             (Some(ms), failed)
@@ -204,11 +235,22 @@ fn display_program_authenticity(p: &ProgramAuthenticity, is_mainnet: bool) -> bo
 
 /// Returns true when the feature account is in an unexpected state - an owner or
 /// data length this tool does not recognise.
-fn display_feature(v: &FeatureVerification) -> bool {
+fn display_feature(v: &FeatureVerification, multisig_rekeyed: bool) -> bool {
+    use crate::verification::FeatureGateStatus;
     println!();
     Output::header("🪄 Feature Gate");
     Output::field("Feature gate ID (vault 0)", &v.feature_id.to_string());
-    Output::field("Status", &format!("{:?}", v.status));
+    // A rekeyed multisig can never pass another proposal, so a feature it still
+    // governs is frozen wherever it stands. Saying only "Fresh" or "Pending"
+    // reads as work outstanding when it is actually a terminal state.
+    let status = match (&v.status, multisig_rekeyed) {
+        (FeatureGateStatus::Activated { .. }, _) => format!("{:?}", v.status),
+        (s, true) => format!(
+            "{s:?} - PERMANENT: the multisig is rekeyed, so this can never be activated or revoked"
+        ),
+        (s, false) => format!("{s:?}"),
+    };
+    Output::field("Status", &status);
     Output::field("Lamports", &v.lamports.to_string());
     Output::field("Rent-exempt", &v.rent_exempt.to_string());
     if let crate::verification::FeatureGateStatus::Unexpected { owner, data_len } = &v.status {
