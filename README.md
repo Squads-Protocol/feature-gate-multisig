@@ -124,9 +124,11 @@ For programmatic voting from a parent multisig:
 
 > **Important**: Add the parent's **vault PDA** (not multisig address) as a member of the child multisig with Vote/Execute permissions.
 
-The **fee payer keypair** must be a member of the parent multisig with Initiate.
-Here `voting_key` and the fee payer are deliberately *different*: pass the parent
-multisig as `--voting-key` and sign with your own key.
+The **fee payer keypair** must be a member of the parent multisig. Initiate is
+enough to create the parent proposal, which is all the tool checks up front,
+but approving needs Vote and executing needs Execute, so in practice give it
+all three. Here `voting_key` and the fee payer are deliberately *different*:
+pass the parent multisig as `--voting-key` and sign with your own key.
 
 The parent multisig address cannot sign during CPI - only the vault PDA can be
 signed for using PDA seeds. That PDA is off-curve, so no private key exists for
