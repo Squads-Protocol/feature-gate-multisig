@@ -37,10 +37,12 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
     // Warn-and-exit-0 reads as "verified" to anything checking the exit code, so
     // a check that could not run - or ran and reported a problem - has to fail.
     let mut incomplete = false;
-    // Track whether every multisig that answered is rekeyed, so a deliberate
-    // decommission reports as one instead of as a failed correctness check.
+    // Track whether every configured network was read and every copy is
+    // rekeyed, so a deliberate decommission reports as one instead of as a
+    // failed correctness check. A network that did not answer holds a copy this
+    // run never saw, so it disqualifies that claim.
     let mut all_rekeyed = true;
-    let mut any_seen = false;
+    let mut every_network_read = true;
     for network in &networks {
         println!();
         Output::header(&format!(
@@ -65,15 +67,18 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
             Err(e) => {
                 Output::error(&e.to_string());
                 incomplete = true;
+                every_network_read = false;
                 continue;
             }
         };
         let (found, failed) = verify_on_network(&rpc, &multisig, mainnet, &config.members);
         incomplete |= failed;
-        if let Some(ms) = found {
-            all_rekeyed &= is_rekeyed(&ms);
-            any_seen = true;
-            seen.push((get_network_display(network), ms));
+        match found {
+            Some(ms) => {
+                all_rekeyed &= is_rekeyed(&ms);
+                seen.push((get_network_display(network), ms));
+            }
+            None => every_network_read = false,
         }
     }
 
@@ -86,11 +91,12 @@ pub fn verify_command(config: &Config, address: Option<String>) -> Result<()> {
         // irreversible end state trains people to shrug at that sentence -- the
         // exact sentence that must still mean something when a real check fails.
         // Still a non-zero exit, so `verify && approve` cannot sail through.
-        if any_seen && all_rekeyed {
+        if every_network_read && all_rekeyed {
             return Err(eyre::eyre!(
-                "This multisig is DECOMMISSIONED: it has been rekeyed, so no proposal can ever \
-                 pass and its feature gate is frozen where it stands. Nothing further can be \
-                 done with it. If you expected a live multisig, you have the wrong address."
+                "This multisig is DECOMMISSIONED: it has been rekeyed on every configured \
+                 network, so no proposal can ever pass and its feature gate is frozen where it \
+                 stands. Nothing further can be done with it. If you expected a live multisig, \
+                 you have the wrong address. Any other warnings above still stand."
             ));
         }
         return Err(eyre::eyre!(
@@ -121,7 +127,7 @@ fn verify_on_network(
     // never act again, which changes what its feature's status *means*. "Fresh"
     // on a live multisig is a pending job; on a rekeyed one it is a permanent
     // dead end, and the report should not read the same in both cases.
-    let ms = fetch_squads_multisig(rpc, multisig, "multisig").ok();
+    let ms = fetch_squads_multisig(rpc, multisig, "multisig");
     let rekeyed = ms.as_ref().map(is_rekeyed).unwrap_or(false);
 
     match verify_feature_gate(rpc, multisig) {
@@ -132,12 +138,12 @@ fn verify_on_network(
         }
     }
     match ms {
-        Some(ms) => {
+        Ok(ms) => {
             failed |= display_owners(&ms, is_mainnet, expected_members);
             (Some(ms), failed)
         }
-        None => {
-            Output::warning("Multisig not readable on this network.");
+        Err(e) => {
+            Output::warning(&format!("Multisig not readable on this network: {e}"));
             (None, true)
         }
     }
