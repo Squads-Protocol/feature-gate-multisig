@@ -62,6 +62,10 @@ pub fn create_command_with_deployments(
         },
     );
 
+    // Last gate before anything is signed: whatever path produced this list,
+    // Squads rejects repeats.
+    ensure_unique_members(&members)?;
+
     // Determine network deployment mode and deploy
     let (use_saved_networks, saved_networks) = choose_network_mode(config, true)?;
 

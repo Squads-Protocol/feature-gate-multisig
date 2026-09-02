@@ -255,10 +255,20 @@ pub fn save_config(config: &Config) -> Result<()> {
 
 // Member management functions
 pub fn parse_saved_members(config: &Config) -> Vec<Member> {
-    let mut parsed_members = Vec::new();
+    let mut parsed_members: Vec<Member> = Vec::new();
     for member_str in &config.members {
         match Pubkey::from_str(member_str) {
             Ok(pubkey) => {
+                // Squads rejects a member list with repeats, so a duplicate in
+                // the saved config would only surface as a failed transaction.
+                if parsed_members.iter().any(|m| m.key == pubkey) {
+                    println!(
+                        "  {} Duplicate saved member key: {}, skipping...",
+                        "⚠️".bright_yellow(),
+                        member_str
+                    );
+                    continue;
+                }
                 parsed_members.push(Member {
                     key: pubkey,
                     permissions: Permissions::all(), // Full permissions for saved members
@@ -276,6 +286,21 @@ pub fn parse_saved_members(config: &Config) -> Vec<Member> {
     parsed_members
 }
 
+/// Reject a member list with repeats. Squads fails such a create with
+/// `MultisigError::DuplicateMember`, and it fails at send time - after the user
+/// has reviewed and signed - so the list has to be checked before that.
+pub fn ensure_unique_members(members: &[Member]) -> Result<()> {
+    for (i, member) in members.iter().enumerate() {
+        if members[..i].iter().any(|m| m.key == member.key) {
+            return Err(eyre::eyre!(
+                "Duplicate member {}: every member must be unique",
+                member.key
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn collect_members_interactively() -> Result<Vec<Member>> {
     let mut interactive_members = Vec::new();
 
@@ -288,6 +313,17 @@ pub fn collect_members_interactively() -> Result<Vec<Member>> {
 
         match validate_pubkey_with_retry("Enter member public key:") {
             Ok(member_key) => {
+                if interactive_members
+                    .iter()
+                    .any(|m: &Member| m.key == member_key)
+                {
+                    println!(
+                        "  {} {} is already a member; Squads rejects duplicates.",
+                        "❌".bright_red(),
+                        member_key.to_string().bright_white()
+                    );
+                    continue;
+                }
                 interactive_members.push(Member {
                     key: member_key,
                     permissions: Permissions::all(),
@@ -1174,6 +1210,44 @@ mod tests {
 
         std::env::remove_var(CONFIG_DIR_ENV);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Squads rejects a create whose member list repeats a key, and it does so
+    /// only at send time - after the user has reviewed and signed.
+    #[test]
+    fn duplicate_members_are_rejected() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let member = |key| Member {
+            key,
+            permissions: Permissions::all(),
+        };
+
+        ensure_unique_members(&[member(a), member(b)]).unwrap();
+
+        let err = ensure_unique_members(&[member(a), member(b), member(a)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Duplicate member"), "got: {err}");
+        assert!(err.contains(&a.to_string()), "got: {err}");
+    }
+
+    /// A hand-edited config can repeat a key; the second copy is dropped rather
+    /// than carried into a transaction that cannot succeed.
+    #[test]
+    fn saved_members_are_deduplicated() {
+        let a = Pubkey::new_unique().to_string();
+        let b = Pubkey::new_unique().to_string();
+        let config = Config {
+            members: vec![a.clone(), b.clone(), a.clone()],
+            ..Config::default()
+        };
+
+        let members = parse_saved_members(&config);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].key.to_string(), a);
+        assert_eq!(members[1].key.to_string(), b);
+        ensure_unique_members(&members).unwrap();
     }
 
     #[test]
