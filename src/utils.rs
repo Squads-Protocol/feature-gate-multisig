@@ -1083,6 +1083,73 @@ pub fn check_fee_payer_balance_on_networks(
     Ok(())
 }
 
+/// clap value parser for a public key argument. Parsing at the argument
+/// boundary means a command can never receive an address it forgot to check,
+/// and a typo is reported before any network call or prompt happens.
+pub fn parse_pubkey_arg(input: &str) -> std::result::Result<Pubkey, String> {
+    let input = input.trim();
+    Pubkey::from_str(input).map_err(|_| format!("'{input}' is not a valid base58-encoded address"))
+}
+
+/// clap value parser for `--network`: either the name of a configured network
+/// or an RPC URL. Names are resolved against the config later
+/// (`resolve_network_arg`); URLs are checked here, so a mistyped endpoint is
+/// rejected at the source rather than dialled.
+pub fn parse_network_arg(input: &str) -> std::result::Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("network cannot be empty".to_string());
+    }
+    if input.contains("://") {
+        check_rpc_url(input)?;
+    } else if input.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "'{input}' is not a network name or an RPC URL (URLs must start with https://)"
+        ));
+    }
+    Ok(input.to_string())
+}
+
+/// Non-interactive RPC URL check. Plain HTTP is refused off the loopback
+/// interface: a governance action must not be sent, nor its reply trusted, over
+/// a connection anything on the path can rewrite.
+pub fn check_rpc_url(url: &str) -> std::result::Result<(), String> {
+    if url.chars().any(char::is_whitespace) {
+        return Err(format!("RPC URL '{url}' contains whitespace"));
+    }
+    let rest = match url.strip_prefix("https://") {
+        Some(rest) => rest,
+        None => match url.strip_prefix("http://") {
+            Some(rest) if is_loopback_authority(rest) => rest,
+            Some(_) => {
+                return Err(format!(
+                    "RPC URL '{url}' uses plain HTTP; use https:// (http:// is allowed only for localhost)"
+                ))
+            }
+            None => return Err(format!("RPC URL '{url}' must start with https://")),
+        },
+    };
+    if rest.split(['/', '?', '#']).next().unwrap_or("").is_empty() {
+        return Err(format!("RPC URL '{url}' has no host"));
+    }
+    Ok(())
+}
+
+/// Whether the authority (what follows the scheme) addresses this machine.
+fn is_loopback_authority(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    // Bracketed IPv6 literal, e.g. `[::1]:8899`.
+    if let Some(inner) = host.strip_prefix('[') {
+        return matches!(inner.split_once(']'), Some((addr, _)) if addr == "::1");
+    }
+    let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+    host == "localhost" || host.starts_with("127.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1174,6 +1241,50 @@ mod tests {
 
         std::env::remove_var(CONFIG_DIR_ENV);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sanitizing at the argument boundary: a mistyped address or endpoint is
+    /// rejected before the command runs, not by whichever call site remembered
+    /// to check.
+    #[test]
+    fn pubkey_args_are_parsed_at_the_boundary() {
+        let key = Pubkey::new_unique();
+        assert_eq!(parse_pubkey_arg(&format!("  {key} ")).unwrap(), key);
+
+        let err = parse_pubkey_arg("not-a-key").unwrap_err();
+        assert!(err.contains("base58"), "got: {err}");
+    }
+
+    #[test]
+    fn network_args_accept_names_and_https_urls() {
+        assert_eq!(parse_network_arg(" devnet ").unwrap(), "devnet");
+        assert_eq!(
+            parse_network_arg("https://api.devnet.solana.com").unwrap(),
+            "https://api.devnet.solana.com"
+        );
+        // Loopback endpoints are how local validators are reached.
+        assert_eq!(
+            parse_network_arg("http://127.0.0.1:8899").unwrap(),
+            "http://127.0.0.1:8899"
+        );
+        assert_eq!(
+            parse_network_arg("http://[::1]:8899").unwrap(),
+            "http://[::1]:8899"
+        );
+
+        for bad in [
+            "",
+            "http://soolana.com/mainnet",
+            "ws://api.devnet.solana.com",
+            "https://",
+            "my network",
+            // Only the loopback carve-out may be plain HTTP.
+            "http://[2001:db8::1]:8899",
+            "http://10.0.0.5:8899",
+            "http://localhost.example.net",
+        ] {
+            assert!(parse_network_arg(bad).is_err(), "should be rejected: {bad}");
+        }
     }
 
     #[test]
