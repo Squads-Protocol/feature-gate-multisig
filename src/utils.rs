@@ -775,6 +775,60 @@ pub fn validate_threshold(input: &str, max_members: usize) -> Result<u16> {
     }
 }
 
+/// The host of an http(s) URL: the authority with any userinfo and port
+/// removed. `None` when the URL has no http(s) scheme.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // `user:pass@host`: the host is what the client actually connects to, so a
+    // look-alike parked in the userinfo must not be read as the destination.
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    // Strip the port, keeping bracketed IPv6 literals intact.
+    let host = match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => rest,
+        },
+        None => host.split(':').next().unwrap_or(""),
+    };
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// Whether the URL looks like a Solana RPC endpoint. The check is on the parsed
+/// host, not on a substring of the whole URL: `https://ssolana.com/mainnet`,
+/// `https://solana.com.example.net` and `https://evil.example/?x=solana.com`
+/// all contain "solana.com" without being one, and a typo like that is exactly
+/// what this warning exists to catch.
+fn looks_like_solana_rpc(url: &str) -> bool {
+    let Some(host) = url_host(url) else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if host.starts_with("127.") || host == "::1" {
+        return true;
+    }
+    if host == "solana.com" || host.ends_with(".solana.com") {
+        return true;
+    }
+    // Providers usually name themselves in the host: rpc.example.com,
+    // mainnet.example-rpc.com. A path or query saying "rpc" proves nothing.
+    host.split('.').any(|label| label.contains("rpc"))
+}
+
 pub fn validate_rpc_url(url: &str) -> Result<String> {
     let url = url.trim();
 
@@ -793,11 +847,7 @@ pub fn validate_rpc_url(url: &str) -> Result<String> {
     }
 
     // Check for common Solana RPC patterns
-    let looks_like_rpc_endpoint = url.contains("solana.com")
-        || url.contains("localhost")
-        || url.contains("127.0.0.1")
-        || url.contains("rpc");
-    if !looks_like_rpc_endpoint {
+    if !looks_like_solana_rpc(url) {
         println!(
             "  {} Warning: URL doesn't match common Solana RPC patterns",
             "⚠️".bright_yellow()
@@ -1174,6 +1224,58 @@ mod tests {
 
         std::env::remove_var(CONFIG_DIR_ENV);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The old check matched "solana.com" anywhere in the URL, so a typo'd or
+    /// look-alike host passed silently. Match the host itself.
+    #[test]
+    fn rpc_host_check_rejects_lookalike_urls() {
+        for url in [
+            "https://api.mainnet-beta.solana.com",
+            "https://solana.com",
+            "https://api.devnet.solana.com/",
+            "http://localhost:8899",
+            "http://127.0.0.1:8899",
+            "https://mainnet.helius-rpc.com/?api-key=secret",
+            "https://rpc.example.net",
+        ] {
+            assert!(looks_like_solana_rpc(url), "should be accepted: {url}");
+        }
+
+        for url in [
+            // Typo: an extra letter in the domain.
+            "https://ssolana.com/mainnet",
+            "https://soolana.com/mainnet",
+            // The real host is the suffix, not the "solana.com" prefix.
+            "https://solana.com.example.net",
+            // "solana.com" in the userinfo, the path, or the query.
+            "https://solana.com@example.net",
+            "https://example.net/solana.com",
+            "https://example.net/?url=solana.com",
+            // Not an http(s) URL at all.
+            "ftp://api.solana.com",
+        ] {
+            assert!(!looks_like_solana_rpc(url), "should warn: {url}");
+        }
+    }
+
+    #[test]
+    fn url_host_strips_userinfo_port_and_path() {
+        assert_eq!(
+            url_host("https://api.devnet.solana.com/v1"),
+            Some("api.devnet.solana.com")
+        );
+        assert_eq!(
+            url_host("http://user:pass@127.0.0.1:8899"),
+            Some("127.0.0.1")
+        );
+        assert_eq!(url_host("http://[::1]:8899/rpc"), Some("::1"));
+        assert_eq!(
+            url_host("https://api.devnet.solana.com./"),
+            Some("api.devnet.solana.com")
+        );
+        assert_eq!(url_host("https://"), None);
+        assert_eq!(url_host("api.devnet.solana.com"), None);
     }
 
     #[test]
