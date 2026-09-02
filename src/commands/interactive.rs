@@ -259,7 +259,8 @@ pub(crate) fn is_actionable(
 /// of typing an index from memory. Executed, rejected, cancelled, and stale
 /// proposals are skipped (with a note). Falls back to manual entry when
 /// nothing is listable or the user prefers. Returns the chosen index and its
-/// classified kind.
+/// classified kind. Errors when the multisig cannot be read or has issued no
+/// proposals: both leave nothing to bound a typed index with.
 fn prompt_for_proposal_index(
     rpc_client: &RpcClient,
     multisig: &Pubkey,
@@ -267,62 +268,70 @@ fn prompt_for_proposal_index(
 ) -> Result<(u64, ProposalKind)> {
     const MAX_LISTED: u64 = crate::constants::MAX_LISTED_PROPOSALS;
 
+    // The multisig read is what bounds the index the user is about to act on.
+    // Without it there is nothing to check a manually entered index against, so
+    // an unreadable multisig - or one that has issued no proposals - ends the
+    // action here instead of walking the user into an index that cannot exist.
+    let ms = fetch_squads_multisig(rpc_client, multisig, "multisig").map_err(|e| {
+        eyre::eyre!(
+            "Could not read multisig {multisig}: {e} Its proposals cannot be listed, so there is \
+             nothing to {} against. Retry, or read the multisig from a different RPC endpoint.",
+            action_verb(action)
+        )
+    })?;
+    if ms.transaction_index == 0 {
+        return Err(eyre::eyre!(
+            "Multisig {multisig} has no proposals yet, so there is nothing to {}.",
+            action_verb(action)
+        ));
+    }
+
     let mut entries: Vec<(u64, ProposalKind)> = Vec::new();
     let mut options: Vec<String> = Vec::new();
     let mut skipped = 0u64;
-    let mut known_max: Option<u64> = None;
-    match fetch_squads_multisig(rpc_client, multisig, "multisig") {
-        Ok(ms) if ms.transaction_index > 0 => {
-            known_max = Some(ms.transaction_index);
-            let first = ms.transaction_index.saturating_sub(MAX_LISTED - 1).max(1);
-            if first > 1 {
-                Output::info(&format!(
-                    "Showing the last {MAX_LISTED} proposals; older ones (#1-#{}) via manual entry.",
-                    first - 1
-                ));
-            }
-            for index in first..=ms.transaction_index {
-                // Authenticated: the status below decides whether this proposal
-                // is offered at all, so an unauthenticated record could hide a
-                // live one or invent a vote count next to a trustworthy label.
-                let proposal = match fetch_proposal(rpc_client, multisig, index) {
-                    Ok(proposal) => proposal,
-                    Err(e) => {
-                        let msg = e.to_string();
-                        // Missing accounts are normal (closed/reclaimed); only a
-                        // real fetch failure deserves a warning, so the list is
-                        // never silently incomplete.
-                        if !msg.contains("AccountNotFound")
-                            && !msg.contains("could not find account")
-                        {
-                            Output::warning(&format!("Could not fetch proposal #{index}: {e}"));
-                        }
-                        continue;
-                    }
-                };
-                let kind = describe_transaction(rpc_client, multisig, index);
-                if !is_actionable(
-                    action,
-                    &proposal.status,
-                    kind,
-                    index,
-                    ms.stale_transaction_index,
-                ) {
-                    skipped += 1;
-                    continue;
+    let first = ms.transaction_index.saturating_sub(MAX_LISTED - 1).max(1);
+    if first > 1 {
+        Output::info(&format!(
+            "Showing the last {MAX_LISTED} proposals; older ones (#1-#{}) via manual entry.",
+            first - 1
+        ));
+    }
+    for index in first..=ms.transaction_index {
+        // Authenticated: the status below decides whether this proposal
+        // is offered at all, so an unauthenticated record could hide a
+        // live one or invent a vote count next to a trustworthy label.
+        let proposal = match fetch_proposal(rpc_client, multisig, index) {
+            Ok(proposal) => proposal,
+            Err(e) => {
+                let msg = e.to_string();
+                // Missing accounts are normal (closed/reclaimed); only a
+                // real fetch failure deserves a warning, so the list is
+                // never silently incomplete.
+                if !msg.contains("AccountNotFound") && !msg.contains("could not find account") {
+                    Output::warning(&format!("Could not fetch proposal #{index}: {e}"));
                 }
-                entries.push((index, kind));
-                options.push(format!(
-                    "#{index} - {} - {} - {} approval(s), {} rejection(s)",
-                    kind.label(),
-                    proposal_status_label(&proposal.status),
-                    proposal.approved.len(),
-                    proposal.rejected.len(),
-                ));
+                continue;
             }
+        };
+        let kind = describe_transaction(rpc_client, multisig, index);
+        if !is_actionable(
+            action,
+            &proposal.status,
+            kind,
+            index,
+            ms.stale_transaction_index,
+        ) {
+            skipped += 1;
+            continue;
         }
-        Ok(_) => {}
-        Err(e) => Output::warning(&format!("Could not list proposals: {e}")),
+        entries.push((index, kind));
+        options.push(format!(
+            "#{index} - {} - {} - {} approval(s), {} rejection(s)",
+            kind.label(),
+            proposal_status_label(&proposal.status),
+            proposal.approved.len(),
+            proposal.rejected.len(),
+        ));
     }
 
     if skipped > 0 {
@@ -345,19 +354,54 @@ fn prompt_for_proposal_index(
     let index: u64 = index_str
         .parse()
         .map_err(|_| eyre::eyre!("Invalid proposal index"))?;
-    if let Some(max) = known_max {
-        if index == 0 || index > max {
-            return Err(eyre::eyre!(
-                "Proposal index must be between 1 and {max} for this multisig"
-            ));
-        }
-    }
+    validate_manual_index(index, ms.transaction_index)?;
     Ok((index, describe_transaction(rpc_client, multisig, index)))
+}
+
+/// What `action` does, for messages that have to say what cannot be done.
+fn action_verb(action: ProposalCommand) -> &'static str {
+    match action {
+        ProposalCommand::Propose => "propose",
+        ProposalCommand::Approve => "approve",
+        ProposalCommand::Reject => "reject",
+        ProposalCommand::Execute => "execute",
+    }
+}
+
+/// A typed index only means something inside the range the multisig has issued.
+fn validate_manual_index(index: u64, known_max: u64) -> Result<()> {
+    if index == 0 || index > known_max {
+        return Err(eyre::eyre!(
+            "Proposal index must be between 1 and {known_max} for this multisig"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manually entered index used to be accepted unchecked whenever the
+    /// multisig could not be read; the range now always comes from a live read.
+    #[test]
+    fn manual_index_must_be_within_the_issued_range() {
+        validate_manual_index(1, 3).unwrap();
+        validate_manual_index(3, 3).unwrap();
+
+        for index in [0, 4, u64::MAX] {
+            let err = validate_manual_index(index, 3).unwrap_err().to_string();
+            assert!(err.contains("between 1 and 3"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn action_verbs_name_the_action() {
+        assert_eq!(action_verb(ProposalCommand::Approve), "approve");
+        assert_eq!(action_verb(ProposalCommand::Reject), "reject");
+        assert_eq!(action_verb(ProposalCommand::Execute), "execute");
+        assert_eq!(action_verb(ProposalCommand::Propose), "propose");
+    }
 
     #[test]
     fn actionability_matrix() {
